@@ -46,3 +46,16 @@ def replace_linear_with_ramtorch_linear(module: nn.Module, device="cuda", recurs
             logger.info(f"Replaced {name} with RamTorch Linear layer.")
         elif recursive and len(list(child_module.children())) > 0:
             replace_linear_with_ramtorch_linear(child_module, device, recursive=True)
+
+def apply_ramtorch(args, unet, text_encoders, accelerator):
+    # Apply ramtorch
+    if args.use_ramtorch:
+        try:
+            from library.ramtorch_utils import replace_linear_with_ramtorch_linear
+            logger.info("Applying RamTorch to U-Net and Text Encoders for memory efficiency...")
+            replace_linear_with_ramtorch_linear(unet, accelerator.device)
+            for text_encoder in text_encoders:
+                replace_linear_with_ramtorch_linear(text_encoder, accelerator.device)
+            logger.info("RamTorch applied successfully.")
+        except ImportError as e:
+            logger.error(f"Failed to apply RamTorch: {e}")

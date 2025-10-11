@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
+from library.ramtorch_utils import apply_ramtorch
 
 init_ipex()
 
@@ -609,16 +610,7 @@ class NetworkTrainer:
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
         # Apply ramtorch
-        if args.use_ramtorch:
-            try:
-                from library.ramtorch_util import replace_linear_with_ramtorch_linear
-                logger.info("Applying RamTorch to U-Net and Text Encoders for memory efficiency...")
-                replace_linear_with_ramtorch_linear(unet, accelerator.device)
-                for te in text_encoder:
-                    replace_linear_with_ramtorch_linear(te, accelerator.device)
-                logger.info("RamTorch applied successfully.")
-            except ImportError as e:
-                logger.error(f"Failed to apply RamTorch: {e}")
+        apply_ramtorch(args, unet, text_encoders, accelerator)
 
         # prepare dataset for latents caching if needed
         if cache_latents:
