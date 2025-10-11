@@ -59,7 +59,7 @@ def cache_to_disk(args: argparse.Namespace) -> None:
 
     use_dreambooth_method = args.in_json is None
 
-    train_util.args_set_seed(args, accelerator)
+    train_util.args_set_seed(args)
 
     is_sd = not args.sdxl and not args.flux
     is_sdxl = args.sdxl

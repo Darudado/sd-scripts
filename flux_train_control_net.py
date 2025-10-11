@@ -97,7 +97,7 @@ def train(args):
 
     cache_latents = args.cache_latents
 
-    train_util.args_set_seed(args, accelerator)
+    train_util.args_set_seed(args)
 
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     if args.cache_latents:

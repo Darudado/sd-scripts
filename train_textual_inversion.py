@@ -193,7 +193,7 @@ class TextualInversionTrainer:
 
         cache_latents = args.cache_latents
 
-        train_util.args_set_seed(args, accelerator)
+        train_util.args_set_seed(args)
 
         tokenize_strategy = self.get_tokenize_strategy(args)
         strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)

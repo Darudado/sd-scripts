@@ -6678,7 +6678,7 @@ def set_torch_cuda_reduced_precision(args):
         torch.backends.cuda.allow_fp16_bf16_reduction_math_sdp(True)
 
 def args_set_seed(args):
-    train_util.args_set_seed(args)
+    set_seed(args)
 
 # endregion
 
