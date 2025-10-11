@@ -246,9 +246,11 @@ class NetworkTrainer:
         noise_scheduler = DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
         )
-        prepare_scheduler_for_custom_training(noise_scheduler, device)
+
         if args.zero_terminal_snr:
             custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
+
+        prepare_scheduler_for_custom_training(noise_scheduler, device)
         return noise_scheduler
 
     def encode_images_to_latents(self, args, vae: AutoencoderKL, images: torch.FloatTensor) -> torch.FloatTensor:
