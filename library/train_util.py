@@ -6661,6 +6661,8 @@ def init_trackers(accelerator: Accelerator, args: argparse.Namespace, default_tr
 
             wandb_tracker.define_metric("global_step", hidden=True)
 
+def args_set_seed(args):
+    train_util.args_set_seed(args)
 
 # endregion
 
