@@ -6661,6 +6661,22 @@ def init_trackers(accelerator: Accelerator, args: argparse.Namespace, default_tr
 
             wandb_tracker.define_metric("global_step", hidden=True)
 
+def set_torch_cuda_reduced_precision(args):
+    if args.disable_cuda_reduced_precision_operations:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction=False
+        torch.backends.cuda.matmul.allow_tf32=False
+        torch.backends.cudnn.allow_tf32=False
+        torch.backends.cuda.allow_fp16_bf16_reduction_math_sdp(False)
+    elif args.enable_cuda_reduced_precision_operations:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=True
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction=True
+        torch.backends.cuda.matmul.allow_tf32=True
+        torch.backends.cudnn.allow_tf32=True
+        torch.backends.cuda.allow_fp16_bf16_reduction_math_sdp(True)
+
 def args_set_seed(args):
     train_util.args_set_seed(args)
 
