@@ -4351,6 +4351,18 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
         "この数を増やすと、トレーニング中のVRAM使用量が減りますが、トレーニング速度（s/it）も低下します。",
     )
 
+    parser.add_argument(
+        "--disable_cuda_reduced_precision_operations",
+        action="store_true",
+        help="Disables reduced precision for bf16, fp16, and disables use of tf32 to maximize precision at a small cost to performance.",
+    )
+
+    parser.add_argument(
+        "--enable_cuda_reduced_precision_operations",
+        action="store_true",
+        help="Enables reduced precision for bf16, fp16, and enables use of tf32, reducing precision a negligible amount for a performance benefit.",
+    )  
+
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
     # if `--log_config` is enabled, return args for logging. if not, return None.

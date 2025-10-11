@@ -58,6 +58,7 @@ def train(args):
     train_util.verify_training_args(args)
     train_util.prepare_dataset_args(args, True)
     # sdxl_train_util.verify_sdxl_training_args(args)
+    train_util.set_torch_cuda_reduced_precision(args)
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
 
