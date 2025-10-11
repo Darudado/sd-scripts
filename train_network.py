@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
+from library.edm2_loss_utils import prepare_edm2_loss_weighting, handle_conflicting_configuration, plot_edm2_loss_weighting_check, plot_edm2_loss_weighting
 from library.ramtorch_utils import apply_ramtorch
 
 init_ipex()
@@ -73,8 +74,16 @@ class NetworkTrainer:
         maximum_norm=None,
         mean_grad_norm=None,
         mean_combined_norm=None,
+        edm2_lr_scheduler=None,
+        current_loss_scaled=None, 
+        average_loss_scaled=None, 
+
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
+
+        if current_loss_scaled is not None:
+            logs["loss/current_scaled"] = current_loss_scaled
+            logs["loss/average_scaled"] = average_loss_scaled
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -125,6 +134,9 @@ class NetworkTrainer:
                     )
                 if args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
                     logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
+
+        if edm2_lr_scheduler is not None:
+            logs[f"lr/edm2"] = edm2_lr_scheduler.get_last_lr()[0]
 
         return logs
 
@@ -387,6 +399,7 @@ class NetworkTrainer:
         is_train=True,
         train_text_encoder=True,
         train_unet=True,
+        edm2_model=None
     ) -> torch.Tensor:
         """
         Process a batch for the network
@@ -467,20 +480,35 @@ class NetworkTrainer:
             is_train=is_train,
         )
 
-        huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
-        if weighting is not None:
-            loss = loss * weighting
-        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-            loss = apply_masked_loss(loss, batch)
+        if is_train:
+            huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
+            loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+            if weighting is not None:
+                loss = loss * weighting
+            if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                loss = apply_masked_loss(loss, batch)
+        else:
+                loss = train_util.conditional_loss(noise_pred.float(), target.float(), "l2", "none", None)
         loss = loss.mean([1, 2, 3])
 
-        loss_weights = batch["loss_weights"]  # 各sampleごとのweight
-        loss = loss * loss_weights
+        if is_train:
+            loss_weights = batch["loss_weights"]  # 各sampleごとのweight
+            loss = loss * loss_weights
+            loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
-        loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
+        if is_train and args.loss_multiplier:
+            loss.mul_(float(args.loss_multiplier) if args.loss_multiplier is not None else 1.0)
 
-        return loss.mean()
+        # For logging
+        pre_scaling_loss = loss.mean()
+
+        if is_train and args.edm2_loss_weighting:
+            loss, loss_scaled = edm2_model(loss, timesteps)
+            loss_scaled = loss_scaled.mean()
+        else:
+            loss_scaled = None
+
+        return loss.mean(), pre_scaling_loss, loss_scaled
 
     def cast_text_encoder(self, args):
         return True  # default for other than HunyuanImage
@@ -1281,11 +1309,16 @@ class NetworkTrainer:
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
+        edm2_model, edm2_optimizer, edm2_lr_scheduler = prepare_edm2_loss_weighting(args, noise_scheduler, accelerator)
+
         train_util.init_trackers(accelerator, args, "network_train")
 
         loss_recorder = train_util.LossRecorder()
         val_step_loss_recorder = train_util.LossRecorder()
         val_epoch_loss_recorder = train_util.LossRecorder()
+
+        if args.edm2_loss_weighting:
+            loss_scaled_recorder = train_util.LossRecorder()
 
         del train_dataset_group
         if val_dataset_group is not None:
@@ -1298,7 +1331,7 @@ class NetworkTrainer:
             on_step_start_for_network = lambda *args, **kwargs: None
 
         # function for saving/removing
-        def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+        def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False, dtype_override=None):
             os.makedirs(args.output_dir, exist_ok=True)
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
@@ -1311,7 +1344,7 @@ class NetworkTrainer:
             sai_metadata = self.get_sai_model_spec(args)
             metadata_to_save.update(sai_metadata)
 
-            unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+            unwrapped_nw.save_weights(ckpt_file, dtype_override or save_dtype, metadata_to_save)
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
@@ -1335,6 +1368,9 @@ class NetworkTrainer:
         # For --sample_at_first
         optimizer_eval_fn()
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+
+        if plot_edm2_loss_weighting_check(args, global_step):
+            plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
         optimizer_train_fn()
         is_tracking = len(accelerator.trackers) > 0
         if is_tracking:
@@ -1403,6 +1439,10 @@ class NetworkTrainer:
                     torch.cuda.set_rng_state(gpu_rng_state)
             random.setstate(python_rng_state)
 
+        accumulation_counter = 0
+        current_global_step_loss = 0.0
+        current_global_step_loss_scaled = 0.0
+
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
             current_epoch.value = epoch + 1
@@ -1423,13 +1463,15 @@ class NetworkTrainer:
                     initial_step -= 1
                     continue
 
-                with accelerator.accumulate(training_model):
+                with train_util.determine_grad_sync_context(args, accelerator, None, training_model, edm2_model):
                     on_step_start_for_network(text_encoder, unet)
+
+                    accumulation_counter += 1
 
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
-                    loss = self.process_batch(
+                    loss, pre_scaling_loss, loss_scaled = self.process_batch(
                         batch,
                         text_encoders,
                         unet,
@@ -1448,6 +1490,7 @@ class NetworkTrainer:
                     )
 
                     accelerator.backward(loss)
+
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
@@ -1462,6 +1505,13 @@ class NetworkTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    if args.edm2_loss_weighting:
+                        edm2_model.step()
+                        edm2_lr_scheduler.step()
+                        # swap to pre_scaling_loss for logging
+                        loss = pre_scaling_loss
+                        edm2_optimizer.zero_grad(set_to_none=True)
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -1487,6 +1537,12 @@ class NetworkTrainer:
                         mean_combined_norm = None
                         max_mean_logs = {}
 
+                current_global_step_loss += loss.detach().item()
+                if args.edm2_loss_weighting:
+                    current_global_step_loss_scaled += loss_scaled.detach().item()
+                else:
+                    current_global_step_loss_scaled = None
+
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
@@ -1505,6 +1561,10 @@ class NetworkTrainer:
                             ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
                             save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
 
+                            if args.edm2_loss_weighting:
+                                loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step, "_edm2_loss_weights")
+                                save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, epoch, dtype_override=torch.float32)
+
                             if args.save_state:
                                 train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
 
@@ -1512,100 +1572,124 @@ class NetworkTrainer:
                             if remove_step_no is not None:
                                 remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
                                 remove_model(remove_ckpt_name)
+
+                                if args.edm2_loss_weighting:
+                                    remove_loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no, "_edm2_loss_weights")
+                                    remove_model(remove_loss_weights_ckpt_name)
+
+                    if plot_edm2_loss_weighting_check(args, global_step):
+                        plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
                     optimizer_train_fn()
 
-                current_loss = loss.detach().item()
-                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-                avr_loss: float = loss_recorder.moving_average
-                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**{**max_mean_logs, **logs})
-
-                if is_tracking:
-                    logs = self.generate_step_logs(
-                        args,
-                        current_loss,
-                        avr_loss,
-                        lr_scheduler,
-                        lr_descriptions,
-                        optimizer,
-                        keys_scaled,
-                        mean_norm,
-                        maximum_norm,
-                        mean_grad_norm,
-                        mean_combined_norm,
-                    )
-                    self.step_logging(accelerator, logs, global_step, epoch + 1)
-
-                # VALIDATION PER STEP: global_step is already incremented
-                # for example, if validate_every_n_steps=100, validate at step 100, 200, 300, ...
-                should_validate_step = args.validate_every_n_steps is not None and global_step % args.validate_every_n_steps == 0
-                if accelerator.sync_gradients and validation_steps > 0 and should_validate_step:
-                    optimizer_eval_fn()
-                    accelerator.unwrap_model(network).eval()
-                    rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
-
-                    val_progress_bar = tqdm(
-                        range(validation_total_steps),
-                        smoothing=0,
-                        disable=not accelerator.is_local_main_process,
-                        desc="validation steps",
-                    )
-                    val_timesteps_step = 0
-                    for val_step, batch in enumerate(val_dataloader):
-                        if val_step >= validation_steps:
-                            break
-
-                        for timestep in validation_timesteps:
-                            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
-
-                            args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
-
-                            loss = self.process_batch(
-                                batch,
-                                text_encoders,
-                                unet,
-                                network,
-                                vae,
-                                noise_scheduler,
-                                vae_dtype,
-                                weight_dtype,
-                                accelerator,
-                                args,
-                                text_encoding_strategy,
-                                tokenize_strategy,
-                                is_train=False,
-                                train_text_encoder=train_text_encoder,  # this is needed for validation because Text Encoders must be called if train_text_encoder is True
-                                train_unet=train_unet,
-                            )
-
-                            current_loss = loss.detach().item()
-                            val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                            val_progress_bar.update(1)
-                            val_progress_bar.set_postfix(
-                                {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
-                            )
-
-                            # if is_tracking:
-                            #     logs = {f"loss/validation/step_current_{timestep}": current_loss}
-                            #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
-
-                            self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
-                            val_timesteps_step += 1
+                    current_loss = loss.detach().item()
+                    loss_recorder.add(epoch=epoch, step=global_step, loss=current_global_step_loss / accumulation_counter)
+                    if args.edm2_loss_weighting:
+                        loss_scaled_recorder.add(epoch=epoch, step=global_step, loss=current_global_step_loss_scaled / accumulation_counter)
+                    avr_loss: float = loss_recorder.moving_average
+                    logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                    progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                     if is_tracking:
-                        loss_validation_divergence = val_step_loss_recorder.moving_average - loss_recorder.moving_average
-                        logs = {
-                            "loss/validation/step_average": val_step_loss_recorder.moving_average,
-                            "loss/validation/step_divergence": loss_validation_divergence,
-                        }
-                        self.step_logging(accelerator, logs, global_step, epoch=epoch + 1)
+                        if args.edm2_loss_weighting:
+                            current_global_step_loss_scaled = (current_global_step_loss_scaled / accumulation_counter)
+                            average_loss_scaled: float = loss_scaled_recorder.moving_average
+                        else:
+                            current_global_step_loss_scaled = None
+                            average_loss_scaled = None
 
-                    restore_rng_state(rng_states)
-                    args.min_timestep = original_args_min_timestep
-                    args.max_timestep = original_args_max_timestep
-                    optimizer_train_fn()
-                    accelerator.unwrap_model(network).train()
-                    progress_bar.unpause()
+                        logs = self.generate_step_logs(
+                            args,
+                            current_global_step_loss,
+                            avr_loss,
+                            lr_scheduler,
+                            lr_descriptions,
+                            optimizer,
+                            keys_scaled,
+                            mean_norm,
+                            maximum_norm,
+                            mean_grad_norm,
+                            mean_combined_norm,
+                            edm2_lr_scheduler,
+                            current_global_step_loss_scaled,
+                            average_loss_scaled,
+                        )
+                        self.step_logging(accelerator, logs, global_step, epoch + 1)
+
+                    accumulation_counter = 0
+                    current_global_step_loss = 0.0
+                    if args.edm2_loss_weighting:
+                        current_global_step_loss_scaled = 0.0
+
+                    # VALIDATION PER STEP: global_step is already incremented
+                    # for example, if validate_every_n_steps=100, validate at step 100, 200, 300, ...
+                    should_validate_step = args.validate_every_n_steps is not None and global_step % args.validate_every_n_steps == 0
+                    if accelerator.sync_gradients and validation_steps > 0 and should_validate_step:
+                        optimizer_eval_fn()
+                        accelerator.unwrap_model(network).eval()
+                        rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
+
+                        val_progress_bar = tqdm(
+                            range(validation_total_steps),
+                            smoothing=0,
+                            disable=not accelerator.is_local_main_process,
+                            desc="validation steps",
+                        )
+                        val_timesteps_step = 0
+                        for val_step, batch in enumerate(val_dataloader):
+                            if val_step >= validation_steps:
+                                break
+
+                            for timestep in validation_timesteps:
+                                self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
+
+                                args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
+
+                                loss, _, _ = self.process_batch(
+                                    batch,
+                                    text_encoders,
+                                    unet,
+                                    network,
+                                    vae,
+                                    noise_scheduler,
+                                    vae_dtype,
+                                    weight_dtype,
+                                    accelerator,
+                                    args,
+                                    text_encoding_strategy,
+                                    tokenize_strategy,
+                                    is_train=False,
+                                    train_text_encoder=train_text_encoder,  # this is needed for validation because Text Encoders must be called if train_text_encoder is True
+                                    train_unet=train_unet,
+                                )
+
+                                current_loss = loss.detach().item()
+                                val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
+                                val_progress_bar.update(1)
+                                val_progress_bar.set_postfix(
+                                    {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
+                                )
+
+                                # if is_tracking:
+                                #     logs = {f"loss/validation/step_current_{timestep}": current_loss}
+                                #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
+
+                                self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                                val_timesteps_step += 1
+
+                        if is_tracking:
+                            loss_validation_divergence = val_step_loss_recorder.moving_average - loss_recorder.moving_average
+                            logs = {
+                                "loss/validation/step_average": val_step_loss_recorder.moving_average,
+                                "loss/validation/step_divergence": loss_validation_divergence,
+                            }
+                            self.step_logging(accelerator, logs, global_step, epoch=epoch + 1)
+
+                        restore_rng_state(rng_states)
+                        args.min_timestep = original_args_min_timestep
+                        args.max_timestep = original_args_max_timestep
+                        optimizer_train_fn()
+                        accelerator.unwrap_model(network).train()
+                        progress_bar.unpause()
 
                 if global_step >= args.max_train_steps:
                     break
@@ -1638,7 +1722,7 @@ class NetworkTrainer:
                         # temporary, for batch processing
                         self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
-                        loss = self.process_batch(
+                        loss, _, _ = self.process_batch(
                             batch,
                             text_encoders,
                             unet,
@@ -1701,15 +1785,26 @@ class NetworkTrainer:
                     ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
                     save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
 
+                    if args.edm2_loss_weighting:
+                        loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1, "_edm2_loss_weights")
+                        save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, epoch + 1, dtype_override=torch.float32)
+
                     remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
                     if remove_epoch_no is not None:
                         remove_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
                         remove_model(remove_ckpt_name)
 
+                        if args.edm2_loss_weighting:
+                            remove_loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no, "_edm2_loss_weights")
+                            remove_model(remove_loss_weights_ckpt_name)
+
                     if args.save_state:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+
+            if plot_edm2_loss_weighting_check(args, global_step):
+                plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
             progress_bar.unpause()
             optimizer_train_fn()
 
@@ -1730,6 +1825,10 @@ class NetworkTrainer:
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+
+            if args.edm2_loss_weighting:
+                loss_weights_ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as, "_edm2_loss_weights")
+                save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, num_train_epochs, force_sync_upload=True, dtype_override=torch.float32)
 
             logger.info("model saved.")
 
@@ -1909,6 +2008,148 @@ def setup_parser() -> argparse.ArgumentParser:
         "--use_ramtorch",
         action="store_true",
         help="Use RamTorch to reduce GPU memory usage by keeping model weights on CPU.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting",
+        action="store_true",
+        help="Use EDM2 loss weighting.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_laplace",
+        action="store_true",
+        help="Use EDM2 loss weighting to calculate timestep sampling using laplace.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_optimizer",
+        type=str,
+        default="torch.optim.AdamW",
+        help="Fully qualified optimizer class name to use with the edm2 loss weighting optimizer.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_optimizer_lr",
+        type=float,
+        default=2e-2,
+        help="Learning rate as a float for the edm2 loss weighting optimizer.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_optimizer_args",
+        type=str,
+        default=r"{'weight_decay': 0, 'betas': (0.9,0.999)}",
+        help="A JSON object as a string of optimizer args for the edm2 loss weighting optimizer.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_lr_scheduler",
+        action="store_true",
+        help="Use lr scheduler with EDM2 loss weighting optimizer.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_lr_scheduler_warmup_percent",
+        type=float,
+        default=0.1,
+        help="Percent of training steps to use for warmup.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_lr_scheduler_constant_percent",
+        type=float,
+        default=0.1,
+        help="Percent of training steps to maintain constant LR before decay.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_generate_graph",
+        action="store_true",
+        help="Enable generation of graph images that show the loss weighting per timestep.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_generate_graph_every_x_steps",
+        type=int,
+        default=20,
+        help="Every x steps generate a graph image.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_generate_graph_output_dir",
+        type=str,
+        default=None,
+        help="""The parent directory where loss weighting graph images should be stored, 
+        with sub directories automatically created and named after the model's defined name.""",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_generate_graph_y_limit",
+        type=int,
+        default=None,
+        help="""Set the max limit of the y axis, if not set, uses dynamic scaling of the y-axis, which can make it harder to follow. 
+        6 is a good value for v-pred + ztsnr without any augmentation (i.e. low min snr gamma, debiased loss, or scaled v-pred loss). 
+        If any of the noted augmentations are used, weighting values can reach ~100-150.""",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_generate_graph_y_scale",
+        type=str,
+        default="linear",
+        choices=["linear", "log"],
+        help="""Select between linear or log scaling for the y-axis.""",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_num_channels",
+        type=int,
+        default=128,
+        help="The number of channels used by for the loss weighting module. Additional channels allows for greater granularity in the weighting.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_initial_weights",
+        type=str,
+        default=None,
+        help="The full filepath to initial weights and state of edm2 weighting model to use instead of random.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_lr_scheduler_decay_scaling",
+        type=float,
+        default=1.0,
+        help="A scaling factor to apply to the decay rate of the edm2_loss_weighting_lr_scheduler, lower values result in slower decay, higher values result in faster decay.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_importance_weighting",
+        action="store_true",
+        help="If edm2 loss scaling weights are weighted by importance, which is based using a specific min snr gamma value and SNR for the given timestep. " \
+        "Default behavior when edm2_loss_weighting_importance_weighting is enabled is to disable normal min snr gamma and debiased loss if enabled." \
+        "It is not advised to stack with either, as there is a possiblity of loss curving to 0 as SNR approaches 0." \
+        "If you still wish to, set edm2_loss_weighting_importance_weighting_safety_override=True at your own risk."
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_importance_weighting_max",
+        type=float,
+        default=10.0,
+        help="The max loss weighting/scaling to apply when using edm2 importance weighting, has no effect otherwise.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_importance_min_snr_gamma",
+        type=float,
+        default=1.0,
+        help="The min snr gamma used for edm2 importance weighting as a heuristic, has no effect if not using importance weighting. " \
+        "Not related to the typical application of min snr gamma.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_importance_weighting_safety_override",
+        action="store_true",
+        help="At your own risk, you may set this to true to ALLOW stacking debiased loss and/or typical min snr gamma with EDM2 using importance weighting.",
     )
 
     return parser

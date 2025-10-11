@@ -23,6 +23,7 @@ import hashlib
 import subprocess
 from io import BytesIO
 import toml
+import contextlib
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -5818,19 +5819,19 @@ def default_if_none(value, default):
     return default if value is None else value
 
 
-def get_epoch_ckpt_name(args: argparse.Namespace, ext: str, epoch_no: int):
+def get_epoch_ckpt_name(args: argparse.Namespace, ext: str, epoch_no: int, output_name_append: str = ""):
     model_name = default_if_none(args.output_name, DEFAULT_EPOCH_NAME)
-    return EPOCH_FILE_NAME.format(model_name, epoch_no) + ext
+    return EPOCH_FILE_NAME.format(model_name + output_name_append, epoch_no) + ext
 
 
-def get_step_ckpt_name(args: argparse.Namespace, ext: str, step_no: int):
+def get_step_ckpt_name(args: argparse.Namespace, ext: str, step_no: int, output_name_append: str = ""):
     model_name = default_if_none(args.output_name, DEFAULT_STEP_NAME)
-    return STEP_FILE_NAME.format(model_name, step_no) + ext
+    return STEP_FILE_NAME.format(model_name + output_name_append, step_no) + ext
 
 
-def get_last_ckpt_name(args: argparse.Namespace, ext: str):
+def get_last_ckpt_name(args: argparse.Namespace, ext: str, output_name_append: str = ""):
     model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME)
-    return model_name + ext
+    return model_name + output_name_append + ext
 
 
 def get_remove_epoch_no(args: argparse.Namespace, epoch_no: int):
@@ -6676,6 +6677,22 @@ def set_torch_cuda_reduced_precision(args):
         torch.backends.cuda.matmul.allow_tf32=True
         torch.backends.cudnn.allow_tf32=True
         torch.backends.cuda.allow_fp16_bf16_reduction_math_sdp(True)
+
+def determine_grad_sync_context(args, accelerator, sync_gradients, training_model, edm2_model = None):
+    # TODO
+    #if args.full_bf16:
+    #    if not sync_gradients and accelerator.num_processes > 1:
+    #        if edm2_model is not None:
+    #            return accelerator.no_sync(training_model, edm2_model)
+    #        else:
+    #            return accelerator.no_sync(training_model)
+    #    else:
+    #        return contextlib.nullcontext()
+    #else:
+    if edm2_model is not None:
+        return accelerator.accumulate(training_model, edm2_model)
+    else:
+        return accelerator.accumulate(training_model)
 
 def args_set_seed(args):
     set_seed(args)
