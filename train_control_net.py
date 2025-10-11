@@ -18,7 +18,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from accelerate.utils import set_seed
+
 from diffusers import DDPMScheduler, ControlNetModel
 from safetensors.torch import load_file
 
@@ -69,9 +69,7 @@ def train(args):
     cache_latents = args.cache_latents
     use_user_config = args.dataset_config is not None
 
-    if args.seed is None:
-        args.seed = random.randint(0, 2**32)
-    set_seed(args.seed)
+    train_util.args_set_seed(args)
 
     tokenize_strategy = strategy_sd.SdTokenizeStrategy(args.v2, args.max_token_length, args.tokenizer_cache_dir)
     strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)

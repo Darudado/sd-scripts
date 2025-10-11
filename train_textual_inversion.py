@@ -13,7 +13,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from accelerate.utils import set_seed
+
 from diffusers import DDPMScheduler
 from transformers import CLIPTokenizer
 from library import deepspeed_utils, model_util, strategy_base, strategy_sd, sai_model_spec
@@ -193,8 +193,7 @@ class TextualInversionTrainer:
 
         cache_latents = args.cache_latents
 
-        if args.seed is not None:
-            set_seed(args.seed)
+        train_util.args_set_seed(args)
 
         tokenize_strategy = self.get_tokenize_strategy(args)
         strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)

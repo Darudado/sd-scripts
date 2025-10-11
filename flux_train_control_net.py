@@ -29,7 +29,7 @@ from library.device_utils import clean_memory_on_device, init_ipex
 
 init_ipex()
 
-from accelerate.utils import set_seed
+
 
 import library.train_util as train_util
 import library.sai_model_spec as sai_model_spec
@@ -97,8 +97,7 @@ def train(args):
 
     cache_latents = args.cache_latents
 
-    if args.seed is not None:
-        set_seed(args.seed)  # 乱数系列を初期化する
+    train_util.args_set_seed(args)
 
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     if args.cache_latents:

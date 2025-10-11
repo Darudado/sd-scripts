@@ -13,7 +13,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from accelerate.utils import set_seed
+
 import diffusers
 from diffusers import DDPMScheduler
 import library
@@ -117,8 +117,7 @@ def train(args):
 
     cache_latents = args.cache_latents
 
-    if args.seed is not None:
-        set_seed(args.seed)
+    train_util.args_set_seed(args)
 
     tokenizer = train_util.load_tokenizer(args)
 

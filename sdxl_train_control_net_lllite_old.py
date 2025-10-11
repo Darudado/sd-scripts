@@ -16,7 +16,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from accelerate.utils import set_seed
+
 from diffusers import DDPMScheduler, ControlNetModel
 from safetensors.torch import load_file
 from library import deepspeed_utils, sai_model_spec, sdxl_model_util, sdxl_original_unet, sdxl_train_util
@@ -72,9 +72,7 @@ def train(args):
     cache_latents = args.cache_latents
     use_user_config = args.dataset_config is not None
 
-    if args.seed is None:
-        args.seed = random.randint(0, 2**32)
-    set_seed(args.seed)
+    train_util.args_set_seed(args)
 
     tokenizer1, tokenizer2 = sdxl_train_util.load_tokenizers(args)
 

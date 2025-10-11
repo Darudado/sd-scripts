@@ -18,7 +18,7 @@ from library.safetensors_utils import load_safetensors
 
 init_ipex()
 
-from accelerate.utils import set_seed
+
 from diffusers import DDPMScheduler
 from library import deepspeed_utils, sd3_models, sd3_train_utils, sd3_utils, strategy_base, strategy_sd3
 
@@ -101,8 +101,7 @@ def train(args):
     cache_latents = args.cache_latents
     use_dreambooth_method = args.in_json is None
 
-    if args.seed is not None:
-        set_seed(args.seed)  # 乱数系列を初期化する
+    train_util.args_set_seed(args)
 
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     if args.cache_latents:

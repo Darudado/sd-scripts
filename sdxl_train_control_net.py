@@ -12,7 +12,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from accelerate.utils import set_seed
+
 from accelerate import init_empty_weights
 from diffusers import DDPMScheduler
 from diffusers.utils.torch_utils import is_compiled_module
@@ -75,9 +75,7 @@ def train(args):
     cache_latents = args.cache_latents
     use_user_config = args.dataset_config is not None
 
-    if args.seed is None:
-        args.seed = random.randint(0, 2**32)
-    set_seed(args.seed)
+    train_util.args_set_seed(args)
 
     tokenize_strategy = strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
     strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)

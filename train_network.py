@@ -21,7 +21,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from accelerate.utils import set_seed
+
 from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
@@ -502,9 +502,7 @@ class NetworkTrainer:
         use_dreambooth_method = args.in_json is None
         use_user_config = args.dataset_config is not None
 
-        if args.seed is None:
-            args.seed = random.randint(0, 2**32)
-        set_seed(args.seed)
+        train_util.args_set_seed(args)
 
         tokenize_strategy = self.get_tokenize_strategy(args)
         strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
