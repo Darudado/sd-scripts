@@ -72,7 +72,7 @@ def train(args):
     cache_latents = args.cache_latents
     use_user_config = args.dataset_config is not None
 
-    train_util.args_set_seed(args)
+    train_util.args_set_seed(args, accelerator)
 
     tokenizer1, tokenizer2 = sdxl_train_util.load_tokenizers(args)
 

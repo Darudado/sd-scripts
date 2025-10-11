@@ -117,7 +117,7 @@ def train(args):
 
     cache_latents = args.cache_latents
 
-    train_util.args_set_seed(args)
+    train_util.args_set_seed(args, accelerator)
 
     tokenizer = train_util.load_tokenizer(args)
 

@@ -58,7 +58,7 @@ def train(args):
 
     cache_latents = args.cache_latents
 
-    train_util.args_set_seed(args)
+    train_util.args_set_seed(args, accelerator)
 
     tokenize_strategy = strategy_sd.SdTokenizeStrategy(args.v2, args.max_token_length, args.tokenizer_cache_dir)
     strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)

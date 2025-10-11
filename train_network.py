@@ -504,7 +504,7 @@ class NetworkTrainer:
         use_dreambooth_method = args.in_json is None
         use_user_config = args.dataset_config is not None
 
-        train_util.args_set_seed(args)
+        train_util.args_set_seed(args, accelerator)
 
         tokenize_strategy = self.get_tokenize_strategy(args)
         strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
