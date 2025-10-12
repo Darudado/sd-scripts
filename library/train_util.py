@@ -464,8 +464,8 @@ class BaseSubset:
 
         self.img_count = 0
 
-        self.validation_seed = validation_seed
-        self.validation_split = validation_split
+        self.validation_seed = int(validation_seed) if validation_seed is not None else None
+        self.validation_split = float(validation_split) if validation_split is not None else 0.0
 
         self.resize_interpolation = resize_interpolation
 
@@ -1942,8 +1942,8 @@ class DreamBoothDataset(BaseDataset):
         self.prior_loss_weight = prior_loss_weight
         self.latents_cache = None
         self.is_training_dataset = is_training_dataset
-        self.validation_seed = validation_seed
-        self.validation_split = validation_split
+        self.validation_seed = int(validation_seed) if validation_seed is not None else None
+        self.validation_split = float(validation_split) if validation_split is not None else 0.0
 
         self.enable_bucket = enable_bucket
         if self.enable_bucket:
@@ -2507,8 +2507,8 @@ class ControlNetDataset(BaseDataset):
         self.batch_size = batch_size
         self.num_train_images = self.dreambooth_dataset_delegate.num_train_images
         self.num_reg_images = self.dreambooth_dataset_delegate.num_reg_images
-        self.validation_split = validation_split
-        self.validation_seed = validation_seed
+        self.validation_seed = int(validation_seed) if validation_seed is not None else None
+        self.validation_split = float(validation_split) if validation_split is not None else 0.0
         self.resize_interpolation = resize_interpolation
 
         # assert all conditioning data exists

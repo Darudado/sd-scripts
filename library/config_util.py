@@ -241,8 +241,8 @@ class ConfigSanitizer:
         "enable_bucket": bool,
         "max_bucket_reso": int,
         "min_bucket_reso": int,
-        "validation_seed": int,
-        "validation_split": float,
+        "validation_seed": Any(str, int),
+        "validation_split": Any(str, float),
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "network_multiplier": float,
         "resize_interpolation": str,
@@ -496,6 +496,8 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
 
     val_datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
     for dataset_blueprint in dataset_group_blueprint.datasets:
+        dataset_blueprint.params.validation_split = float(dataset_blueprint.params.validation_split) if dataset_blueprint.params.validation_split is not None else 0.0
+
         if dataset_blueprint.params.validation_split < 0.0 or dataset_blueprint.params.validation_split > 1.0:
             logging.warning(f"Dataset param `validation_split` ({dataset_blueprint.params.validation_split}) is not a valid number between 0.0 and 1.0, skipping validation split...")
             continue

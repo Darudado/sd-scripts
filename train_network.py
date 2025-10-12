@@ -1090,7 +1090,7 @@ class NetworkTrainer:
             "ss_fp8_base": bool(args.fp8_base),
             "ss_fp8_base_unet": bool(args.fp8_base_unet),
             "ss_validation_seed": args.validation_seed,
-            "ss_validation_split": args.validation_split,
+            "ss_validation_split": float(args.validation_split),
             "ss_max_validation_steps": args.max_validation_steps,
             "ss_validate_every_n_epochs": args.validate_every_n_epochs,
             "ss_validate_every_n_steps": args.validate_every_n_steps,
