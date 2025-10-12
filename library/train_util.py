@@ -5343,6 +5343,9 @@ def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) 
 def is_schedulefree_optimizer(optimizer: Optimizer, args: argparse.Namespace) -> bool:
     return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower().endswith("schedulefreewrapper".lower())
 
+def is_schedulefree_wrapper_optimizer(args: argparse.Namespace) -> bool:
+    return args.optimizer_type.lower().endswith("schedulefreewrapper".lower())
+
 def get_dummy_scheduler(optimizer: Optimizer) -> Any:
     # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
     # this scheduler is used for logging only.
@@ -5369,17 +5372,29 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     Unified API to get any scheduler from its name.
     """
     # if schedulefree optimizer, return dummy scheduler
-    if is_schedulefree_optimizer(optimizer, args):
+    if args.optimizer_type.lower().split(".")[0] not in {"LoraEasyCustomOptimizer".lower(), "prodigyplus".lower()} and is_schedulefree_optimizer(optimizer, args):
         return get_dummy_scheduler(optimizer)
+    
+    # Need to apply scheduler to base_optimizer
+    if is_schedulefree_wrapper_optimizer(args):
+        optimizer = optimizer.base_optimizer
 
     name = args.lr_scheduler
     num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
     num_warmup_steps: Optional[int] = (
         int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
     )
+
+    temp_lr_decay_steps = parse_string_to_type(args.lr_decay_steps) if args.lr_decay_steps is not None else args.lr_decay_steps or 0
+
     num_decay_steps: Optional[int] = (
-        int(args.lr_decay_steps * num_training_steps) if isinstance(args.lr_decay_steps, float) else args.lr_decay_steps
+        int(temp_lr_decay_steps * num_training_steps) if isinstance(temp_lr_decay_steps, float) else temp_lr_decay_steps
     )
+
+    # TODO add inputs to UI to support setting decay steps
+    if name == SchedulerType.WARMUP_STABLE_DECAY and (num_decay_steps is None or num_decay_steps == 0):
+        num_decay_steps = num_warmup_steps
+
     num_stable_steps = num_training_steps - num_warmup_steps - num_decay_steps
     num_cycles = args.lr_scheduler_num_cycles
     power = args.lr_scheduler_power
@@ -5391,6 +5406,17 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         for arg in args.lr_scheduler_args:
             key, value = arg.split("=")
             value = ast.literal_eval(value)
+
+            # TODO temp fix for warmup and first cycle steps pending UI changes
+            if key == 'first_cycle_max_steps' and float(args.validation_split) > 0.0:
+                value = math.ceil(num_training_steps / num_cycles)
+                num_cycles = 1
+            elif key == 'first_cycle_max_steps':
+                num_cycles = 1
+            
+            if key == 'warmup_steps' and float(args.validation_split) > 0.0:
+                value = math.ceil(value * (1.0 - float(args.validation_split)))
+
             lr_scheduler_kwargs[key] = value
 
     def wrap_check_needless_num_warmup_steps(return_vals):
@@ -5411,6 +5437,8 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
         lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
         return wrap_check_needless_num_warmup_steps(lr_scheduler)
+    else:
+        logger.info(f"use {name} | {lr_scheduler_kwargs} as lr_scheduler")
 
     if name.startswith("adafactor"):
         assert (
@@ -5424,6 +5452,12 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         name = DiffusersSchedulerType(name)
         schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
         return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
+
+    if name.lower() == 'CosineAnnealingLR'.lower():
+        return wrap_check_needless_num_warmup_steps(CosineAnnealingLR(optimizer, 
+                                 T_max=num_training_steps,
+                                 eta_min=lr_scheduler_kwargs.get("min_lr", 1e-8),
+                                 last_epoch=lr_scheduler_kwargs.get("last_epoch", -1)))
 
     name = SchedulerType(name)
     schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
@@ -5479,6 +5513,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         )
 
     # All other schedulers require `num_decay_steps`
+
     if num_decay_steps is None:
         raise ValueError(f"{name} requires `num_decay_steps`, please provide that argument.")
     if name == SchedulerType.WARMUP_STABLE_DECAY:
@@ -5487,7 +5522,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             num_warmup_steps=num_warmup_steps,
             num_stable_steps=num_stable_steps,
             num_decay_steps=num_decay_steps,
-            num_cycles=num_cycles / 2,
+            num_cycles=num_cycles / 2.0,
             min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
             **lr_scheduler_kwargs,
         )
@@ -5499,6 +5534,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         num_decay_steps=num_decay_steps,
         **lr_scheduler_kwargs,
     )
+
 
 
 def prepare_dataset_args(args: argparse.Namespace, support_metadata: bool):
