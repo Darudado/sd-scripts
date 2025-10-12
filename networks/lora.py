@@ -1145,7 +1145,12 @@ class LoRANetwork(torch.nn.Module):
         logger.info(f"LoRA+ Text Encoder LR Ratio: {self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}")
 
     # 二つのText Encoderに別々の学習率を設定できるようにするといいかも
-    def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
+    def prepare_optimizer_params(self, 
+                                 text_encoder_lr: float, 
+                                 unet_lr: float, 
+                                 learning_rate: float, 
+                                 apply_orthograd: bool, 
+                                 orthograd_targets: list[str]):
         # TODO warn if optimizer is not compatible with LoRA+ (but it will cause error so we don't need to check it here?)
         # if (
         #     self.loraplus_lr_ratio is not None
@@ -1196,7 +1201,7 @@ class LoRANetwork(torch.nn.Module):
         if self.text_encoder_loras:
             params, descriptions = assemble_params(
                 self.text_encoder_loras,
-                text_encoder_lr if text_encoder_lr is not None else default_lr,
+                text_encoder_lr if text_encoder_lr is not None else learning_rate,
                 self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio,
             )
             all_params.extend(params)
@@ -1222,7 +1227,7 @@ class LoRANetwork(torch.nn.Module):
                 for idx, block_loras in block_idx_to_lora.items():
                     params, descriptions = assemble_params(
                         block_loras,
-                        (unet_lr if unet_lr is not None else default_lr) * self.get_lr_weight(idx),
+                        (unet_lr if unet_lr is not None else learning_rate) * self.get_lr_weight(idx),
                         self.loraplus_unet_lr_ratio or self.loraplus_lr_ratio,
                     )
                     all_params.extend(params)
@@ -1231,7 +1236,7 @@ class LoRANetwork(torch.nn.Module):
             else:
                 params, descriptions = assemble_params(
                     self.unet_loras,
-                    unet_lr if unet_lr is not None else default_lr,
+                    unet_lr if unet_lr is not None else learning_rate,
                     self.loraplus_unet_lr_ratio or self.loraplus_lr_ratio,
                 )
                 all_params.extend(params)

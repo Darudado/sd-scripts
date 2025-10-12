@@ -1033,7 +1033,12 @@ class LoRANetwork(torch.nn.Module):
         return lr_weight
 
     # 二つのText Encoderに別々の学習率を設定できるようにするといいかも
-    def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
+    def prepare_optimizer_params(self, 
+                                 text_encoder_lr: float, 
+                                 unet_lr: float, 
+                                 learning_rate: float, 
+                                 apply_orthograd: bool, 
+                                 orthograd_targets: list[str]):
         self.requires_grad_(True)
         all_params = []
 
@@ -1066,8 +1071,8 @@ class LoRANetwork(torch.nn.Module):
 
                     if unet_lr is not None:
                         param_data["lr"] = unet_lr * self.get_lr_weight(block_loras[0])
-                    elif default_lr is not None:
-                        param_data["lr"] = default_lr * self.get_lr_weight(block_loras[0])
+                    elif learning_rate is not None:
+                        param_data["lr"] = learning_rate * self.get_lr_weight(block_loras[0])
                     if ("lr" in param_data) and (param_data["lr"] == 0):
                         continue
                     all_params.append(param_data)

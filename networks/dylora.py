@@ -432,7 +432,12 @@ class DyLoRANetwork(torch.nn.Module):
     """
 
     # 二つのText Encoderに別々の学習率を設定できるようにするといいかも
-    def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
+    def prepare_optimizer_params(self, 
+                                 text_encoder_lr: float, 
+                                 unet_lr: float, 
+                                 learning_rate: float, 
+                                 apply_orthograd: bool, 
+                                 orthograd_targets: list[str]):
         self.requires_grad_(True)
         all_params = []
 
@@ -468,14 +473,14 @@ class DyLoRANetwork(torch.nn.Module):
         if self.text_encoder_loras:
             params = assemble_params(
                 self.text_encoder_loras,
-                text_encoder_lr if text_encoder_lr is not None else default_lr,
+                text_encoder_lr if text_encoder_lr is not None else learning_rate,
                 self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio,
             )
             all_params.extend(params)
 
         if self.unet_loras:
             params = assemble_params(
-                self.unet_loras, default_lr if unet_lr is None else unet_lr, self.loraplus_unet_lr_ratio or self.loraplus_lr_ratio
+                self.unet_loras, learning_rate if unet_lr is None else unet_lr, self.loraplus_unet_lr_ratio or self.loraplus_lr_ratio
             )
             all_params.extend(params)
 

@@ -26,6 +26,8 @@ from io import BytesIO
 import toml
 import contextlib
 import kornia
+import inspect
+import types
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -4910,7 +4912,7 @@ def resume_from_local_or_hf_if_specified(accelerator, args):
     accelerator.load_state(dirname)
 
 
-def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
+def get_optimizer(args, trainable_params, optimizer_kwargs: Dict = {}) -> tuple[str, str, object]:
     # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, AdEMAMix8bit, PagedAdEMAMix8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, Adafactor"
 
     optimizer_type = args.optimizer_type
@@ -4942,11 +4944,13 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         ), "fused_backward_pass does not work with gradient_accumulation_steps > 1 / fused_backward_passはgradient_accumulation_steps>1では機能しません"
 
     # 引数を分解する
-    optimizer_kwargs = {}
-    if args.optimizer_args is not None and len(args.optimizer_args) > 0:
+    if not optimizer_kwargs and args.optimizer_args is not None and len(args.optimizer_args) > 0:
         for arg in args.optimizer_args:
             key, value = arg.split("=")
-            value = ast.literal_eval(value)
+            try:
+                value = ast.literal_eval(value)
+            except ValueError:
+                value = value
 
             # value = value.split(",")
             # for i in range(len(value)):
@@ -5218,8 +5222,19 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
             optimizer_module = importlib.import_module(".".join(values[:-1]))
             case_sensitive_optimizer_type = values[-1]
 
-        optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
-        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+        # Need to handle base optimizer
+        if case_sensitive_optimizer_type.lower() == "schedulefreewrapper":
+            case_sensitive_full_base_optimizer_name = optimizer_kwargs.get("base_optimizer_type", None)
+            base_optimizer_values = case_sensitive_full_base_optimizer_name.split(".")
+            base_optimizer_module = importlib.import_module(".".join(base_optimizer_values[:-1]))
+            case_sensitive_base_optimizer_type = base_optimizer_values[-1]
+            base_optimizer_class = getattr(base_optimizer_module, case_sensitive_base_optimizer_type)
+
+            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+            optimizer = optimizer_class(trainable_params, base_optimizer_class, lr=lr, **optimizer_kwargs)
+        else:
+            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     """
     # wrap any of above optimizer with schedulefree, if optimizer is not schedulefree
@@ -5314,7 +5329,7 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
 
 
 def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) -> Tuple[Callable, Callable]:
-    if not is_schedulefree_optimizer(optimizer, args):
+    if not is_schedulefree_optimizer(optimizer, args) or getattr(args,"fused_optimizer_groups", False):
         # return dummy func
         return lambda: None, lambda: None
 
@@ -5326,8 +5341,7 @@ def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) 
 
 
 def is_schedulefree_optimizer(optimizer: Optimizer, args: argparse.Namespace) -> bool:
-    return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
-
+    return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower().endswith("schedulefreewrapper".lower())
 
 def get_dummy_scheduler(optimizer: Optimizer) -> Any:
     # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
@@ -7058,6 +7072,116 @@ def args_set_seed(args):
         args.seed = random.randint(0, 2**32)
         logger.info(f"As seed provided is -1, randomly selected {args.seed} as the seed for this training run.")
     set_seed(int(args.seed))
+
+
+def prepare_optimizer(args, network):
+    if isinstance(args.orthograd_targets, str):
+        orthograd_targets = ast.literal_eval(args.orthograd_targets)
+    else:
+        orthograd_targets = [
+            "lora_down.weight",
+            "lora_up.weight",
+            "lora_down1.weight",
+            "lora_up1.weight",
+            "lora_down2.weight",
+            "lora_up2.weight",
+            "a1.weight",
+            "a2.weight",
+            "b1.weight",
+            "b2.weight",
+            "c1.weight", 
+        ]
+
+    optimizer_kwargs = {}
+    if args.optimizer_args is not None and len(args.optimizer_args) > 0:
+        for arg in args.optimizer_args:
+            key, value = arg.split("=")
+            try:
+                value = ast.literal_eval(value)
+            except ValueError:
+                value = value
+
+            optimizer_kwargs[key] = value
+
+    try:
+        # Check optimizer defaults
+        case_sensitive_optimizer_type = args.optimizer_type  # not lower
+
+        if "." not in case_sensitive_optimizer_type:  # from torch.optim
+            optimizer_module = torch.optim
+        else:  # from other library
+            values = case_sensitive_optimizer_type.split(".")
+            optimizer_module = importlib.import_module(".".join(values[:-1]))
+            case_sensitive_optimizer_type = values[-1]
+
+        # Need to handle base optimizer
+        if case_sensitive_optimizer_type.lower() == "schedulefreewrapper":
+            case_sensitive_full_base_optimizer_name = optimizer_kwargs.get("base_optimizer_type", None)
+            base_optimizer_values = case_sensitive_full_base_optimizer_name.split(".")
+            base_optimizer_module = importlib.import_module(".".join(base_optimizer_values[:-1]))
+            case_sensitive_base_optimizer_type = base_optimizer_values[-1]
+            optimizer_class = getattr(base_optimizer_module, case_sensitive_base_optimizer_type)
+        else:
+            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+        
+        sig = inspect.signature(optimizer_class.__init__)
+
+        optimizer_init_sig_parameters = sig.parameters
+    except Exception as e:
+        logger.warning(f"Encountered an error while trying to determine default orthograd from optimizer init signature. {e}")
+        optimizer_init_sig_parameters = {}
+
+    apply_orthograd = any(optimizer_kwargs.get(key, getattr(optimizer_init_sig_parameters.get(key, types.SimpleNamespace()), "default", False)) == True for key in ['use_orthograd', 'orthograd'])
+
+    # make backward compatibility for text_encoder_lr
+    support_multiple_lrs = hasattr(network, "prepare_optimizer_params_with_multiple_te_lrs")
+    if support_multiple_lrs or args.network_module == "lycoris.kohya":
+        text_encoder_lr = args.text_encoder_lr
+    else:
+        # toml backward compatibility
+        if args.text_encoder_lr is None or isinstance(args.text_encoder_lr, float) or isinstance(args.text_encoder_lr, int):
+            text_encoder_lr = args.text_encoder_lr
+        else:
+            text_encoder_lr = None if len(args.text_encoder_lr) == 0 else args.text_encoder_lr[0]
+    
+    try:
+        if support_multiple_lrs:
+            # only flux and sd3 atm via Kohya's
+            results = network.prepare_optimizer_params_with_multiple_te_lrs(text_encoder_lr=text_encoder_lr, 
+                                                                            unet_lr=args.unet_lr, 
+                                                                            learning_rate=args.learning_rate,
+                                                                            apply_orthograd=apply_orthograd,
+                                                                            orthograd_targets=orthograd_targets)
+        else:
+            results = network.prepare_optimizer_params(text_encoder_lr=text_encoder_lr, 
+                                                        unet_lr=args.unet_lr, 
+                                                        learning_rate=args.learning_rate,
+                                                        apply_orthograd=apply_orthograd,
+                                                        orthograd_targets=orthograd_targets)
+        if type(results) is tuple:
+            trainable_params = results[0]
+            lr_descriptions = results[1]
+        else:
+            trainable_params = results
+            lr_descriptions = None
+    except TypeError as e:
+        results = network.prepare_optimizer_params(text_encoder_lr=text_encoder_lr, 
+                                                            unet_lr=args.unet_lr, 
+                                                            learning_rate=args.learning_rate,
+                                                            apply_orthograd=apply_orthograd,
+                                                            orthograd_targets=orthograd_targets)
+        if type(results) is tuple:
+            trainable_params = results[0]
+            lr_descriptions = results[1]
+        else:
+            trainable_params = results
+            lr_descriptions = None
+
+    optimizer_name, optimizer_args, optimizer = get_optimizer(args, trainable_params, optimizer_kwargs)
+    optimizer_train_fn, optimizer_eval_fn = get_optimizer_train_eval_fn(optimizer, args)
+
+    return optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn, lr_descriptions, text_encoder_lr
+
 
 # endregion
 
