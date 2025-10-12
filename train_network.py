@@ -1531,7 +1531,7 @@ class NetworkTrainer:
                         mean_grad_norm = grad_norms.mean().item() if grad_norms is not None else None
                         combined_weight_norms = network.combined_weight_norms()
                         mean_combined_norm = combined_weight_norms.mean().item() if combined_weight_norms is not None else None
-                        maximum_norm = weight_norms.max().item() if weight_norms is not None else None
+                        maximum_norm = weight_norms.max().item() if weight_norms is not None and weight_norms.numel() > 0 else None
                         keys_scaled = None
                         max_mean_logs = {}
                     else:
