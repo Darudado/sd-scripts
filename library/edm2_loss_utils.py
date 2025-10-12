@@ -1,10 +1,9 @@
-from library.utils import setup_logging
 import importlib
 import ast
-import edm2_loss
+from library import edm2_loss, train_util
+from library.utils import setup_logging
 import torch
 import math
-import train_util
 import matplotlib
 matplotlib.use('Agg')  # Set the backend to 'Agg', non-interactive backend
 import matplotlib.pyplot as plt

@@ -35,7 +35,7 @@ RamTorch~=0.1.6
 PyWavelets~=1.9.0
 # for Image utils
 imagesize~=1.4.1
-numpy~=2.3.3
+numpy~=2.2.6
 # <=2.0
 # for BLIP captioning
 # requests==2.28.2

@@ -14,7 +14,8 @@ import shutil
 import time
 import typing
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
-from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialStatefrom, set_seed
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
+from accelerate.utils import set_seed
 import glob
 import math
 import os
@@ -6695,7 +6696,10 @@ def determine_grad_sync_context(args, accelerator, sync_gradients, training_mode
         return accelerator.accumulate(training_model)
 
 def args_set_seed(args):
-    set_seed(args)
+    if args.seed is None or args.seed == -1:
+        args.seed = random.randint(0, 2**32)
+        logger.info(f"As seed provided is -1, randomly selected {args.seed} as the seed for this training run.")
+    set_seed(int(args.seed))
 
 # endregion
 
