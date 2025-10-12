@@ -24,7 +24,7 @@ def prepare_edm2_loss_weighting(args, noise_scheduler, accelerator):
         opti_args = ast.literal_eval(args.edm2_loss_weighting_optimizer_args)
         opti_lr = float(args.edm2_loss_weighting_optimizer_lr) if args.edm2_loss_weighting_optimizer_lr else 2e-2
 
-        edm2_model, edm2_optim = edm2_loss.create_weight_MLP(noise_scheduler,
+        edm2_model, edm2_optimizer = edm2_loss.create_weight_MLP(noise_scheduler,
                                                                     logvar_channels=int(args.edm2_loss_weighting_num_channels) if args.edm2_loss_weighting_num_channels else 128,
                                                                     optimizer=getattr(optimizer_module, case_sensitive_optimizer_type),
                                                                     lr=opti_lr,
@@ -51,21 +51,18 @@ def prepare_edm2_loss_weighting(args, noise_scheduler, accelerator):
                         return 1 / math.sqrt(max(current_step / max(constant_steps + warmup_steps, 1), 1)**decay_scaling)
                 return torch.optim.lr_scheduler.LambdaLR(optimizer=wrap_optimizer, lr_lambda=lr_lambda)
             
-            mlp_lr_scheduler = InverseSqrt(
-                edm2_optim,
+            edm2_lr_scheduler = InverseSqrt(
+                edm2_optimizer,
                 warmup_steps=args.max_train_steps * float(args.edm2_loss_weighting_lr_scheduler_warmup_percent) if args.edm2_loss_weighting_lr_scheduler_warmup_percent is not None else 0.05,
                 constant_steps=args.max_train_steps * float(args.edm2_loss_weighting_lr_scheduler_constant_percent) if args.edm2_loss_weighting_lr_scheduler_constant_percent is not None else 0.15,
                 decay_scaling=float(args.edm2_loss_weighting_lr_scheduler_decay_scaling) if args.edm2_loss_weighting_lr_scheduler_decay_scaling is not None else 1.0,
             )
         else:
-            mlp_lr_scheduler = train_util.get_dummy_scheduler(edm2_optim)
+            edm2_lr_scheduler = train_util.get_dummy_scheduler(edm2_optimizer)
 
-        mlp_lr_scheduler = accelerator.prepare(mlp_lr_scheduler)
+        edm2_lr_scheduler = accelerator.prepare(edm2_lr_scheduler)
             
-        edm2_model, edm2_optim = accelerator.prepare(edm2_model, edm2_optim)
-
-        if args.edm2_loss_weighting_generate_graph:
-            train_util.plot_dynamic_loss_weighting(args, 0, edm2_model, 1000, accelerator.device)
+        edm2_model, edm2_optimizer = accelerator.prepare(edm2_model, edm2_optimizer)
     else:
         edm2_optimizer = None
         edm2_lr_scheduler = None

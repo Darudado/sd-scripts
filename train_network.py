@@ -1489,6 +1489,7 @@ class NetworkTrainer:
                         is_train=True,
                         train_text_encoder=train_text_encoder,
                         train_unet=train_unet,
+                        edm2_model=edm2_model,
                     )
 
                     accelerator.backward(loss)
@@ -1509,7 +1510,7 @@ class NetworkTrainer:
                     optimizer.zero_grad(set_to_none=True)
 
                     if args.edm2_loss_weighting:
-                        edm2_model.step()
+                        edm2_optimizer.step()
                         edm2_lr_scheduler.step()
                         # swap to pre_scaling_loss for logging
                         loss = pre_scaling_loss

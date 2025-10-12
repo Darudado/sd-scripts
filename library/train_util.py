@@ -15,7 +15,7 @@ import time
 import typing
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, TorchDynamoPlugin
 import glob
 import math
 import os
@@ -4294,6 +4294,25 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
             "--prior_loss_weight", type=float, default=1.0, help="loss weight for regularization images / 正則化画像のlossの重み"
         )
 
+    parser.add_argument(
+        "--disable_cuda_reduced_precision_operations",
+        action="store_true",
+        help="Disables reduced precision for bf16, fp16, and disables use of tf32 to maximize precision at a small cost to performance.",
+    )
+
+    parser.add_argument(
+        "--enable_cuda_reduced_precision_operations",
+        action="store_true",
+        help="Enables reduced precision for bf16, fp16, and enables use of tf32, reducing precision a negligible amount for a performance benefit.",
+    )  
+
+    parser.add_argument(
+        "--loss_multiplier",
+        type=float,
+        default=None,
+        help="A raw multiplier to apply to loss.",
+    )
+
 
 def add_masked_loss_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
@@ -4373,18 +4392,6 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
         " / 順伝播および逆伝播中にスワップするブロックの数を設定します。"
         "この数を増やすと、トレーニング中のVRAM使用量が減りますが、トレーニング速度（s/it）も低下します。",
     )
-
-    parser.add_argument(
-        "--disable_cuda_reduced_precision_operations",
-        action="store_true",
-        help="Disables reduced precision for bf16, fp16, and disables use of tf32 to maximize precision at a small cost to performance.",
-    )
-
-    parser.add_argument(
-        "--enable_cuda_reduced_precision_operations",
-        action="store_true",
-        help="Enables reduced precision for bf16, fp16, and enables use of tf32, reducing precision a negligible amount for a performance benefit.",
-    )  
 
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
@@ -5537,22 +5544,32 @@ def prepare_accelerator(args: argparse.Namespace):
                 wandb.login(key=args.wandb_api_key)
 
     # torch.compile のオプション。 NO の場合は torch.compile は使わない
-    dynamo_backend = "NO"
+    # torch.compile のオプション。 NO の場合は torch.compile は使わない
     if args.torch_compile:
-        dynamo_backend = args.dynamo_backend
+        # Configure the compilation backend
+        dynamo_plugin = TorchDynamoPlugin(
+            backend="inductor",  # Options: "inductor", "aot_eager", "aot_nvfuser", etc.
+            mode="default",      # Options: "default", "reduce-overhead", "max-autotune"
+            fullgraph=False,
+            dynamic=True,
+            use_regional_compilation=True,
+        )
+    else:
+        dynamo_plugin = None
+
+    #    (
+    #        InitProcessGroupKwargs(
+    #            backend="gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl",
+    #            init_method=(
+    #                "env://?use_libuv=False" if os.name == "nt" and Version(torch.__version__) >= Version("2.4.0") else None
+    #            ),
+    #            timeout=datetime.timedelta(minutes=args.ddp_timeout) if args.ddp_timeout else None,
+    #        )
+    #        if torch.cuda.device_count() > 1
+    #        else None
+    #    ),
 
     kwargs_handlers = [
-        (
-            InitProcessGroupKwargs(
-                backend="gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl",
-                init_method=(
-                    "env://?use_libuv=False" if os.name == "nt" and Version(torch.__version__) >= Version("2.4.0") else None
-                ),
-                timeout=datetime.timedelta(minutes=args.ddp_timeout) if args.ddp_timeout else None,
-            )
-            if torch.cuda.device_count() > 1
-            else None
-        ),
         (
             DistributedDataParallelKwargs(
                 gradient_as_bucket_view=args.ddp_gradient_as_bucket_view, static_graph=args.ddp_static_graph
@@ -5570,7 +5587,7 @@ def prepare_accelerator(args: argparse.Namespace):
         log_with=log_with,
         project_dir=logging_dir,
         kwargs_handlers=kwargs_handlers,
-        dynamo_backend=dynamo_backend,
+        dynamo_plugin=dynamo_plugin,
         deepspeed_plugin=deepspeed_plugin,
     )
     print("accelerator device:", accelerator.device)
