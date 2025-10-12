@@ -431,7 +431,7 @@ def train(args):
                     target = noise
 
                 huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-                loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, scale=float(args.loss_scale))
                 loss = loss.mean([1, 2, 3])
 
                 loss_weights = batch["loss_weights"]  # 各sampleごとのweight

@@ -399,7 +399,7 @@ def train(args):
                 huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
                 if args.min_snr_gamma or args.scale_v_pred_loss_like_noise_pred or args.debiased_estimation_loss:
                     # do not mean over batch dimension for snr weight or scale v-pred loss
-                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, scale=float(args.loss_scale))
                     loss = loss.mean([1, 2, 3])
 
                     if args.min_snr_gamma:
@@ -411,7 +411,7 @@ def train(args):
 
                     loss = loss.mean()  # mean over batch dimension
                 else:
-                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "mean", huber_c)
+                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "mean", huber_c, scale=float(args.loss_scale))
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients and args.max_grad_norm != 0.0:

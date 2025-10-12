@@ -668,7 +668,7 @@ def train(args):
 
                 # calculate loss
                 huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-                loss = train_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                loss = train_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c, scale=float(args.loss_scale))
                 if weighting is not None:
                     loss = loss * weighting
                 if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
