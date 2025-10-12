@@ -225,7 +225,7 @@ def test_lumina_latents_caching_strategy():
 
         # Call cache_batch_latents
         mock_vae = MockVAE()
-        caching_strategy.cache_batch_latents(mock_vae, batch, flip_aug=False, alpha_mask=False, random_crop=False)
+        caching_strategy.cache_batch_latents(mock_vae, batch, flip_aug=False, alpha_mask=False, random_crop=False, random_crop_padding_percent=0.05)
 
         # Generate the expected npz path
         npz_path = caching_strategy.get_latents_npz_path(abs_path, image_size)
