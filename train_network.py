@@ -19,7 +19,6 @@ import torch.nn as nn
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.edm2_loss_utils import prepare_edm2_loss_weighting, handle_conflicting_configuration, plot_edm2_loss_weighting_check, plot_edm2_loss_weighting
-from library.ramtorch_utils import apply_ramtorch
 
 init_ipex()
 
@@ -636,9 +635,6 @@ class NetworkTrainer:
 
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
-
-        # Apply ramtorch
-        apply_ramtorch(args, unet, text_encoders, accelerator)
 
         # prepare dataset for latents caching if needed
         if cache_latents:

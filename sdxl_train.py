@@ -11,7 +11,6 @@ from tqdm import tqdm
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
-from library.ramtorch_utils import apply_ramtorch
 
 init_ipex()
 
@@ -227,8 +226,6 @@ def train(args):
     ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype)
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
-    # Apply ramtorch
-    apply_ramtorch(args, unet, [text_encoder1, text_encoder2], accelerator)
 
     # verify load/save model formats
     if load_stable_diffusion_format:

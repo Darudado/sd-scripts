@@ -8,6 +8,7 @@ import torch
 from accelerate import Accelerator
 
 from library.device_utils import clean_memory_on_device, init_ipex
+from ramtorch.helpers import replace_linear_with_ramtorch
 
 init_ipex()
 
@@ -155,6 +156,13 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 logger.info("Loaded fp8 T5XXL model")
 
         ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
+
+        if args.use_ramtorch:
+            logger.info("Applying RamTorch to FLUX models (DiT, T5-XXL, CLIP-L, AE).")
+            model = replace_linear_with_ramtorch(model, accelerator.device)
+            clip_l = replace_linear_with_ramtorch(clip_l, accelerator.device)
+            t5xxl = replace_linear_with_ramtorch(t5xxl, accelerator.device)
+            ae = replace_linear_with_ramtorch(ae, accelerator.device)
 
         model_version = flux_utils.MODEL_VERSION_FLUX_V1 if self.model_type != "chroma" else flux_utils.MODEL_VERSION_CHROMA
         return model_version, [clip_l, t5xxl], ae, model

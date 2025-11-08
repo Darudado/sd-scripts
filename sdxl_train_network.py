@@ -4,6 +4,7 @@ from typing import List, Optional, Union
 import torch
 from accelerate import Accelerator
 from library.device_utils import init_ipex, clean_memory_on_device
+from ramtorch.helpers import replace_linear_with_ramtorch
 
 init_ipex()
 
@@ -58,6 +59,13 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         self.load_stable_diffusion_format = load_stable_diffusion_format
         self.logit_scale = logit_scale
         self.ckpt_info = ckpt_info
+
+        if args.use_ramtorch:
+            logger.info("Applying RamTorch to SDXL UNet, VAE, and Text Encoders.")
+            unet = replace_linear_with_ramtorch(unet, accelerator.device)
+            vae = replace_linear_with_ramtorch(vae, accelerator.device)
+            text_encoder1 = replace_linear_with_ramtorch(text_encoder1, accelerator.device)
+            text_encoder2 = replace_linear_with_ramtorch(text_encoder2, accelerator.device)
 
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
