@@ -35,6 +35,7 @@ from tqdm import tqdm
 from packaging.version import Version
 
 import torch
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
 
@@ -5362,6 +5363,26 @@ def get_dummy_scheduler(optimizer: Optimizer) -> Any:
 
     return DummyScheduler(optimizer)
 
+# Compile the regular expression patterns for float and integer
+float_pattern = re.compile(r'''^[+-]?(
+    ( (\d+\.\d*) | (\.\d+) ) ([eE][+-]?\d+)?   # Decimal numbers with optional exponent
+    | \d+[eE][+-]?\d+                          # Integers with exponent
+)$''', re.VERBOSE)
+
+int_pattern = re.compile(r'^[+-]?\d+$')
+
+def parse_string_to_type(s):
+    if s is not None:
+        if isinstance(s, float) or isinstance(s, int):
+            return s
+        elif float_pattern.match(s):
+            return float(s)
+        elif int_pattern.match(s):
+            return int(s)
+        else:
+            return s
+    else:
+        return None
 
 # Modified version of get_scheduler() function from diffusers.optimizer.get_scheduler
 # Add some checking and features to the original function.
