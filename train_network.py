@@ -21,6 +21,7 @@ import torch.nn as nn
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.edm2_loss_utils import prepare_edm2_loss_weighting, handle_conflicting_configuration, plot_edm2_loss_weighting_check, plot_edm2_loss_weighting
+from ramtorch.helpers import replace_linear_with_ramtorch
 
 init_ipex()
 
@@ -194,6 +195,20 @@ class NetworkTrainer:
 
     def load_target_model(self, args, weight_dtype, accelerator) -> tuple[str, nn.Module, nn.Module, Optional[nn.Module]]:
         text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
+
+        if args.use_ramtorch:
+            logger.info("Applying RamTorch to SD UNet, VAE, and Clip-L.")
+            if isinstance(unet, torch.nn.Module):
+                unet = replace_linear_with_ramtorch(unet, accelerator.device)
+                logger.info("RamTorch applied to SD unet.")
+
+            if isinstance(text_encoder, torch.nn.Module):
+                text_encoder = replace_linear_with_ramtorch(text_encoder, accelerator.device)
+                logger.info("RamTorch applied to SD Clip-L.")
+
+            if isinstance(vae, torch.nn.Module):
+                vae = replace_linear_with_ramtorch(vae, accelerator.device)
+                logger.info("RamTorch applied to SD VAE.")
 
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
@@ -951,6 +966,12 @@ class NetworkTrainer:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
             info = network.load_weights(args.network_weights)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
+
+        if args.use_ramtorch:
+            logger.info("Applying RamTorch to network/lora.")
+            if isinstance(network, torch.nn.Module):
+                network = replace_linear_with_ramtorch(network, accelerator.device)
+                logger.info("RamTorch applied to network/lora.")
 
         if args.gradient_checkpointing:
             if args.cpu_offload_checkpointing:
@@ -1711,21 +1732,21 @@ class NetworkTrainer:
                     mean_combined_norm = None
                     max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
                 else:
-                    if hasattr(network, "weight_norms"):
-                        weight_norms = network.weight_norms()
-                        mean_norm = weight_norms.mean().item() if weight_norms is not None else None
-                        grad_norms = network.grad_norms()
-                        mean_grad_norm = grad_norms.mean().item() if grad_norms is not None else None
-                        combined_weight_norms = network.combined_weight_norms()
-                        mean_combined_norm = combined_weight_norms.mean().item() if combined_weight_norms is not None else None
-                        maximum_norm = weight_norms.max().item() if weight_norms is not None and weight_norms.numel() > 0 else None
-                        keys_scaled = None
-                        max_mean_logs = {}
-                    else:
-                        keys_scaled, mean_norm, maximum_norm = None, None, None
-                        mean_grad_norm = None
-                        mean_combined_norm = None
-                        max_mean_logs = {}
+                    #if hasattr(network, "weight_norms"):
+                    #    weight_norms = network.weight_norms()
+                    #    mean_norm = weight_norms.mean().item() if weight_norms is not None else None
+                    #    grad_norms = network.grad_norms()
+                    #    mean_grad_norm = grad_norms.mean().item() if grad_norms is not None else None
+                    #    combined_weight_norms = network.combined_weight_norms()
+                    #    mean_combined_norm = combined_weight_norms.mean().item() if combined_weight_norms is not None else None
+                    #    maximum_norm = weight_norms.max().item() if weight_norms is not None and weight_norms.numel() > 0 else None
+                    #    keys_scaled = None
+                    #    max_mean_logs = {}
+                    # else:
+                    keys_scaled, mean_norm, maximum_norm = None, None, None
+                    mean_grad_norm = None
+                    mean_combined_norm = None
+                    max_mean_logs = {}
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
