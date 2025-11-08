@@ -11,6 +11,8 @@ import time
 import json
 from multiprocessing import Value
 import numpy as np
+import ast
+import itertools
 
 from tqdm import tqdm
 
@@ -76,7 +78,8 @@ class NetworkTrainer:
         edm2_lr_scheduler=None,
         current_loss_scaled=None, 
         average_loss_scaled=None, 
-
+        current_val_loss=None,
+        average_val_loss=None,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
 
@@ -93,6 +96,10 @@ class NetworkTrainer:
             logs["norm/avg_grad_norm"] = mean_grad_norm
         if mean_combined_norm is not None:
             logs["norm/avg_combined_norm"] = mean_combined_norm
+
+        if current_val_loss is not None:
+            logs["loss/current_val_loss"] = current_val_loss                      
+            logs["loss/average_val_loss"] = average_val_loss
 
         lrs = lr_scheduler.get_last_lr()
         for i, lr in enumerate(lrs):
@@ -144,9 +151,6 @@ class NetworkTrainer:
 
     def epoch_logging(self, accelerator: Accelerator, logs: dict, global_step: int, epoch: int):
         self.accelerator_logging(accelerator, logs, epoch, global_step, epoch)
-
-    def val_logging(self, accelerator: Accelerator, logs: dict, global_step: int, epoch: int, val_step: int):
-        self.accelerator_logging(accelerator, logs, global_step + val_step, global_step, epoch, val_step)
 
     def accelerator_logging(
         self, accelerator: Accelerator, logs: dict, step_value: int, global_step: int, epoch: int, val_step: Optional[int] = None
@@ -283,14 +287,15 @@ class NetworkTrainer:
         network,
         weight_dtype,
         train_unet,
+        fixed_timesteps=None,
         is_train=True,
     ):
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
-        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
+        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, fixed_timesteps, is_train)
 
         # ensure the hidden state will require grad
-        if args.gradient_checkpointing:
+        if is_train and args.gradient_checkpointing:
             for x in noisy_latents:
                 x.requires_grad_(True)
             for t in text_encoder_conds:
@@ -508,6 +513,118 @@ class NetworkTrainer:
             loss_scaled = None
 
         return loss.mean(), pre_scaling_loss, loss_scaled
+    
+    def process_val_batch(
+        self,
+        batch,
+        text_encoders,
+        unet,
+        network,
+        vae,
+        noise_scheduler,
+        vae_dtype,
+        weight_dtype,
+        accelerator,
+        args,
+        text_encoding_strategy: strategy_base.TextEncodingStrategy,
+        tokenize_strategy: strategy_base.TokenizeStrategy,
+        train_text_encoder=True,
+        train_unet=True,
+        timesteps_list: list = [50, 350, 500, 650, 950]
+    ) -> torch.Tensor:
+        """
+        Process a batch for the network to determine val loss
+        """
+        total_loss = 0.0 
+        with torch.autograd.grad_mode.inference_mode(mode=True):
+            if "latents" in batch and batch["latents"] is not None:
+                latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
+            else:
+                # latentに変換
+                if args.vae_batch_size is None or len(batch["images"]) <= args.vae_batch_size:
+                    latents = self.encode_images_to_latents(args, vae, batch["images"].to(accelerator.device, dtype=vae_dtype))
+                else:
+                    chunks = [
+                        batch["images"][i : i + args.vae_batch_size] for i in range(0, len(batch["images"]), args.vae_batch_size)
+                    ]
+                    list_latents = []
+                    for chunk in chunks:
+                        with torch.no_grad():
+                            chunk = self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype))
+                            list_latents.append(chunk)
+                    latents = torch.cat(list_latents, dim=0)
+
+                # NaNが含まれていれば警告を表示し0に置き換える
+                if torch.any(torch.isnan(latents)):
+                    accelerator.print("NaN found in latents, replacing with zeros")
+                    latents = typing.cast(torch.FloatTensor, torch.nan_to_num(latents, 0, out=latents))
+
+            latents = self.shift_scale_latents(args, latents)
+
+            text_encoder_conds = []
+            text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+            if text_encoder_outputs_list is not None:
+                text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
+
+            if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
+                # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
+                with torch.set_grad_enabled(False and train_text_encoder), accelerator.autocast():
+                    # Get the text embedding for conditioning
+                    if args.weighted_captions:
+                        input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids_list,
+                            weights_list,
+                        )
+                    else:
+                        input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
+                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids,
+                        )
+                    if args.full_fp16:
+                        encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+
+                # if text_encoder_conds is not cached, use encoded_text_encoder_conds
+                if len(text_encoder_conds) == 0:
+                    text_encoder_conds = encoded_text_encoder_conds
+                else:
+                    # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
+                    for i in range(len(encoded_text_encoder_conds)):
+                        if encoded_text_encoder_conds[i] is not None:
+                            text_encoder_conds[i] = encoded_text_encoder_conds[i]
+
+            batch_size = latents.shape[0]
+            for fixed_timesteps in timesteps_list:
+                timesteps = torch.full((batch_size,), fixed_timesteps, dtype=torch.long, device=latents.device)
+
+                # sample noise, call unet, get target
+                noise_pred, target, _, _ = self.get_noise_pred_and_target(
+                    args,
+                    accelerator,
+                    noise_scheduler,
+                    latents,
+                    batch,
+                    text_encoder_conds,
+                    unet,
+                    network,
+                    weight_dtype,
+                    train_unet,
+                    timesteps,
+                    is_train=False,
+                )
+
+                loss = train_util.conditional_loss(noise_pred.float(), target.float(), "l2", "none", None)
+                loss = loss.mean([1, 2, 3])
+                loss = loss.mean()
+                total_loss += loss
+
+        average_loss = total_loss / len(timesteps_list)    
+
+        return average_loss
 
     def cast_text_encoder(self, args):
         return True  # default for other than HunyuanImage
@@ -517,6 +634,99 @@ class NetworkTrainer:
 
     def cast_unet(self, args):
         return True  # default for other than HunyuanImage
+
+    def switch_rng_state(self, val_seed: int, accelerator) -> tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]:
+        cpu_rng_state = torch.get_rng_state()
+        python_rng_state = random.getstate()
+        numpy_rng_state = np.random.get_state()
+        if accelerator.device.type == "cuda":
+            gpu_rng_state = torch.cuda.get_rng_state()
+        elif accelerator.device.type == "xpu":
+            gpu_rng_state = torch.xpu.get_rng_state()
+        elif accelerator.device.type == "mps":
+            gpu_rng_state = torch.cuda.get_rng_state()
+        else:
+            gpu_rng_state = None
+
+        random.seed(val_seed)
+        np.random.seed(val_seed)
+        torch.manual_seed(val_seed)
+        if accelerator.device.type == "cuda":
+            torch.cuda.manual_seed_all(val_seed)
+
+        return (cpu_rng_state, gpu_rng_state, python_rng_state, numpy_rng_state)
+
+    def restore_rng_state(self, rng_states: tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple], accelerator):
+        cpu_rng_state, gpu_rng_state, python_rng_state, numpy_rng_state = rng_states
+        torch.set_rng_state(cpu_rng_state)
+        random.setstate(python_rng_state)
+        np.random.set_state(numpy_rng_state)
+        if gpu_rng_state is not None:
+            if accelerator.device.type == "cuda":
+                torch.cuda.set_rng_state(gpu_rng_state)
+            elif accelerator.device.type == "xpu":
+                torch.xpu.set_rng_state(gpu_rng_state)
+            elif accelerator.device.type == "mps":
+                torch.cuda.set_rng_state(gpu_rng_state)
+
+    def calculate_val_loss(self, 
+                           global_step,
+                           epoch_step,
+                           train_dataloader,
+                           val_loss_recorder,
+                           val_dataloader,
+                           cyclic_val_dataloader,
+                           network, 
+                           tokenize_strategy, 
+                           text_encoders, 
+                           text_encoding_strategy, 
+                           unet, 
+                           vae, 
+                           noise_scheduler, 
+                           vae_dtype, 
+                           weight_dtype, 
+                           accelerator, 
+                           args, 
+                           batch=None,
+                           train_text_encoder=True):
+        if not train_util.calculate_val_loss_check(args,global_step,epoch_step,val_dataloader,train_dataloader):
+            return None, None, None
+        
+        if batch is not None:
+            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
+   
+        rng_states = self.switch_rng_state(int(args.validation_seed) if args.validation_seed else 23, accelerator)
+
+        timesteps_list = ast.literal_eval(args.validation_timesteps)
+              
+        accelerator.print("") 
+        accelerator.print("Validating バリデーション処理...")
+        total_loss = 0.0
+        with torch.no_grad():
+            validation_steps = min(int(args.max_validation_steps), len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
+            val_dataloader_seed = random.randint(global_step, 0x7FFFFFFF)
+            val_dataloader_state = random.Random(val_dataloader_seed).getstate()
+            for val_step in tqdm(range(validation_steps), desc='Validation Steps'):
+                val_original_state = random.getstate()
+                random.setstate(val_dataloader_state)
+                batch = next(cyclic_val_dataloader)
+                val_dataloader_state = random.getstate()
+                random.setstate(val_original_state)
+                loss = self.process_val_batch(batch, text_encoders, unet, network, vae, noise_scheduler, vae_dtype, 
+                                              weight_dtype, accelerator, args, text_encoding_strategy, tokenize_strategy, 
+                                              train_text_encoder=train_text_encoder,
+                                              timesteps_list=timesteps_list)
+                total_loss += loss.detach().item()
+            current_val_loss = total_loss / validation_steps
+            val_loss_recorder.add(epoch=0, step=global_step, loss=current_val_loss)   
+                     
+        average_val_loss: float = val_loss_recorder.moving_average
+        logs = {"loss/current_val_loss": current_val_loss, "loss/average_val_loss": average_val_loss}
+
+        self.restore_rng_state(rng_states, accelerator)
+
+        return current_val_loss, average_val_loss, logs
+
 
     def train(self, args):
         session_id = random.randint(0, 2**32)
@@ -796,6 +1006,12 @@ class NetworkTrainer:
             persistent_workers=args.persistent_data_loader_workers,
         )
 
+        if val_dataset_group is not None:
+            val_dataloader = accelerator.prepare(val_dataloader)
+            cyclic_val_dataloader = itertools.cycle(val_dataloader)
+        else:
+            val_dataloader, cyclic_val_dataloader = None, None
+
         # 学習ステップ数を計算する
         if args.max_train_epochs is not None:
             args.max_train_steps = args.max_train_epochs * math.ceil(
@@ -871,8 +1087,8 @@ class NetworkTrainer:
                 text_encoder2=(text_encoders[1] if flags[1] else None) if len(text_encoders) > 1 else None,
                 network=network,
             )
-            ds_model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-                ds_model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+            ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                ds_model, optimizer, train_dataloader, lr_scheduler
             )
             training_model = ds_model
         else:
@@ -894,10 +1110,16 @@ class NetworkTrainer:
             else:
                 pass  # if text_encoder is not trained, no need to prepare. and device and dtype are already set
 
-            network, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-                network, optimizer, train_dataloader, val_dataloader, lr_scheduler
+            network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                network, optimizer, train_dataloader, lr_scheduler
             )
             training_model = network
+
+        if val_dataset_group is not None:
+            val_dataloader = accelerator.prepare(val_dataloader)
+            cyclic_val_dataloader = itertools.cycle(val_dataloader)
+        else:
+            val_dataloader, cyclic_val_dataloader = None, None
 
         if args.gradient_checkpointing:
             # according to TI example in Diffusers, train is required
@@ -1284,8 +1506,7 @@ class NetworkTrainer:
         train_util.init_trackers(accelerator, args, "network_train")
 
         loss_recorder = train_util.LossRecorder()
-        val_step_loss_recorder = train_util.LossRecorder()
-        val_epoch_loss_recorder = train_util.LossRecorder()
+        val_loss_recorder = train_util.LossRecorder()
 
         if args.edm2_loss_weighting:
             loss_scaled_recorder = train_util.LossRecorder()
@@ -1335,17 +1556,57 @@ class NetworkTrainer:
             gc.collect()
             clean_memory_on_device(accelerator.device)
 
+        current_val_loss, average_val_loss, val_logs = None, None, {}
+        keys_scaled, mean_norm, maximum_norm = None, None, None
+        mean_grad_norm, mean_combined_norm = None, None
+        max_mean_logs = {}
+        current_global_step_loss = 0.0
+        current_global_step_loss_scaled = 0.0 if args.edm2_loss_weighting else None
+        average_loss_scaled = 0.0 if args.edm2_loss_weighting else None
+        avr_loss = 0.0
+        accumulation_counter = 0
+
         # For --sample_at_first
-        optimizer_eval_fn()
-        self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+        if train_util.sample_images_check(args, 0, global_step) or train_util.calculate_val_loss_check(args, global_step, 0, val_dataloader, train_dataloader):
+            #Switch network to eval mode
+            accelerator.unwrap_model(network).eval()
+            optimizer_eval_fn()
+            self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+            if train_util.calculate_val_loss_check(args, global_step, 0, val_dataloader, train_dataloader):
+                current_val_loss, average_val_loss, val_logs = self.calculate_val_loss(
+                    global_step, 0, train_dataloader, val_loss_recorder, val_dataloader, 
+                    cyclic_val_dataloader, network, tokenize_strategy, 
+                    text_encoders, text_encoding_strategy, unet, vae, noise_scheduler, 
+                    vae_dtype, weight_dtype, accelerator, args, None, train_text_encoder)
+            #Switch network to train mode
+            optimizer_train_fn()
+            accelerator.unwrap_model(network).train()
 
         if plot_edm2_loss_weighting_check(args, global_step):
             plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
-        optimizer_train_fn()
+
         is_tracking = len(accelerator.trackers) > 0
         if is_tracking:
+            logs = self.generate_step_logs(
+                args,
+                current_global_step_loss,
+                avr_loss,
+                lr_scheduler,
+                lr_descriptions,
+                optimizer,
+                keys_scaled,
+                mean_norm,
+                maximum_norm,
+                mean_grad_norm,
+                mean_combined_norm,
+                edm2_lr_scheduler,
+                current_global_step_loss_scaled,
+                average_loss_scaled,
+                current_val_loss=current_val_loss, 
+                average_val_loss=average_val_loss
+            )
             # log empty object to commit the sample images to wandb
-            accelerator.log({}, step=0)
+            self.step_logging(accelerator, logs, global_step, 1)
 
         # training loop
         if initial_step > 0:  # only if skip_until_initial_step is specified
@@ -1369,50 +1630,6 @@ class NetworkTrainer:
             range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
         )
 
-        validation_steps = (
-            min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
-        )
-        NUM_VALIDATION_TIMESTEPS = 4  # 200, 400, 600, 800 TODO make this configurable
-        min_timestep = 0 if args.min_timestep is None else args.min_timestep
-        max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
-        validation_timesteps = np.linspace(min_timestep, max_timestep, (NUM_VALIDATION_TIMESTEPS + 2), dtype=int)[1:-1]
-        validation_total_steps = validation_steps * len(validation_timesteps)
-        original_args_min_timestep = args.min_timestep
-        original_args_max_timestep = args.max_timestep
-
-        def switch_rng_state(seed: int) -> tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]:
-            cpu_rng_state = torch.get_rng_state()
-            if accelerator.device.type == "cuda":
-                gpu_rng_state = torch.cuda.get_rng_state()
-            elif accelerator.device.type == "xpu":
-                gpu_rng_state = torch.xpu.get_rng_state()
-            elif accelerator.device.type == "mps":
-                gpu_rng_state = torch.cuda.get_rng_state()
-            else:
-                gpu_rng_state = None
-            python_rng_state = random.getstate()
-
-            torch.manual_seed(seed)
-            random.seed(seed)
-
-            return (cpu_rng_state, gpu_rng_state, python_rng_state)
-
-        def restore_rng_state(rng_states: tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]):
-            cpu_rng_state, gpu_rng_state, python_rng_state = rng_states
-            torch.set_rng_state(cpu_rng_state)
-            if gpu_rng_state is not None:
-                if accelerator.device.type == "cuda":
-                    torch.cuda.set_rng_state(gpu_rng_state)
-                elif accelerator.device.type == "xpu":
-                    torch.xpu.set_rng_state(gpu_rng_state)
-                elif accelerator.device.type == "mps":
-                    torch.cuda.set_rng_state(gpu_rng_state)
-            random.setstate(python_rng_state)
-
-        accumulation_counter = 0
-        current_global_step_loss = 0.0
-        current_global_step_loss_scaled = 0.0
-
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
             current_epoch.value = epoch + 1
@@ -1429,6 +1646,7 @@ class NetworkTrainer:
 
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
                 current_step.value = global_step
+
                 if initial_step > 0:
                     initial_step -= 1
                     continue
@@ -1462,6 +1680,8 @@ class NetworkTrainer:
 
                     accelerator.backward(loss)
 
+                    loss = pre_scaling_loss
+
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
@@ -1481,10 +1701,9 @@ class NetworkTrainer:
                         edm2_optimizer.step()
                         edm2_lr_scheduler.step()
                         # swap to pre_scaling_loss for logging
-                        loss = pre_scaling_loss
                         edm2_optimizer.zero_grad(set_to_none=True)
 
-                if args.scale_weight_norms:
+                if args.scale_weight_norms and accelerator.sync_gradients:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
                         args.scale_weight_norms, accelerator.device
                     )
@@ -1508,51 +1727,81 @@ class NetworkTrainer:
                         mean_combined_norm = None
                         max_mean_logs = {}
 
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    global_step += 1
+
+                    if (train_util.sample_images_check(args, None, global_step) or 
+                        train_util.calculate_val_loss_check(args, global_step, step, val_dataloader, train_dataloader) or 
+                        args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0):
+
+                        accelerator.unwrap_model(network).eval()
+                        optimizer_eval_fn()
+                        self.sample_images(
+                            accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
+                        )
+
+                        if train_util.calculate_val_loss_check(args, global_step, step, val_dataloader, train_dataloader):
+                            current_val_loss, average_val_loss, val_logs = self.calculate_val_loss(global_step, step, 
+                                                                                                    skipped_dataloader or train_dataloader, 
+                                                                                                    val_loss_recorder, 
+                                                                                                    val_dataloader, 
+                                                                                                    cyclic_val_dataloader, 
+                                                                                                    network,
+                                                                                                    tokenize_strategy, 
+                                                                                                    text_encoders, 
+                                                                                                    text_encoding_strategy, 
+                                                                                                    unet, 
+                                                                                                    vae, 
+                                                                                                    noise_scheduler, 
+                                                                                                    vae_dtype, 
+                                                                                                    weight_dtype, 
+                                                                                                    accelerator, 
+                                                                                                    args, 
+                                                                                                    batch,
+                                                                                                    train_text_encoder)
+                        else:
+                            current_val_loss, average_val_loss, val_logs = None, None, {}
+                        progress_bar.unpause()
+
+                        # 指定ステップごとにモデルを保存
+                        if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                            accelerator.wait_for_everyone()
+                            if accelerator.is_main_process:
+                                ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
+                                save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+
+                                if args.edm2_loss_weighting:
+                                    loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step, "_edm2_loss_weights")
+                                    save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, epoch, dtype_override=torch.float32)
+
+                                if args.save_state:
+                                    train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+
+                                remove_step_no = train_util.get_remove_step_no(args, global_step)
+                                if remove_step_no is not None:
+                                    remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
+                                    remove_model(remove_ckpt_name)
+
+                                    if args.edm2_loss_weighting:
+                                        remove_loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no, "_edm2_loss_weights")
+                                        remove_model(remove_loss_weights_ckpt_name)
+
+                        if plot_edm2_loss_weighting_check(args, global_step):
+                            plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
+                        optimizer_train_fn()
+                        accelerator.unwrap_model(network).train()
+                    else:
+                        current_val_loss, average_val_loss, val_logs = None, None, None
+
                 current_global_step_loss += loss.detach().item()
                 if args.edm2_loss_weighting:
                     current_global_step_loss_scaled += loss_scaled.detach().item()
                 else:
                     current_global_step_loss_scaled = None
 
-                # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
-                    progress_bar.update(1)
-                    global_step += 1
-
-                    optimizer_eval_fn()
-                    self.sample_images(
-                        accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
-                    )
-                    progress_bar.unpause()
-
-                    # 指定ステップごとにモデルを保存
-                    if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
-                        accelerator.wait_for_everyone()
-                        if accelerator.is_main_process:
-                            ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
-                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
-
-                            if args.edm2_loss_weighting:
-                                loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step, "_edm2_loss_weights")
-                                save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, epoch, dtype_override=torch.float32)
-
-                            if args.save_state:
-                                train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
-
-                            remove_step_no = train_util.get_remove_step_no(args, global_step)
-                            if remove_step_no is not None:
-                                remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
-                                remove_model(remove_ckpt_name)
-
-                                if args.edm2_loss_weighting:
-                                    remove_loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no, "_edm2_loss_weights")
-                                    remove_model(remove_loss_weights_ckpt_name)
-
-                    if plot_edm2_loss_weighting_check(args, global_step):
-                        plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
-                    optimizer_train_fn()
-
-                    current_loss = loss.detach().item()
                     loss_recorder.add(epoch=epoch, step=global_step, loss=current_global_step_loss / accumulation_counter)
                     if args.edm2_loss_weighting:
                         loss_scaled_recorder.add(epoch=epoch, step=global_step, loss=current_global_step_loss_scaled / accumulation_counter)
@@ -1561,6 +1810,7 @@ class NetworkTrainer:
                     progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                     if is_tracking:
+                        current_global_step_loss = (current_global_step_loss / accumulation_counter)
                         if args.edm2_loss_weighting:
                             current_global_step_loss_scaled = (current_global_step_loss_scaled / accumulation_counter)
                             average_loss_scaled: float = loss_scaled_recorder.moving_average
@@ -1583,163 +1833,17 @@ class NetworkTrainer:
                             edm2_lr_scheduler,
                             current_global_step_loss_scaled,
                             average_loss_scaled,
+                            current_val_loss=current_val_loss, 
+                            average_val_loss=average_val_loss
                         )
                         self.step_logging(accelerator, logs, global_step, epoch + 1)
-
-                    accumulation_counter = 0
                     current_global_step_loss = 0.0
                     if args.edm2_loss_weighting:
                         current_global_step_loss_scaled = 0.0
-
-                    # VALIDATION PER STEP: global_step is already incremented
-                    # for example, if validate_every_n_steps=100, validate at step 100, 200, 300, ...
-                    should_validate_step = args.validate_every_n_steps is not None and global_step % args.validate_every_n_steps == 0
-                    if accelerator.sync_gradients and validation_steps > 0 and should_validate_step:
-                        optimizer_eval_fn()
-                        accelerator.unwrap_model(network).eval()
-                        rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
-
-                        val_progress_bar = tqdm(
-                            range(validation_total_steps),
-                            smoothing=0,
-                            disable=not accelerator.is_local_main_process,
-                            desc="validation steps",
-                        )
-                        val_timesteps_step = 0
-                        for val_step, batch in enumerate(val_dataloader):
-                            if val_step >= validation_steps:
-                                break
-
-                            for timestep in validation_timesteps:
-                                self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
-
-                                args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
-
-                                loss, _, _ = self.process_batch(
-                                    batch,
-                                    text_encoders,
-                                    unet,
-                                    network,
-                                    vae,
-                                    noise_scheduler,
-                                    vae_dtype,
-                                    weight_dtype,
-                                    accelerator,
-                                    args,
-                                    text_encoding_strategy,
-                                    tokenize_strategy,
-                                    is_train=False,
-                                    train_text_encoder=train_text_encoder,  # this is needed for validation because Text Encoders must be called if train_text_encoder is True
-                                    train_unet=train_unet,
-                                )
-
-                                current_loss = loss.detach().item()
-                                val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                                val_progress_bar.update(1)
-                                val_progress_bar.set_postfix(
-                                    {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
-                                )
-
-                                # if is_tracking:
-                                #     logs = {f"loss/validation/step_current_{timestep}": current_loss}
-                                #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
-
-                                self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
-                                val_timesteps_step += 1
-
-                        if is_tracking:
-                            loss_validation_divergence = val_step_loss_recorder.moving_average - loss_recorder.moving_average
-                            logs = {
-                                "loss/validation/step_average": val_step_loss_recorder.moving_average,
-                                "loss/validation/step_divergence": loss_validation_divergence,
-                            }
-                            self.step_logging(accelerator, logs, global_step, epoch=epoch + 1)
-
-                        restore_rng_state(rng_states)
-                        args.min_timestep = original_args_min_timestep
-                        args.max_timestep = original_args_max_timestep
-                        optimizer_train_fn()
-                        accelerator.unwrap_model(network).train()
-                        progress_bar.unpause()
+                    accumulation_counter = 0
 
                 if global_step >= args.max_train_steps:
                     break
-
-            # EPOCH VALIDATION
-            should_validate_epoch = (
-                (epoch + 1) % args.validate_every_n_epochs == 0 if args.validate_every_n_epochs is not None else True
-            )
-
-            if should_validate_epoch and len(val_dataloader) > 0:
-                optimizer_eval_fn()
-                accelerator.unwrap_model(network).eval()
-                rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
-
-                val_progress_bar = tqdm(
-                    range(validation_total_steps),
-                    smoothing=0,
-                    disable=not accelerator.is_local_main_process,
-                    desc="epoch validation steps",
-                )
-
-                val_timesteps_step = 0
-                for val_step, batch in enumerate(val_dataloader):
-                    if val_step >= validation_steps:
-                        break
-
-                    for timestep in validation_timesteps:
-                        args.min_timestep = args.max_timestep = timestep
-
-                        # temporary, for batch processing
-                        self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
-
-                        loss, _, _ = self.process_batch(
-                            batch,
-                            text_encoders,
-                            unet,
-                            network,
-                            vae,
-                            noise_scheduler,
-                            vae_dtype,
-                            weight_dtype,
-                            accelerator,
-                            args,
-                            text_encoding_strategy,
-                            tokenize_strategy,
-                            is_train=False,
-                            train_text_encoder=train_text_encoder,
-                            train_unet=train_unet,
-                        )
-
-                        current_loss = loss.detach().item()
-                        val_epoch_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                        val_progress_bar.update(1)
-                        val_progress_bar.set_postfix(
-                            {"val_epoch_avg_loss": val_epoch_loss_recorder.moving_average, "timestep": timestep}
-                        )
-
-                        # if is_tracking:
-                        #     logs = {f"loss/validation/epoch_current_{timestep}": current_loss}
-                        #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
-
-                        self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
-                        val_timesteps_step += 1
-
-                if is_tracking:
-                    avr_loss: float = val_epoch_loss_recorder.moving_average
-                    loss_validation_divergence = val_epoch_loss_recorder.moving_average - loss_recorder.moving_average
-                    logs = {
-                        "loss/validation/epoch_average": avr_loss,
-                        "loss/validation/epoch_divergence": loss_validation_divergence,
-                    }
-                    self.epoch_logging(accelerator, logs, global_step, epoch + 1)
-
-                restore_rng_state(rng_states)
-                args.min_timestep = original_args_min_timestep
-                args.max_timestep = original_args_max_timestep
-                optimizer_train_fn()
-                accelerator.unwrap_model(network).train()
-                progress_bar.unpause()
 
             # END OF EPOCH
             if is_tracking:
@@ -1748,36 +1852,41 @@ class NetworkTrainer:
 
             accelerator.wait_for_everyone()
 
-            # 指定エポックごとにモデルを保存
-            optimizer_eval_fn()
-            if args.save_every_n_epochs is not None:
-                saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
-                if is_main_process and saving:
-                    ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
-                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
+            if (train_util.sample_images_check(args, epoch + 1, global_step) or 
+                args.save_every_n_epochs is not None):
 
-                    if args.edm2_loss_weighting:
-                        loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1, "_edm2_loss_weights")
-                        save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, epoch + 1, dtype_override=torch.float32)
-
-                    remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
-                    if remove_epoch_no is not None:
-                        remove_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
-                        remove_model(remove_ckpt_name)
+                # 指定エポックごとにモデルを保存
+                optimizer_eval_fn()
+                accelerator.unwrap_model(network).eval()
+                if args.save_every_n_epochs is not None:
+                    saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
+                    if is_main_process and saving:
+                        ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
+                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
 
                         if args.edm2_loss_weighting:
-                            remove_loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no, "_edm2_loss_weights")
-                            remove_model(remove_loss_weights_ckpt_name)
+                            loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1, "_edm2_loss_weights")
+                            save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, epoch + 1, dtype_override=torch.float32)
 
-                    if args.save_state:
-                        train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+                        remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
+                        if remove_epoch_no is not None:
+                            remove_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
+                            remove_model(remove_ckpt_name)
 
-            self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+                            if args.edm2_loss_weighting:
+                                remove_loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no, "_edm2_loss_weights")
+                                remove_model(remove_loss_weights_ckpt_name)
 
-            if plot_edm2_loss_weighting_check(args, global_step):
-                plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
-            progress_bar.unpause()
-            optimizer_train_fn()
+                        if args.save_state:
+                            train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+
+                self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+
+                if plot_edm2_loss_weighting_check(args, global_step):
+                    plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
+                progress_bar.unpause()
+                optimizer_train_fn()
+                accelerator.unwrap_model(network).train()
 
             # end of epoch
 
@@ -1974,6 +2083,13 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="Max number of validation dataset items processed. By default, validation will run the entire validation dataset / 処理される検証データセット項目の最大数。デフォルトでは、検証は検証データセット全体を実行します",
     )
+
+    parser.add_argument(
+        "--validation_timesteps",
+        type=str,
+        default=r"[50, 350, 500, 650, 950]",
+        help="A list of timesteps to use for each validation step."
+    )  
 
     parser.add_argument(
         "--use_ramtorch",

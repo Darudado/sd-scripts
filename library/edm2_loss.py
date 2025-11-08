@@ -3,6 +3,8 @@ import torch.nn as nn
 import numpy as np
 from diffusers import DDPMScheduler
 import os
+import logging
+logger = logging.getLogger(__name__)
 
 def normalize(x: torch.Tensor, dim=None, eps=1e-4, dtype=torch.float32) -> torch.Tensor:
     if dim is None:
@@ -155,7 +157,7 @@ def create_weight_MLP(noise_scheduler: DDPMScheduler,
                     use_importance_weights: bool = True,
                     importance_weights_max_weight: float = 10.0,
                     importance_weights_min_snr_gamma: float = 1.0):
-    print("creating weight MLP")
+    logger.info("creating weight MLP")
     lossweightMLP = AdaptiveLossWeightMLP(noise_scheduler, logvar_channels, lambda_weights, device, 
                                           dtype=dtype, 
                                           importance_weights_max_weight=importance_weights_max_weight, 

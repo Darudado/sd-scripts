@@ -5669,7 +5669,6 @@ def prepare_accelerator(args: argparse.Namespace):
         dynamo_plugin=dynamo_plugin,
         deepspeed_plugin=deepspeed_plugin,
     )
-    print("accelerator device:", accelerator.device)
     return accelerator
 
 
@@ -6238,17 +6237,17 @@ def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: tor
 
 
 def get_noise_noisy_latents_and_timesteps(
-    args, noise_scheduler, latents: torch.FloatTensor
+    args, noise_scheduler, latents: torch.FloatTensor, fixed_timesteps=None, is_train=True
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.IntTensor]:
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
-    if args.noise_offset:
+    if args.noise_offset and is_train:
         if args.noise_offset_random_strength:
             noise_offset = torch.rand(1, device=latents.device) * args.noise_offset
         else:
             noise_offset = args.noise_offset
         noise = custom_train_functions.apply_noise_offset(latents, noise, noise_offset, args.adaptive_noise_scale)
-    if args.multires_noise_iterations:
+    if args.multires_noise_iterations and is_train:
         noise = custom_train_functions.pyramid_noise_like(
             noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount
         )
@@ -6257,11 +6256,15 @@ def get_noise_noisy_latents_and_timesteps(
     b_size = latents.shape[0]
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
-    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
+
+    if fixed_timesteps is not None:
+        timesteps = fixed_timesteps
+    else:
+        timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
-    if args.ip_noise_gamma:
+    if args.ip_noise_gamma and is_train:
         if args.ip_noise_gamma_random_strength:
             strength = torch.rand(1, device=latents.device) * args.ip_noise_gamma
         else:
@@ -6296,6 +6299,19 @@ def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler
         raise NotImplementedError(f"Unknown Huber loss schedule {args.huber_schedule}!")
 
     return result
+
+def calculate_val_loss_check(args, global_step, epoch_step, val_dataloader, train_dataloader) -> bool:
+    if val_dataloader is None:
+        return False
+
+    if global_step != 0 and global_step < args.max_train_steps:
+        if args.validation_every_n_step is not None:
+            if global_step % int(args.validation_every_n_step) != 0:
+                return False
+        else:
+            if epoch_step != len(train_dataloader) - 1:
+                return False
+    return True
 
 def soft_welsch_loss(predictions:torch.Tensor, 
                     targets:torch.Tensor, 
@@ -6834,6 +6850,22 @@ def load_prompts(prompt_file: str) -> List[Dict]:
         prompt_dict.pop("subset", None)
 
     return prompts
+
+def sample_images_check(args, epoch, steps) -> bool:
+    if steps == 0:
+        if not args.sample_at_first:
+            return False
+    else:
+        if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
+            return False
+        if args.sample_every_n_epochs is not None:
+            # sample_every_n_steps は無視する
+            if epoch is None or epoch % args.sample_every_n_epochs != 0:
+                return False
+        else:
+            if steps % args.sample_every_n_steps != 0 or epoch is not None:  # steps is not divisible or end of epoch
+                return False
+    return True
 
 
 def sample_images_common(
