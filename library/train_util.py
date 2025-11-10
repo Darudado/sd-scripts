@@ -5226,7 +5226,7 @@ def get_optimizer(args, trainable_params, optimizer_kwargs: Dict = {}) -> tuple[
             case_sensitive_optimizer_type = values[-1]
 
         # Need to handle base optimizer
-        if case_sensitive_optimizer_type.lower() == "schedulefreewrapper":
+        if case_sensitive_optimizer_type.lower() == "schedulefreewrapper" or args.optimizer_type.lower().endswith("snoo_asgd".lower()):
             case_sensitive_full_base_optimizer_name = optimizer_kwargs.get("base_optimizer_type", None)
             base_optimizer_values = case_sensitive_full_base_optimizer_name.split(".")
             base_optimizer_module = importlib.import_module(".".join(base_optimizer_values[:-1]))
@@ -5346,8 +5346,8 @@ def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) 
 def is_schedulefree_optimizer(optimizer: Optimizer, args: argparse.Namespace) -> bool:
     return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower().endswith("schedulefreewrapper".lower())
 
-def is_schedulefree_wrapper_optimizer(args: argparse.Namespace) -> bool:
-    return args.optimizer_type.lower().endswith("schedulefreewrapper".lower())
+def is_wrapper_optimizer(args: argparse.Namespace) -> bool:
+    return args.optimizer_type.lower().endswith("schedulefreewrapper".lower()) or args.optimizer_type.lower().endswith("snoo_asgd".lower())
 
 def get_dummy_scheduler(optimizer: Optimizer) -> Any:
     # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
@@ -5399,7 +5399,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         return get_dummy_scheduler(optimizer)
     
     # Need to apply scheduler to base_optimizer
-    if is_schedulefree_wrapper_optimizer(args):
+    if is_wrapper_optimizer(args):
         optimizer = optimizer.base_optimizer
 
     name = args.lr_scheduler
@@ -7196,7 +7196,7 @@ def prepare_optimizer(args, network):
             case_sensitive_optimizer_type = values[-1]
 
         # Need to handle base optimizer
-        if case_sensitive_optimizer_type.lower() == "schedulefreewrapper":
+        if case_sensitive_optimizer_type.lower() == "schedulefreewrapper" or args.optimizer_type.lower().endswith("snoo_asgd".lower()):
             case_sensitive_full_base_optimizer_name = optimizer_kwargs.get("base_optimizer_type", None)
             base_optimizer_values = case_sensitive_full_base_optimizer_name.split(".")
             base_optimizer_module = importlib.import_module(".".join(base_optimizer_values[:-1]))
