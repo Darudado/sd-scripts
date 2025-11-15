@@ -33,7 +33,8 @@ huggingface-hub[hf_xet]~=0.36.0
 hf-xet~=1.2.0
 matplotlib~=3.10.7
 scipy~=1.16.2
-RamTorch~=0.2.2
+#RamTorch~=0.2.2
+RamTorch @ git+https://github.com/67372a/RamTorch
 PyWavelets~=1.9.0
 # for Image utils
 imagesize~=1.4.1
