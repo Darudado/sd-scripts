@@ -965,6 +965,13 @@ class NetworkTrainer:
             info = network.load_weights(args.network_weights)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
+        if args.use_ramtorch_network:
+            #move all network weights to cpu first as base device
+            network = network.to("cpu")
+            logger.info("Applying RamTorch to network/lora.")
+            network = replace_linear_with_ramtorch(network, accelerator.device)
+            logger.info("RamTorch applied to network/lora.")
+
         if args.gradient_checkpointing:
             if args.cpu_offload_checkpointing:
                 unet.enable_gradient_checkpointing(cpu_offload=True)
@@ -2105,7 +2112,14 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--use_ramtorch",
         action="store_true",
-        help="Use RamTorch to reduce GPU memory usage by keeping model weights on CPU.",
+        help="Use RamTorch to reduce GPU memory usage by keeping base/original linear model weights in system RAM.",
+    )
+
+    parser.add_argument(
+        "--use_ramtorch_network",
+        action="store_true",
+        help="Use RamTorch to reduce GPU memory usage by keeping network/lora linear weights in system RAM. " \
+        "Requires use of optimizers that have been modified to support it, currently only SimplifiedAdEMAMixExM.",
     )
 
     parser.add_argument(
