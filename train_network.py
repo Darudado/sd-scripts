@@ -1006,16 +1006,19 @@ class NetworkTrainer:
             collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
+            pin_memory=args.pin_data_loader_memory or args.pin_memory,
         )
 
-        val_dataloader = torch.utils.data.DataLoader(
-            val_dataset_group if val_dataset_group is not None else [],
-            shuffle=False,
-            batch_size=1,
-            collate_fn=collator,
-            num_workers=n_workers,
-            persistent_workers=args.persistent_data_loader_workers,
-        )
+        if val_dataset_group is not None:
+            val_dataloader = torch.utils.data.DataLoader(
+                val_dataset_group if val_dataset_group is not None else [],
+                shuffle=False,
+                batch_size=1,
+                collate_fn=collator,
+                num_workers=n_workers,
+                persistent_workers=args.persistent_data_loader_workers,
+                pin_memory=args.pin_data_loader_memory or args.pin_memory,
+            )
 
         if val_dataset_group is not None:
             val_dataloader = accelerator.prepare(val_dataloader)
@@ -2260,6 +2263,18 @@ def setup_parser() -> argparse.ArgumentParser:
         type=str,
         default=r"['lora_down.weight','lora_up.weight','lora_down1.weight','lora_up1.weight','lora_down2.weight','lora_up2.weight','a1.weight','a2.weight','b1.weight','b2.weight','c1.weight']",
         help="A list of strings to determine which named parameters should subject to orthgrad, based on their name containing the string."
+    )
+
+    parser.add_argument(
+        "--pin_data_loader_memory",
+        action="store_true",
+        help="Pins dataloader memory, may speed up dataloader operations.",
+    )
+
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="Pin memory for faster GPU loading / GPU の読み込みを高速化するためのピンメモリ",
     )
 
     return parser
