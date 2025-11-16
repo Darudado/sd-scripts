@@ -489,6 +489,9 @@ class NetworkTrainer:
         )
 
         if is_train:
+            if args.differential_guidance:
+                target = noise_pred + (float(args.differential_guidance_scale) * (target - noise_pred))
+
             huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
             loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, scale=float(args.loss_scale))
             if weighting is not None:
@@ -2275,6 +2278,23 @@ def setup_parser() -> argparse.ArgumentParser:
         "--pin_memory",
         action="store_true",
         help="Pin memory for faster GPU loading / GPU の読み込みを高速化するためのピンメモリ",
+    )
+
+    parser.add_argument(
+        "--differential_guidance",
+        action="store_true",
+        help="Differential Guidance amplifies applies an amplification between the difference of the model prediction and the target during training to make " \
+        "a new target. This may help improve convergence to the actual target. " \
+        "See original code at https://github.com/ostris/ai-toolkit/commit/2e7b2d9926de40a7b9119322c1d8fc085b1283e4#diff-fb148217f864741f0e90717dc8ab38dff83a42e917a20540f65afb1c3aedaa85",
+    )
+
+    parser.add_argument(
+        "--differential_guidance_scale",
+        type=float,
+        default=3.0,
+        help="Differential Guidance Scale is used to determine the multiplier of the difference of the model prediction and the target. " \
+        "--differential_guidance arg must be passed for this to be applied. " \
+        "See original code at https://github.com/ostris/ai-toolkit/commit/2e7b2d9926de40a7b9119322c1d8fc085b1283e4#diff-fb148217f864741f0e90717dc8ab38dff83a42e917a20540f65afb1c3aedaa85",
     )
 
     return parser
