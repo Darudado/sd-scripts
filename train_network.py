@@ -414,11 +414,11 @@ class NetworkTrainer:
         """
         with torch.no_grad():
             if "latents" in batch and batch["latents"] is not None:
-                latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
+                latents = typing.cast(torch.FloatTensor, batch["latents"].to(device=accelerator.device, non_blocking=args.pin_data_loader_memory or args.pin_memory))
             else:
                 # latentに変換
                 if args.vae_batch_size is None or len(batch["images"]) <= args.vae_batch_size:
-                    latents = self.encode_images_to_latents(args, vae, batch["images"].to(accelerator.device, dtype=vae_dtype))
+                    latents = self.encode_images_to_latents(args, vae, batch["images"].to(device=accelerator.device, dtype=vae_dtype, non_blocking=args.pin_data_loader_memory or args.pin_memory))
                 else:
                     chunks = [
                         batch["images"][i : i + args.vae_batch_size] for i in range(0, len(batch["images"]), args.vae_batch_size)
@@ -426,7 +426,7 @@ class NetworkTrainer:
                     list_latents = []
                     for chunk in chunks:
                         with torch.no_grad():
-                            chunk = self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype))
+                            chunk = self.encode_images_to_latents(args, vae, chunk.to(device=accelerator.device, dtype=vae_dtype, non_blocking=args.pin_data_loader_memory or args.pin_memory))
                             list_latents.append(chunk)
                     latents = torch.cat(list_latents, dim=0)
 
@@ -542,11 +542,11 @@ class NetworkTrainer:
         total_loss = 0.0 
         with torch.autograd.grad_mode.inference_mode(mode=True):
             if "latents" in batch and batch["latents"] is not None:
-                latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
+                latents = typing.cast(torch.FloatTensor, batch["latents"].to(device=accelerator.device, non_blocking=args.pin_data_loader_memory or args.pin_memory))
             else:
                 # latentに変換
                 if args.vae_batch_size is None or len(batch["images"]) <= args.vae_batch_size:
-                    latents = self.encode_images_to_latents(args, vae, batch["images"].to(accelerator.device, dtype=vae_dtype))
+                    latents = self.encode_images_to_latents(args, vae, batch["images"].to(device=accelerator.device, dtype=vae_dtype, non_blocking=args.pin_data_loader_memory or args.pin_memory))
                 else:
                     chunks = [
                         batch["images"][i : i + args.vae_batch_size] for i in range(0, len(batch["images"]), args.vae_batch_size)
@@ -554,7 +554,7 @@ class NetworkTrainer:
                     list_latents = []
                     for chunk in chunks:
                         with torch.no_grad():
-                            chunk = self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype))
+                            chunk = self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype, non_blocking=args.pin_data_loader_memory or args.pin_memory))
                             list_latents.append(chunk)
                     latents = torch.cat(list_latents, dim=0)
 
