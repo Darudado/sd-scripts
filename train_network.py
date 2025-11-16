@@ -21,7 +21,7 @@ import torch.nn as nn
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.edm2_loss_utils import prepare_edm2_loss_weighting, handle_conflicting_configuration, plot_edm2_loss_weighting_check, plot_edm2_loss_weighting
-from ramtorch.helpers import replace_linear_with_ramtorch
+from library.ramtorch_util import apply_ramtorch_to_module
 
 init_ipex()
 
@@ -194,18 +194,10 @@ class NetworkTrainer:
         text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
         if args.use_ramtorch:
-            logger.info("Applying RamTorch to SD UNet, VAE, and Clip-L.")
-            if isinstance(unet, torch.nn.Module):
-                unet = replace_linear_with_ramtorch(unet, accelerator.device)
-                logger.info("RamTorch applied to SD unet.")
-
-            if isinstance(text_encoder, torch.nn.Module):
-                text_encoder = replace_linear_with_ramtorch(text_encoder, accelerator.device)
-                logger.info("RamTorch applied to SD Clip-L.")
-
-            if isinstance(vae, torch.nn.Module):
-                vae = replace_linear_with_ramtorch(vae, accelerator.device)
-                logger.info("RamTorch applied to SD VAE.")
+            logger.info("Applying RamTorch to SD model.")
+            unet = apply_ramtorch_to_module(unet, "unet", accelerator.device)
+            vae = apply_ramtorch_to_module(vae, "vae", accelerator.device)
+            text_encoder = apply_ramtorch_to_module(text_encoder, "clip_l", accelerator.device)
 
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
@@ -969,8 +961,7 @@ class NetworkTrainer:
             #move all network weights to cpu first as base device
             network = network.to("cpu")
             logger.info("Applying RamTorch to network/lora.")
-            network = replace_linear_with_ramtorch(network, accelerator.device)
-            logger.info("RamTorch applied to network/lora.")
+            network = apply_ramtorch_to_module(network, "network/lora", accelerator.device)
 
         if args.gradient_checkpointing:
             if args.cpu_offload_checkpointing:

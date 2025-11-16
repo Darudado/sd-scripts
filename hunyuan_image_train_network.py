@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from accelerate import Accelerator, PartialState
-from ramtorch.helpers import replace_linear_with_ramtorch
+from library.ramtorch_util import apply_ramtorch_to_module
 
 from library import flux_utils, hunyuan_image_models, hunyuan_image_vae, strategy_base, train_util
 from library.device_utils import clean_memory_on_device, init_ipex
@@ -373,18 +373,10 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         vae.eval()
 
         if args.use_ramtorch:
-            logger.info("Applying RamTorch to Hunyuan VAE, and Text Encoders (vlm and byt5).")
-            if isinstance(text_encoder_vlm, torch.nn.Module):
-                text_encoder_vlm = replace_linear_with_ramtorch(text_encoder_vlm, accelerator.device)
-                logger.info("RamTorch applied to Hunyuan vlm.")
-
-            if isinstance(text_encoder_byt5, torch.nn.Module):
-                text_encoder_byt5 = replace_linear_with_ramtorch(text_encoder_byt5, accelerator.device)
-                logger.info("RamTorch applied to Hunyuan byt5.")
-
-            if isinstance(vae, torch.nn.Module):
-                vae = replace_linear_with_ramtorch(vae, accelerator.device)
-                logger.info("RamTorch applied to Hunyuan VAE.")
+            logger.info("Applying RamTorch to Hunyuan model TEs and vae.")
+            text_encoder_vlm = apply_ramtorch_to_module(text_encoder_vlm, "vlm", accelerator.device)
+            text_encoder_byt5 = apply_ramtorch_to_module(text_encoder_byt5, "byt5", accelerator.device)
+            vae = apply_ramtorch_to_module(vae, "vae", accelerator.device)
 
         model_version = hunyuan_image_utils.MODEL_VERSION_2_1
         return model_version, [text_encoder_vlm, text_encoder_byt5], vae, None  # unet will be loaded later
@@ -424,10 +416,8 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
             model.enable_block_swap(args.blocks_to_swap, accelerator.device, supports_backward=True)
 
         if args.use_ramtorch:
-            logger.info("Applying RamTorch to Hunyuan model/unet.")
-            if isinstance(model, torch.nn.Module):
-                model = replace_linear_with_ramtorch(model, accelerator.device)
-                logger.info("RamTorch applied to Hunyuan model/unet.")
+            logger.info("Applying RamTorch to Hunyuan model dit.")
+            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device)
 
         return model, text_encoders
 

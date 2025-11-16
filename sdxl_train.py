@@ -941,6 +941,12 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="number of optimizers for fused backward pass and optimizer step / fused backward passとoptimizer stepのためのoptimizer数",
     )
+
+    parser.add_argument(
+        "--use_ramtorch",
+        action="store_true",
+        help="Use RamTorch to reduce GPU memory usage by keeping base/original linear model weights in system RAM.",
+    )
     return parser
 
 

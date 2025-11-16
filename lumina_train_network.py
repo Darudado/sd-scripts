@@ -10,7 +10,7 @@ init_ipex()
 
 from torch import Tensor
 from accelerate import Accelerator
-from ramtorch.helpers import replace_linear_with_ramtorch
+from library.ramtorch_util import apply_ramtorch_to_module
 
 
 import train_network
@@ -85,18 +85,10 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         ae = lumina_util.load_ae(args.ae, weight_dtype, "cpu")
 
         if args.use_ramtorch:
-            logger.info("Applying RamTorch to Lumina models (DiT, Gemma2, AE).")
-            if isinstance(model, torch.nn.Module):
-                model = replace_linear_with_ramtorch(model, accelerator.device)
-                logger.info("RamTorch applied to Lumina DiT.")
-
-            if isinstance(gemma2, torch.nn.Module):
-                gemma2 = replace_linear_with_ramtorch(gemma2, accelerator.device)
-                logger.info("RamTorch applied to Lumina Gemma2.")
-
-            if isinstance(ae, torch.nn.Module):
-                ae = replace_linear_with_ramtorch(ae, accelerator.device)
-                logger.info("RamTorch applied to Lumina AE/autoencoder.")
+            logger.info("Applying RamTorch to Lumina model.")
+            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device)
+            ae = apply_ramtorch_to_module(ae, "ae", accelerator.device)
+            gemma2 = apply_ramtorch_to_module(gemma2, "gemma2", accelerator.device)
 
         return lumina_util.MODEL_VERSION_LUMINA_V2, [gemma2], ae, model
 
