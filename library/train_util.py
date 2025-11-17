@@ -7155,7 +7155,7 @@ def args_set_seed(args):
     set_seed(int(args.seed))
 
 
-def prepare_optimizer(args, network):
+def prepare_optimizer(args, network, accelerator):
     if isinstance(args.orthograd_targets, str):
         orthograd_targets = ast.literal_eval(args.orthograd_targets)
     else:
@@ -7213,6 +7213,36 @@ def prepare_optimizer(args, network):
         optimizer_init_sig_parameters = {}
 
     apply_orthograd = any(optimizer_kwargs.get(key, getattr(optimizer_init_sig_parameters.get(key, types.SimpleNamespace()), "default", False)) == True for key in ['use_orthograd', 'orthograd'])
+
+    if "state_storage_dtype" in optimizer_init_sig_parameters:
+        logger.info("state_storage_dtype in optimizer signature.")
+        if "state_storage_dtype" in optimizer_kwargs:
+            state_storage_dtype_arg = optimizer_kwargs.get("state_storage_dtype")
+            logger.info(f"state_storage_dtype set to '{state_storage_dtype_arg}' via supplied args.")
+        else:
+            if args.mixed_precision == "fp16":
+                optimizer_kwargs["state_storage_dtype"] = "float16"
+            elif args.mixed_precision == "bf16":
+                optimizer_kwargs["state_storage_dtype"] = "bfloat16"
+            else:
+                optimizer_kwargs["state_storage_dtype"] = "float32"
+
+            state_storage_dtype_arg = optimizer_kwargs["state_storage_dtype"]
+            logger.info(f"Defaulting state_storage_dtype to training mixed precision, '{state_storage_dtype_arg}'")
+
+    if "state_storage_device" in optimizer_init_sig_parameters:
+        logger.info("state_storage_device in optimizer signature.")
+        if "state_storage_device" in optimizer_kwargs:
+            state_storage_device_arg = optimizer_kwargs.get("state_storage_device")
+            logger.info(f"state_storage_device set to '{state_storage_device_arg}' via supplied args.")
+        else:
+            # Use logic to determine the default storage device
+            if args.use_ramtorch_network:
+                logger.info(f"Defaulting state_storage_device to 'cpu' as args.use_ramtorch_network is True.")
+                optimizer_kwargs["state_storage_device"] = "cpu"
+            else:
+                logger.info(f"Defaulting state_storage_device to accelerator device '{accelerator.device}'.")
+                optimizer_kwargs["state_storage_device"] = accelerator.device
 
     # make backward compatibility for text_encoder_lr
     support_multiple_lrs = hasattr(network, "prepare_optimizer_params_with_multiple_te_lrs")

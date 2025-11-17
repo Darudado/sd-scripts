@@ -990,7 +990,7 @@ class NetworkTrainer:
             optimizer_eval_fn, 
             lr_descriptions, 
             text_encoder_lr
-         ) = train_util.prepare_optimizer(args, network)
+         ) = train_util.prepare_optimizer(args, network, accelerator)
 
         # prepare dataloader
         # strategies are set here because they cannot be referenced in another process. Copy them with the dataset
@@ -2116,7 +2116,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--use_ramtorch_network",
         action="store_true",
         help="Use RamTorch to reduce GPU memory usage by keeping network/lora linear weights in system RAM. " \
-        "Requires use of optimizers that have been modified to support it, currently only SimplifiedAdEMAMixExM.",
+        "Requires use of optimizers that have been modified to support it, currently only SimplifiedAdEMAMixExM and OCGOpt.",
     )
 
     parser.add_argument(
