@@ -4197,6 +4197,26 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="set maximum time step for U-Net training (1~1000, default is 1000) / U-Net学習時のtime stepの最大値を設定する（1~1000で指定、省略時はデフォルト値(1000)）",
     )
     parser.add_argument(
+        "--timestep_distribution",
+        type=str,
+        default="uniform",
+        choices=["uniform", "logit_normal"],
+        help="Timestep distribution for training. 'uniform' is the default. 'logit_normal' samples more from the middle of the range.",
+    )
+    parser.add_argument(
+        "--logit_normal_mean",
+        type=float,
+        default=0.0,
+        help="Mean for the logit normal distribution. Only used if --timestep_distribution is 'logit_normal'.",
+    )
+    parser.add_argument(
+        "--logit_normal_std",
+        type=float,
+        default=1.1,
+        help="Stddev for the logit normal distribution. Only used if --timestep_distribution is 'logit_normal'.",
+    )
+
+    parser.add_argument(
         "--loss_type",
         type=str,
         default="l2",
@@ -6261,6 +6281,17 @@ def get_noise_noisy_latents_and_timesteps(
 
     if fixed_timesteps is not None:
         timesteps = fixed_timesteps
+    elif args.timestep_distribution == "logit_normal":
+        logits = torch.normal(
+            mean=args.logit_normal_mean,
+            std=args.logit_normal_std,
+            size=(b_size,),
+            device=latents.device,
+        )
+        sigmas = torch.sigmoid(logits)
+        timestep_range = max_timestep - min_timestep
+        timesteps = min_timestep + sigmas * timestep_range
+        timesteps = torch.clamp(timesteps, min_timestep, max_timestep - 1)
     else:
         timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
 
