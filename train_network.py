@@ -893,6 +893,9 @@ class NetworkTrainer:
         if args.base_weights is not None and not isinstance(args.base_weights, list):
             args.base_weights = [args.base_weights]
 
+        if args.base_weights_multiplier is not None and not isinstance(args.base_weights_multiplier, list):
+            args.base_weights_multiplier = [args.base_weights_multiplier]
+
         if args.base_weights is not None:
             # base_weights が指定されている場合は、指定された重みを読み込みマージする
             for i, weight_path in enumerate(args.base_weights):
