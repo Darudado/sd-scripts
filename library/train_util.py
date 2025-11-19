@@ -6291,7 +6291,7 @@ def get_noise_noisy_latents_and_timesteps(
         sigmas = torch.sigmoid(logits)
         timestep_range = max_timestep - min_timestep
         timesteps = min_timestep + sigmas * timestep_range
-        timesteps = torch.clamp(timesteps, min_timestep, max_timestep - 1)
+        timesteps = torch.clamp(timesteps, min_timestep, max_timestep - 1).to(dtype=torch.int64, device=latents.device)
     else:
         timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
 
