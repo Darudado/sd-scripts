@@ -25,6 +25,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+try:
+    from ramtorch.modules.linear import CPUBouncingLinear
+except ImportError:
+    logger.error("Failed to import ramtorch, please check ramtorch is installed correctly into the venv.")
+    CPUBouncingLinear = type(None)
+
 
 NUM_DOUBLE_BLOCKS = 19
 NUM_SINGLE_BLOCKS = 38
@@ -57,6 +63,11 @@ class LoRAModule(torch.nn.Module):
         super().__init__()
         self.lora_name = lora_name
 
+        # Detect RamTorch modules
+        self.is_ramtorch_org = isinstance(org_module, CPUBouncingLinear)
+        if self.is_ramtorch_org:
+            logger.info(f"RamTorch module detected: {lora_name}")
+
         if org_module.__class__.__name__ == "Conv2d":
             in_dim = org_module.in_channels
             out_dim = org_module.out_channels
@@ -83,7 +94,7 @@ class LoRAModule(torch.nn.Module):
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
-            assert org_module.__class__.__name__ == "Linear", "split_dims is only supported for Linear"
+            assert org_module.__class__.__name__ == "Linear" or org_module.__class__.__name__ == "CPUBouncingLinear", "split_dims is only supported for Linear"
             # print(f"split_dims: {split_dims}")
             self.lora_down = torch.nn.ModuleList(
                 [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
@@ -120,6 +131,13 @@ class LoRAModule(torch.nn.Module):
     def apply_to(self):
         self.org_forward = self.org_module.forward
         self.org_module.forward = self.forward
+
+        # Setup RamTorch device handling
+        if getattr(self, "is_ramtorch_org", False):
+            # Move LoRA parameters to GPU
+            self.lora_up.to(torch.cuda.current_device())
+            self.lora_down.to(torch.cuda.current_device())
+            self.org_module.cpu()
 
         del self.org_module
 
@@ -816,11 +834,13 @@ class LoRANetwork(torch.nn.Module):
                 if target_replace_modules is None or module.__class__.__name__ in target_replace_modules:
                     if target_replace_modules is None:  # dirty hack for all modules
                         module = root_module  # search all modules
+                    module.is_ramtorch_org = isinstance(module, CPUBouncingLinear)
 
                     for child_name, child_module in module.named_modules():
-                        is_linear = child_module.__class__.__name__ == "Linear"
+                        is_linear = child_module.__class__.__name__ in ["Linear", "CPUBouncingLinear"]
                         is_conv2d = child_module.__class__.__name__ == "Conv2d"
                         is_conv2d_1x1 = is_conv2d and child_module.kernel_size == (1, 1)
+                        child_module.is_ramtorch_org = isinstance(child_module, CPUBouncingLinear)
 
                         if is_linear or is_conv2d:
                             lora_name = prefix + "." + (name + "." if name else "") + child_name

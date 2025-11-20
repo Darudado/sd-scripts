@@ -19,6 +19,13 @@ logger = logging.getLogger(__name__)
 
 RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
 
+try:
+    from ramtorch.modules.linear import CPUBouncingLinear
+    from ramtorch.helpers import transfer_ramtensor_to_device
+except ImportError:
+    logger.error("Failed to import ramtorch, please check ramtorch is installed correctly into the venv.")
+    CPUBouncingLinear = type(None)
+    transfer_ramtensor_to_device = lambda t, d: t.to(d)
 
 class OFTModule(torch.nn.Module):
     """
@@ -39,6 +46,11 @@ class OFTModule(torch.nn.Module):
         """
         super().__init__()
         self.oft_name = oft_name
+
+        # Detect RamTorch modules
+        self.is_ramtorch_org = isinstance(org_module, CPUBouncingLinear)
+        if self.is_ramtorch_org:
+            logger.info(f"RamTorch module detected: {oft_name}")
 
         self.num_blocks = dim
 
@@ -70,6 +82,12 @@ class OFTModule(torch.nn.Module):
         self.org_forward = self.org_module[0].forward
         self.org_module[0].forward = self.forward
 
+        # Setup RamTorch device handling
+        if getattr(self, "is_ramtorch_org", False):
+            # Move LoRA parameters to GPU
+            self.oft_blocks.to(torch.cuda.current_device())
+            self.org_module.cpu()
+
     def get_weight(self, multiplier=None):
         if multiplier is None:
             multiplier = self.multiplier
@@ -93,7 +111,7 @@ class OFTModule(torch.nn.Module):
         org_dtype = x.dtype
 
         R = self.get_weight().to(torch.float32)
-        W = org_module.weight.to(torch.float32)
+        W = transfer_ramtensor_to_device(org_module.weight, x.device).to(dtype=torch.float32, non_blocking=True)
 
         if len(W.shape) == 4:  # Conv2d
             W_reshaped = einops.rearrange(W, "(k n) ... -> k n ...", k=self.num_blocks, n=self.block_size)
@@ -278,11 +296,13 @@ class OFTNetwork(torch.nn.Module):
             prefix = self.OFT_PREFIX_UNET
             ofts = []
             for name, module in root_module.named_modules():
+                module.is_ramtorch_org = isinstance(module, CPUBouncingLinear)
                 if module.__class__.__name__ in target_replace_modules:
                     for child_name, child_module in module.named_modules():
-                        is_linear = "Linear" in child_module.__class__.__name__
+                        is_linear = child_module.__class__.__name__ in ["Linear", "CPUBouncingLinear"]
                         is_conv2d = "Conv2d" in child_module.__class__.__name__
                         is_conv2d_1x1 = is_conv2d and child_module.kernel_size == (1, 1)
+                        child_module.is_ramtorch_org = isinstance(child_module, CPUBouncingLinear)
 
                         if is_linear or is_conv2d_1x1 or (is_conv2d and enable_conv):
                             oft_name = prefix + "." + name + "." + child_name
