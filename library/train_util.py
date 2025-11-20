@@ -6283,8 +6283,8 @@ def get_noise_noisy_latents_and_timesteps(
         timesteps = fixed_timesteps
     elif args.timestep_distribution == "logit_normal":
         logits = torch.normal(
-            mean=args.logit_normal_mean,
-            std=args.logit_normal_std,
+            mean=float(args.logit_normal_mean),
+            std=float(args.logit_normal_std),
             size=(b_size,),
             device=latents.device,
         )
