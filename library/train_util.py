@@ -187,11 +187,12 @@ def split_train_val(
 
 
 class ImageInfo:
-    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
+    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, is_val: bool, absolute_path: str) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
         self.caption: str = caption
         self.is_reg: bool = is_reg
+        self.is_val: bool = is_val
         self.absolute_path: str = absolute_path
         self.image_size: Tuple[int, int] = None
         self.resized_size: Tuple[int, int] = None
@@ -481,6 +482,7 @@ class DreamBoothSubset(BaseSubset):
         self,
         image_dir: str,
         is_reg: bool,
+        is_val: bool,
         class_tokens: Optional[str],
         caption_extension: str,
         cache_info: bool,
@@ -540,6 +542,7 @@ class DreamBoothSubset(BaseSubset):
         )
 
         self.is_reg = is_reg
+        self.is_val = is_val
         self.class_tokens = class_tokens
         self.caption_extension = caption_extension
         if self.caption_extension and not self.caption_extension.startswith("."):
@@ -2135,7 +2138,9 @@ class DreamBoothDataset(BaseDataset):
         logger.info("prepare images.")
         num_train_images = 0
         num_reg_images = 0
+        num_val_images = 0
         reg_infos: List[Tuple[ImageInfo, DreamBoothSubset]] = []
+        val_infos: List[Tuple[ImageInfo, DreamBoothSubset]] = []
         for subset in subsets:
             num_repeats = subset.num_repeats if self.is_training_dataset else 1
             if num_repeats < 1:
@@ -2157,13 +2162,21 @@ class DreamBoothDataset(BaseDataset):
                 )
                 continue
 
+            if subset.is_val and self.is_training_dataset:
+                logger.warning(
+                    f"ignore subset with image_dir='{subset.image_dir}': val subset in training dataset"
+                )
+                continue
+
             if subset.is_reg:
                 num_reg_images += num_repeats * len(img_paths)
+            elif subset.is_val:
+                num_val_images += num_repeats * len(img_paths)
             else:
                 num_train_images += num_repeats * len(img_paths)
 
             for img_path, caption, size in zip(img_paths, captions, sizes):
-                info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, img_path)
+                info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, subset.is_val, img_path)
                 info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 )
@@ -2171,6 +2184,9 @@ class DreamBoothDataset(BaseDataset):
                     info.image_size = size
                 if subset.is_reg:
                     reg_infos.append((info, subset))
+                elif subset.is_val:
+                    val_infos.append((info, subset))
+                    self.register_image(info, subset)
                 else:
                     self.register_image(info, subset)
 
@@ -2205,6 +2221,7 @@ class DreamBoothDataset(BaseDataset):
                 first_loop = False
 
         self.num_reg_images = num_reg_images
+        self.num_val_images = num_val_images
 
 
 class FineTuningDataset(BaseDataset):
@@ -2230,6 +2247,7 @@ class FineTuningDataset(BaseDataset):
 
         self.num_train_images = 0
         self.num_reg_images = 0
+        self.num_val_images = 0
 
         for subset in subsets:
             if subset.num_repeats < 1:
@@ -2513,6 +2531,7 @@ class ControlNetDataset(BaseDataset):
         self.batch_size = batch_size
         self.num_train_images = self.dreambooth_dataset_delegate.num_train_images
         self.num_reg_images = self.dreambooth_dataset_delegate.num_reg_images
+        self.num_val_images = self.dreambooth_dataset_delegate.num_val_images  
         self.validation_seed = int(validation_seed) if validation_seed is not None else None
         self.validation_split = float(validation_split) if validation_split is not None else 0.0
         self.resize_interpolation = resize_interpolation
@@ -2655,6 +2674,7 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
         self.image_data = {}
         self.num_train_images = 0
         self.num_reg_images = 0
+        self.num_val_images = 0
 
         # simply concat together
         # TODO: handling image_data key duplication among dataset
@@ -2663,6 +2683,7 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             self.image_data.update(dataset.image_data)
             self.num_train_images += dataset.num_train_images
             self.num_reg_images += dataset.num_reg_images
+            self.num_val_images += dataset.num_val_images
 
     def add_replacement(self, str_from, str_to):
         for dataset in self.datasets:
@@ -2941,6 +2962,7 @@ class MinimalDataset(BaseDataset):
 
         self.num_train_images = 0  # update in subclass
         self.num_reg_images = 0  # update in subclass
+        self.num_val_images = 0  # update in subclass
         self.datasets = [self]
         self.batch_size = 1  # update in subclass
 
@@ -2949,6 +2971,7 @@ class MinimalDataset(BaseDataset):
         self.img_count = 1  # update in subclass if needed
         self.bucket_info = {}
         self.is_reg = False
+        self.is_val = False
         self.image_dir = "dummy"  # for metadata
 
     def verify_bucket_reso_steps(self, min_steps: int):

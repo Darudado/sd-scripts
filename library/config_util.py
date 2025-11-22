@@ -8,6 +8,7 @@ import random
 from textwrap import dedent, indent
 import json
 from pathlib import Path
+import copy
 
 # from toolz import curry
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -82,6 +83,7 @@ class BaseSubsetParams:
 @dataclass
 class DreamBoothSubsetParams(BaseSubsetParams):
     is_reg: bool = False
+    is_val: Optional[bool] = False
     class_tokens: Optional[str] = None
     caption_extension: str = ".caption"
     cache_info: bool = False
@@ -216,6 +218,7 @@ class ConfigSanitizer:
     DB_SUBSET_DISTINCT_SCHEMA = {
         Required("image_dir"): str,
         "is_reg": bool,
+        "is_val": bool,
         "alpha_mask": bool,
     }
     # FT means FineTuning
@@ -474,6 +477,7 @@ class BlueprintGenerator:
 
 def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlueprint) -> Tuple[DatasetGroup, Optional[DatasetGroup]]:
     datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
+    val_datasets:List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
 
     for dataset_blueprint in dataset_group_blueprint.datasets:
         extra_dataset_params = {}
@@ -490,38 +494,75 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
             subset_klass = FineTuningSubset
             dataset_klass = FineTuningDataset
 
-        subsets = [subset_klass(**asdict(subset_blueprint.params)) for subset_blueprint in dataset_blueprint.subsets]
-        dataset = dataset_klass(subsets=subsets, **asdict(dataset_blueprint.params), **extra_dataset_params)
+        subsets = []
+        val_subsets = []
+
+        for subset_blueprint in dataset_blueprint.subsets:
+            if getattr(subset_blueprint.params,'is_val', False):
+                # Set values for consistency
+                subset_blueprint.params.num_repeats = 1
+                subset_blueprint.params.color_aug = False
+                subset_blueprint.params.flip_aug = False
+                subset_blueprint.params.random_crop = False
+                subset_blueprint.params.random_crop_padding_percent = 0.0
+                subset_blueprint.params.caption_dropout_rate = 0.0
+                subset_blueprint.params.caption_dropout_every_n_epochs = 0
+                subset_blueprint.params.caption_tag_dropout_rate = 0.0
+                subset_blueprint.params.shuffle_caption = False
+                subset_blueprint.params.token_warmup_step = 0
+
+                val_subsets.append(subset_klass(**asdict(subset_blueprint.params)))
+            else:
+                subsets.append(subset_klass(**asdict(subset_blueprint.params)))
+
+        if len(val_subsets) > 0:
+            val_dataset = dataset_klass(subsets=val_subsets, is_training_dataset=False, **asdict(dataset_blueprint.params))
+            val_datasets.append(val_dataset)
+
+        dataset = dataset_klass(subsets=subsets, is_training_dataset=True, **asdict(dataset_blueprint.params))
         datasets.append(dataset)
 
-    val_datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
     for dataset_blueprint in dataset_group_blueprint.datasets:
-        dataset_blueprint.params.validation_split = float(dataset_blueprint.params.validation_split) if dataset_blueprint.params.validation_split is not None else 0.0
-
-        if dataset_blueprint.params.validation_split < 0.0 or dataset_blueprint.params.validation_split > 1.0:
-            logging.warning(f"Dataset param `validation_split` ({dataset_blueprint.params.validation_split}) is not a valid number between 0.0 and 1.0, skipping validation split...")
+        if float(dataset_blueprint.params.validation_split) <= 0.0:
             continue
-
-        # if the dataset isn't setting a validation split, there is no current validation dataset
-        if dataset_blueprint.params.validation_split == 0.0:
-            continue
-
-        extra_dataset_params = {}
         if dataset_blueprint.is_controlnet:
             subset_klass = ControlNetSubset
             dataset_klass = ControlNetDataset
         elif dataset_blueprint.is_dreambooth:
             subset_klass = DreamBoothSubset
             dataset_klass = DreamBoothDataset
-            # DreamBooth datasets support splitting training and validation datasets
-            extra_dataset_params = {"is_training_dataset": False}
-        else:
+        else:            
             subset_klass = FineTuningSubset
             dataset_klass = FineTuningDataset
 
-        subsets = [subset_klass(**asdict(subset_blueprint.params)) for subset_blueprint in dataset_blueprint.subsets]
-        dataset = dataset_klass(subsets=subsets, **asdict(dataset_blueprint.params), **extra_dataset_params)
-        val_datasets.append(dataset)
+        val_subsets = []
+        for subset_blueprint in dataset_blueprint.subsets:
+            # Already handled by earlier logic, or controlnet and shouldn't be val
+            if (getattr(subset_blueprint.params,'is_val', False) or 
+                subset_blueprint.params == ControlNetSubsetParams or 
+                subset_blueprint.params.is_reg):
+                continue
+
+            subset_blueprint_params_copy = copy.deepcopy(subset_blueprint.params)
+
+            # Set values for consistency
+            subset_blueprint_params_copy.num_repeats = 1
+            subset_blueprint_params_copy.color_aug = False
+            subset_blueprint_params_copy.flip_aug = False
+            subset_blueprint_params_copy.random_crop = False
+            subset_blueprint_params_copy.random_crop_padding_percent = 0.0
+            subset_blueprint_params_copy.caption_dropout_rate = 0.0
+            subset_blueprint_params_copy.caption_dropout_every_n_epochs = 0
+            subset_blueprint_params_copy.caption_tag_dropout_rate = 0.0
+            subset_blueprint_params_copy.token_warmup_step = 0
+            subset_blueprint_params_copy.shuffle_caption = False
+            subset_blueprint_params_copy.is_val = True
+
+            val_subsets.append(subset_klass(**asdict(subset_blueprint_params_copy)))
+
+        if len(val_subsets) > 0:
+            dataset = dataset_klass(subsets=val_subsets, is_training_dataset=False, **asdict(dataset_blueprint.params))
+            val_datasets.append(dataset)
 
     def print_info(_datasets, dataset_type: str):
         info = ""
@@ -574,6 +615,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                 if is_dreambooth:
                     info += indent(dedent(f"""\
                         is_reg: {subset.is_reg}
+                        is_val: {subset.is_val}
                         class_tokens: {subset.class_tokens}
                         caption_extension: {subset.caption_extension}
                     \n"""), "    ")
@@ -609,7 +651,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
     )
 
 
-def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] = None, reg_data_dir: Optional[str] = None):
+def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] = None, reg_data_dir: Optional[str] = None, val_data_dir: Optional[str] = None):
     def extract_dreambooth_params(name: str) -> Tuple[int, str]:
         tokens = name.split("_")
         try:
@@ -620,7 +662,7 @@ def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] 
         caption_by_folder = "_".join(tokens[1:])
         return n_repeats, caption_by_folder
 
-    def generate(base_dir: Optional[str], is_reg: bool):
+    def generate(base_dir: Optional[str], is_reg: bool, is_val: bool = False):
         if base_dir is None:
             return []
 
@@ -637,7 +679,7 @@ def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] 
             if num_repeats < 1:
                 continue
 
-            subset_config = {"image_dir": str(subdir), "num_repeats": num_repeats, "is_reg": is_reg, "class_tokens": class_tokens}
+            subset_config = {"image_dir": str(subdir), "num_repeats": num_repeats, "is_reg": is_reg, "is_val": is_val, "class_tokens": class_tokens}
             subsets_config.append(subset_config)
 
         return subsets_config
@@ -645,6 +687,7 @@ def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] 
     subsets_config = []
     subsets_config += generate(train_data_dir, False)
     subsets_config += generate(reg_data_dir, True)
+    subsets_config += generate(val_data_dir, False, True)
 
     return subsets_config
 
