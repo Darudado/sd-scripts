@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 import re
 from library.utils import setup_logging
+from lora import transfer_ramtensor_to_device
 
 setup_logging()
 import logging
@@ -21,11 +22,9 @@ RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers
 
 try:
     from ramtorch.modules.linear import CPUBouncingLinear
-    from ramtorch.helpers import transfer_ramtensor_to_device
 except ImportError:
     logger.error("Failed to import ramtorch, please check ramtorch is installed correctly into the venv.")
     CPUBouncingLinear = type(None)
-    transfer_ramtensor_to_device = lambda t, d: t.to(d)
 
 class OFTModule(torch.nn.Module):
     """
