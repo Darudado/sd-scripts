@@ -195,9 +195,9 @@ class NetworkTrainer:
 
         if args.use_ramtorch:
             logger.info("Applying RamTorch to SD model.")
-            unet = apply_ramtorch_to_module(unet, "unet", accelerator.device)
-            vae = apply_ramtorch_to_module(vae, "vae", accelerator.device)
-            text_encoder = apply_ramtorch_to_module(text_encoder, "clip_l", accelerator.device)
+            unet = apply_ramtorch_to_module(unet, "unet", accelerator.device, weight_dtype)
+            vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, weight_dtype)
+            text_encoder = apply_ramtorch_to_module(text_encoder, "clip_l", accelerator.device, weight_dtype)
 
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
@@ -543,7 +543,7 @@ class NetworkTrainer:
         Process a batch for the network to determine val loss
         """
         total_loss = 0.0 
-        with torch.autograd.grad_mode.inference_mode(mode=True):
+        with torch.no_grad():
             if "latents" in batch and batch["latents"] is not None:
                 latents = typing.cast(torch.FloatTensor, batch["latents"].to(device=accelerator.device, non_blocking=args.pin_data_loader_memory or args.pin_memory))
             else:
@@ -556,9 +556,8 @@ class NetworkTrainer:
                     ]
                     list_latents = []
                     for chunk in chunks:
-                        with torch.no_grad():
-                            chunk = self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype, non_blocking=args.pin_data_loader_memory or args.pin_memory))
-                            list_latents.append(chunk)
+                        chunk = self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype, non_blocking=args.pin_data_loader_memory or args.pin_memory))
+                        list_latents.append(chunk)
                     latents = torch.cat(list_latents, dim=0)
 
                 # NaNが含まれていれば警告を表示し0に置き換える
@@ -575,7 +574,7 @@ class NetworkTrainer:
 
             if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
                 # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
-                with torch.set_grad_enabled(False and train_text_encoder), accelerator.autocast():
+                with accelerator.autocast():
                     # Get the text embedding for conditioning
                     if args.weighted_captions:
                         input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
@@ -970,7 +969,7 @@ class NetworkTrainer:
             #move all network weights to cpu first as base device
             network = network.to("cpu")
             logger.info("Applying RamTorch to network/lora.")
-            network = apply_ramtorch_to_module(network, "network/lora", accelerator.device)
+            network = apply_ramtorch_to_module(network, "network/lora", accelerator.device, weight_dtype)
 
         if args.gradient_checkpointing:
             if args.cpu_offload_checkpointing:
@@ -1709,6 +1708,9 @@ class NetworkTrainer:
                     )
 
                     accelerator.backward(loss)
+
+                    if args.use_ramtorch or args.use_ramtorch_network:
+                        torch.cuda.synchronize() 
 
                     loss = pre_scaling_loss
 

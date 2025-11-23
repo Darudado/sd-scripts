@@ -374,9 +374,9 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
 
         if args.use_ramtorch:
             logger.info("Applying RamTorch to Hunyuan model TEs and vae.")
-            text_encoder_vlm = apply_ramtorch_to_module(text_encoder_vlm, "vlm", accelerator.device)
-            text_encoder_byt5 = apply_ramtorch_to_module(text_encoder_byt5, "byt5", accelerator.device)
-            vae = apply_ramtorch_to_module(vae, "vae", accelerator.device)
+            text_encoder_vlm = apply_ramtorch_to_module(text_encoder_vlm, "vlm", accelerator.device, weight_dtype)
+            text_encoder_byt5 = apply_ramtorch_to_module(text_encoder_byt5, "byt5", accelerator.device, weight_dtype)
+            vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, weight_dtype)
 
         model_version = hunyuan_image_utils.MODEL_VERSION_2_1
         return model_version, [text_encoder_vlm, text_encoder_byt5], vae, None  # unet will be loaded later

@@ -86,9 +86,9 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
 
         if args.use_ramtorch:
             logger.info("Applying RamTorch to Lumina model.")
-            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device)
-            ae = apply_ramtorch_to_module(ae, "ae", accelerator.device)
-            gemma2 = apply_ramtorch_to_module(gemma2, "gemma2", accelerator.device)
+            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, weight_dtype)
+            ae = apply_ramtorch_to_module(ae, "ae", accelerator.device, weight_dtype)
+            gemma2 = apply_ramtorch_to_module(gemma2, "gemma2", accelerator.device, weight_dtype)
 
         return lumina_util.MODEL_VERSION_LUMINA_V2, [gemma2], ae, model
 
