@@ -480,16 +480,12 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
     val_datasets:List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
 
     for dataset_blueprint in dataset_group_blueprint.datasets:
-        extra_dataset_params = {}
-
         if dataset_blueprint.is_controlnet:
             subset_klass = ControlNetSubset
             dataset_klass = ControlNetDataset
         elif dataset_blueprint.is_dreambooth:
             subset_klass = DreamBoothSubset
             dataset_klass = DreamBoothDataset
-            # DreamBooth datasets support splitting training and validation datasets
-            extra_dataset_params = {"is_training_dataset": True}
         else:
             subset_klass = FineTuningSubset
             dataset_klass = FineTuningDataset

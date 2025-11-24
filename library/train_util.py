@@ -2458,6 +2458,7 @@ class ControlNetDataset(BaseDataset):
     def __init__(
         self,
         subsets: Sequence[ControlNetSubset],
+        is_training_dataset: bool,
         batch_size: int,
         resolution,
         network_multiplier: float,
@@ -2480,6 +2481,7 @@ class ControlNetDataset(BaseDataset):
             ), "random_crop is not supported in ControlNetDataset / random_cropはControlNetDatasetではサポートされていません"
             db_subset = DreamBoothSubset(
                 subset.image_dir,
+                False,
                 False,
                 None,
                 subset.caption_extension,
@@ -2510,7 +2512,7 @@ class ControlNetDataset(BaseDataset):
 
         self.dreambooth_dataset_delegate = DreamBoothDataset(
             db_subsets,
-            True,
+            is_training_dataset,
             batch_size,
             resolution,
             network_multiplier,
