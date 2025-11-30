@@ -364,7 +364,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         )
         _, text_encoder_byt5 = hunyuan_image_text_encoder.load_byt5(
             args.byt5, dtype=torch.float16, device=vl_device, disable_mmap=args.disable_mmap_load_safetensors
-        )
+        ) # byt5 is always fp16
 
         vae = hunyuan_image_vae.load_vae(
             args.vae, "cpu", disable_mmap=args.disable_mmap_load_safetensors, chunk_size=args.vae_chunk_size
@@ -374,9 +374,8 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
 
         if args.use_ramtorch:
             logger.info("Applying RamTorch to Hunyuan model TEs and vae.")
-            text_encoder_vlm = apply_ramtorch_to_module(text_encoder_vlm, "vlm", accelerator.device, weight_dtype)
-            text_encoder_byt5 = apply_ramtorch_to_module(text_encoder_byt5, "byt5", accelerator.device, weight_dtype)
-            vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, weight_dtype)
+            text_encoder_vlm = apply_ramtorch_to_module(text_encoder_vlm, "vlm", accelerator.device, vl_dtype)
+            text_encoder_byt5 = apply_ramtorch_to_module(text_encoder_byt5, "byt5", accelerator.device, torch.float16) # byt5 is always fp16
 
         model_version = hunyuan_image_utils.MODEL_VERSION_2_1
         return model_version, [text_encoder_vlm, text_encoder_byt5], vae, None  # unet will be loaded later
@@ -417,7 +416,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
 
         if args.use_ramtorch:
             logger.info("Applying RamTorch to Hunyuan model dit.")
-            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device)
+            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
 
         return model, text_encoders
 

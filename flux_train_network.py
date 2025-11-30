@@ -159,10 +159,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         if args.use_ramtorch:
             logger.info("Applying RamTorch to FLUX model.")
-            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, weight_dtype)
-            ae = apply_ramtorch_to_module(ae, "ae", accelerator.device, weight_dtype)
+            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
             clip_l = apply_ramtorch_to_module(clip_l, "clip_l", accelerator.device, weight_dtype)
-            t5xxl = apply_ramtorch_to_module(t5xxl, "t5xxl", accelerator.device, weight_dtype)
+            t5xxl = apply_ramtorch_to_module(t5xxl, "t5xxl", accelerator.device, t5xxl.dtype)
 
         model_version = flux_utils.MODEL_VERSION_FLUX_V1 if self.model_type != "chroma" else flux_utils.MODEL_VERSION_CHROMA
         return model_version, [clip_l, t5xxl], ae, model

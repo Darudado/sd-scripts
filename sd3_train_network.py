@@ -144,11 +144,10 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
 
         if args.use_ramtorch:
             logger.info("Applying RamTorch to SD3 model.")
-            mmdit = apply_ramtorch_to_module(mmdit, "unet/dit", accelerator.device, weight_dtype)
-            ae = apply_ramtorch_to_module(ae, "ae", accelerator.device, weight_dtype)
+            mmdit = apply_ramtorch_to_module(mmdit, "unet/dit", accelerator.device, mmdit.dtype)
             clip_l = apply_ramtorch_to_module(clip_l, "clip_l", accelerator.device, weight_dtype)
             clip_g = apply_ramtorch_to_module(clip_g, "clip_g", accelerator.device, weight_dtype)
-            t5xxl = apply_ramtorch_to_module(t5xxl, "t5xxl", accelerator.device, weight_dtype)
+            t5xxl = apply_ramtorch_to_module(t5xxl, "t5xxl", accelerator.device, t5xxl.dtype)
 
         return mmdit.model_type, [clip_l, clip_g, t5xxl], vae, mmdit
 

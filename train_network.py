@@ -196,7 +196,6 @@ class NetworkTrainer:
         if args.use_ramtorch:
             logger.info("Applying RamTorch to SD model.")
             unet = apply_ramtorch_to_module(unet, "unet", accelerator.device, weight_dtype)
-            vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, weight_dtype)
             text_encoder = apply_ramtorch_to_module(text_encoder, "clip_l", accelerator.device, weight_dtype)
 
         # モデルに xformers とか memory efficient attention を組み込む
@@ -849,6 +848,9 @@ class NetworkTrainer:
         if vae_dtype is None:
             vae_dtype = vae.dtype
             logger.info(f"vae_dtype is set to {vae_dtype} by the model since cast_vae() is false")
+
+        if args.use_ramtorch_vae:
+            vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, vae_dtype)
 
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
@@ -2124,14 +2126,21 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--use_ramtorch",
         action="store_true",
-        help="Use RamTorch to reduce GPU memory usage by keeping base/original linear model weights in system RAM.",
+        help="Use RamTorch to reduce GPU memory usage by keeping base/original linear model weights in system RAM for UNET and TEs.",
+    )
+
+    parser.add_argument(
+        "--use_ramtorch_vae",
+        action="store_true",
+        help="Use RamTorch to reduce GPU memory usage by keeping network/lora linear weights in system RAM for VAE. " \
+        "Requires use of optimizers that have been modified to support it, currently only SimplifiedAdEMAMix, SimplifiedAdEMAMixExM, and OCGOpt.",
     )
 
     parser.add_argument(
         "--use_ramtorch_network",
         action="store_true",
         help="Use RamTorch to reduce GPU memory usage by keeping network/lora linear weights in system RAM. " \
-        "Requires use of optimizers that have been modified to support it, currently only SimplifiedAdEMAMixExM and OCGOpt.",
+        "Requires use of optimizers that have been modified to support it, currently only SimplifiedAdEMAMix, SimplifiedAdEMAMixExM, and OCGOpt.",
     )
 
     parser.add_argument(

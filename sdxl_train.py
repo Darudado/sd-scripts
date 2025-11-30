@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
+from library.ramtorch_util import apply_ramtorch_to_module
 
 init_ipex()
 
@@ -226,6 +227,8 @@ def train(args):
     ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype)
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
+    if args.use_ramtorch_vae:
+        vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, vae_dtype)
 
     # verify load/save model formats
     if load_stable_diffusion_format:
@@ -945,7 +948,14 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--use_ramtorch",
         action="store_true",
-        help="Use RamTorch to reduce GPU memory usage by keeping base/original linear model weights in system RAM.",
+        help="Use RamTorch to reduce GPU memory usage by keeping base/original linear model weights in system RAM for UNET and TEs.",
+    )
+
+    parser.add_argument(
+        "--use_ramtorch_vae",
+        action="store_true",
+        help="Use RamTorch to reduce GPU memory usage by keeping network/lora linear weights in system RAM for VAE. " \
+        "Requires use of optimizers that have been modified to support it, currently only SimplifiedAdEMAMix, SimplifiedAdEMAMixExM, and OCGOpt.",
     )
     return parser
 

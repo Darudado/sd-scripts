@@ -63,7 +63,6 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
     if args.use_ramtorch:
         logger.info("Applying RamTorch to SDXL model.")
         unet = apply_ramtorch_to_module(unet, "unet", accelerator.device, weight_dtype)
-        vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, weight_dtype)
         text_encoder1 = apply_ramtorch_to_module(text_encoder1, "clip_l", accelerator.device, weight_dtype)
         text_encoder2 = apply_ramtorch_to_module(text_encoder2, "clip_g", accelerator.device, weight_dtype)
 
