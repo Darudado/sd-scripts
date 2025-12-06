@@ -2132,8 +2132,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--use_ramtorch_vae",
         action="store_true",
-        help="Use RamTorch to reduce GPU memory usage by keeping network/lora linear weights in system RAM for VAE. " \
-        "Requires use of optimizers that have been modified to support it, currently only SimplifiedAdEMAMix, SimplifiedAdEMAMixExM, and OCGOpt.",
+        help="Use RamTorch to reduce GPU memory usage by keeping linear weights in system RAM for VAE. ",
     )
 
     parser.add_argument(
