@@ -47,6 +47,8 @@ def set_tokenize_strategy(is_sd: bool, is_sdxl: bool, is_flux: bool, args: argpa
         tokenize_strategy = strategy_flux.FluxTokenizeStrategy(t5xxl_max_token_length, args.tokenizer_cache_dir)
     strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
 
+    return tokenize_strategy
+
 
 def cache_to_disk(args: argparse.Namespace) -> None:
     setup_logging(args, reset=True)

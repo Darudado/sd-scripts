@@ -61,6 +61,7 @@ class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
+        self.latent_shift = 0.0
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -237,6 +238,9 @@ class NetworkTrainer:
     def get_text_encoders_train_flags(self, args, text_encoders):
         return [True] * len(text_encoders) if self.is_train_text_encoder(args) else [False] * len(text_encoders)
 
+    def get_flow_pixel_counts(self, args, batch, latents):
+        return None
+
     def is_train_text_encoder(self, args):
         return not args.network_train_unet_only
 
@@ -244,8 +248,8 @@ class NetworkTrainer:
         for t_enc in text_encoders:
             t_enc.to(accelerator.device, dtype=weight_dtype)
 
-    def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype, **kwargs):
-        noise_pred = unet(noisy_latents, timesteps, text_conds[0]).sample
+    def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, text_masks, batch, weight_dtype, **kwargs):
+        noise_pred = unet(noisy_latents, timesteps, text_conds[0], text_masks).sample
         return noise_pred
 
     def all_reduce_network(self, accelerator, network):
@@ -276,7 +280,7 @@ class NetworkTrainer:
         return vae.encode(images).latent_dist.sample()
 
     def shift_scale_latents(self, args, latents: torch.FloatTensor) -> torch.FloatTensor:
-        return latents * self.vae_scale_factor
+        return (latents - self.latent_shift) * self.vae_scale_factor
 
     def get_noise_pred_and_target(
         self,
@@ -286,6 +290,7 @@ class NetworkTrainer:
         latents,
         batch,
         text_encoder_conds,
+        text_encoder_masks,
         unet,
         network,
         weight_dtype,
@@ -295,7 +300,16 @@ class NetworkTrainer:
     ):
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
-        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, fixed_timesteps, is_train)
+        encoder_attention_mask_bias = text_encoder_masks[1] #[(1 - t.to(dtype=text_encoder_conds[0].dtype)).unsqueeze(1) * -10000.0 for t in text_encoder_masks]
+
+        pixel_counts = None
+        if hasattr(self, "get_flow_pixel_counts"):
+            pixel_counts = self.get_flow_pixel_counts(args, batch, latents.device)
+
+        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
+            args, noise_scheduler, latents, fixed_timesteps, is_train, pixel_counts=pixel_counts
+        )
+
 
         # ensure the hidden state will require grad
         if is_train and args.gradient_checkpointing:
@@ -313,11 +327,14 @@ class NetworkTrainer:
                 noisy_latents.requires_grad_(train_unet),
                 timesteps,
                 text_encoder_conds,
+                encoder_attention_mask_bias,
                 batch,
                 weight_dtype,
             )
 
-        if args.v_parameterization:
+        if getattr(args, "flow_model", False):
+            target = noise - latents
+        elif args.v_parameterization:
             # v-parameterization training
             target = noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
@@ -340,6 +357,7 @@ class NetworkTrainer:
                         noisy_latents,
                         timesteps,
                         text_encoder_conds,
+                        encoder_attention_mask_bias,
                         batch,
                         weight_dtype,
                         indices=diff_output_pr_indices,
@@ -347,7 +365,7 @@ class NetworkTrainer:
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
 
-        return noise_pred, target, timesteps, None
+        return noise_pred, target, timesteps, None, noise
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
         if args.min_snr_gamma:
@@ -437,9 +455,12 @@ class NetworkTrainer:
             latents = self.shift_scale_latents(args, latents)
 
         text_encoder_conds = []
+        masks_reshaped = []
         text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
         if text_encoder_outputs_list is not None:
-            text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
+            text_encoder_conds = text_encoder_outputs_list[:3]  # List of text encoder outputs
+            if len(text_encoder_outputs_list) > 3:
+                masks_reshaped = text_encoder_outputs_list[3:]
 
         if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
             # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
@@ -455,10 +476,15 @@ class NetworkTrainer:
                     )
                 else:
                     input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
-                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                    if self.is_sdxl:
+                        masks = [mask.to(accelerator.device) for mask in batch["attn_mask_list"]]
+                    else:
+                        masks = None
+                    encoded_text_encoder_conds, masks_reshaped = text_encoding_strategy.encode_tokens(
                         tokenize_strategy,
                         self.get_models_for_text_encoding(args, accelerator, text_encoders),
                         input_ids,
+                        masks,
                     )
                 if args.full_fp16:
                     encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
@@ -473,13 +499,14 @@ class NetworkTrainer:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
         # sample noise, call unet, get target
-        noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
+        noise_pred, target, timesteps, weighting, noise = self.get_noise_pred_and_target(
             args,
             accelerator,
             noise_scheduler,
             latents,
             batch,
             text_encoder_conds,
+            masks_reshaped,
             unet,
             network,
             weight_dtype,
@@ -495,6 +522,19 @@ class NetworkTrainer:
             loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, scale=float(args.loss_scale))
             if weighting is not None:
                 loss = loss * weighting
+
+            if args.contrastive_flow_matching and latents.size(0) > 1:
+                negative_latents = latents.roll(1, 0)
+                negative_noise = noise.roll(1, 0)
+                with torch.no_grad():
+                    if getattr(args, "flow_model", False):
+                        target_negative = negative_noise - negative_latents
+                    else:
+                        target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
+                loss_contrastive = torch.nn.functional.mse_loss(
+                    noise_pred.float(), target_negative.float(), reduction="none"
+                )
+                loss = loss - args.cfm_lambda * loss_contrastive
             if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                 loss = apply_masked_loss(loss, batch)
         else:
@@ -567,9 +607,12 @@ class NetworkTrainer:
             latents = self.shift_scale_latents(args, latents)
 
             text_encoder_conds = []
+            masks_reshaped = []
             text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
             if text_encoder_outputs_list is not None:
-                text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
+                text_encoder_conds = text_encoder_outputs_list[:3]  # List of text encoder outputs
+                if len(text_encoder_outputs_list) > 3:
+                    masks_reshaped = text_encoder_outputs_list[3:]
 
             if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
                 # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
@@ -585,10 +628,15 @@ class NetworkTrainer:
                         )
                     else:
                         input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
-                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                        if self.is_sdxl:
+                            masks = [ids.to(accelerator.device) for ids in batch["attn_mask_list"]]
+                        else:
+                            masks = None
+                        encoded_text_encoder_conds, masks_reshaped = text_encoding_strategy.encode_tokens(
                             tokenize_strategy,
                             self.get_models_for_text_encoding(args, accelerator, text_encoders),
                             input_ids,
+                            masks,
                         )
                     if args.full_fp16:
                         encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
@@ -607,13 +655,14 @@ class NetworkTrainer:
                 timesteps = torch.full((batch_size,), fixed_timesteps, dtype=torch.long, device=latents.device)
 
                 # sample noise, call unet, get target
-                noise_pred, target, _, _ = self.get_noise_pred_and_target(
+                noise_pred, target, _, _, _ = self.get_noise_pred_and_target(
                     args,
                     accelerator,
                     noise_scheduler,
                     latents,
                     batch,
                     text_encoder_conds,
+                    masks_reshaped,
                     unet,
                     network,
                     weight_dtype,
@@ -743,6 +792,75 @@ class NetworkTrainer:
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
 
+        if getattr(args, "flow_model", False):
+            logger.info("Using Rectified Flow training objective.")
+            if args.v_parameterization:
+                raise ValueError("`--flow_model` is incompatible with `--v_parameterization`; Rectified Flow already predicts velocity.")
+            if args.min_snr_gamma:
+                logger.warning("`--min_snr_gamma` is ignored when Rectified Flow is enabled.")
+                args.min_snr_gamma = None
+            if args.debiased_estimation_loss:
+                logger.warning("`--debiased_estimation_loss` is ignored when Rectified Flow is enabled.")
+                args.debiased_estimation_loss = False
+            if args.scale_v_pred_loss_like_noise_pred:
+                logger.warning("`--scale_v_pred_loss_like_noise_pred` is ignored when Rectified Flow is enabled.")
+                args.scale_v_pred_loss_like_noise_pred = False
+            if args.v_pred_like_loss:
+                logger.warning("`--v_pred_like_loss` is ignored when Rectified Flow is enabled.")
+                args.v_pred_like_loss = None
+            if args.flow_use_ot:
+                logger.info("Using cosine optimal transport pairing for Rectified Flow batches.")
+                
+            shift_enabled = args.flow_uniform_shift or args.flow_uniform_static_ratio is not None
+            distribution = getattr(args, "flow_timestep_distribution", "logit_normal")
+            if distribution == "logit_normal":
+                flow_logit_std = float(getattr(args, "flow_logit_std", 1.0))
+                flow_logit_mean = float(getattr(args, "flow_logit_mean", 0.0))
+                if flow_logit_std <= 0:
+                    raise ValueError("`--flow_logit_std` must be positive.")
+                logger.info(
+                    "Rectified Flow timesteps sampled from logit-normal distribution with "
+                    f"mean={flow_logit_mean}, std={flow_logit_std}."
+                )
+            elif distribution == "uniform":
+                logger.info("Rectified Flow timesteps sampled uniformly in [0, 1].")
+            else:
+                raise ValueError(f"Unknown Rectified Flow timestep distribution: {distribution}")
+
+            if shift_enabled:
+                if args.flow_uniform_static_ratio is not None:
+                    flow_uniform_static_ratio = float(getattr(args, "flow_uniform_static_ratio", 0.0))
+                    if flow_uniform_static_ratio <= 0:
+                        raise ValueError("`--flow_uniform_static_ratio` must be positive.")
+                    logger.info(
+                        f"Rectified Flow timestep shift uses static ratio={flow_uniform_static_ratio}."
+                    )
+                else:
+                    logger.info(
+                        f"Rectified Flow timestep shift uses base pixels={args.flow_uniform_base_pixels}."
+                    )
+
+        if args.contrastive_flow_matching and not (args.v_parameterization or getattr(args, "flow_model", False)):
+            raise ValueError("`--contrastive_flow_matching` requires either v-parameterization or Rectified Flow.")
+
+        if getattr(args, "vae_custom_scale", None) is not None:
+            try:
+                self.vae_scale_factor = float(args.vae_custom_scale)
+            except (TypeError, ValueError):
+                raise ValueError("`--vae_custom_scale` must be a valid number")
+            logger.info(f"Using custom VAE scale factor: {self.vae_scale_factor}")
+        if getattr(args, "vae_custom_shift", None) is not None:
+            try:
+                self.latent_shift = float(args.vae_custom_shift)
+            except (TypeError, ValueError):
+                raise ValueError("`--vae_custom_shift` must be a valid number")
+            logger.info(f"Using custom VAE shift factor: {self.latent_shift}")
+        else:
+            self.latent_shift = 0.0
+
+        args.vae_scale_factor = self.vae_scale_factor
+        args.vae_shift_factor = self.latent_shift
+
         cache_latents = args.cache_latents
         use_dreambooth_method = args.in_json is None
         use_user_config = args.dataset_config is not None
@@ -804,6 +922,19 @@ class NetworkTrainer:
             train_dataset_group = train_util.load_arbitrary_dataset(args)
             val_dataset_group = None  # placeholder until validation dataset supported for arbitrary
 
+        if args.protected_tags_file:
+            logger.info("Injecting protected_tags_file into datasets...")
+            for ds in train_dataset_group.datasets:
+                ds.protected_tags_file = args.protected_tags_file
+        if args.log_caption_tag_dropout:
+            logger.info("Enabling caption tag dropout logging for datasets...")
+            for ds in train_dataset_group.datasets:
+                ds.log_caption_tag_dropout = True
+        if args.log_caption_dropout:
+            logger.info("Enabling caption dropout logging for datasets...")
+            for ds in train_dataset_group.datasets:
+                ds.log_caption_dropout = True
+
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -848,6 +979,9 @@ class NetworkTrainer:
         if vae_dtype is None:
             vae_dtype = vae.dtype
             logger.info(f"vae_dtype is set to {vae_dtype} by the model since cast_vae() is false")
+
+        if getattr(args, "vae_reflection_padding", False):
+            vae = model_util.use_reflection_padding(vae)
 
         if args.use_ramtorch_vae:
             vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, vae_dtype)
@@ -1476,6 +1610,10 @@ class NetworkTrainer:
                 vae_name = os.path.basename(vae_name)
             metadata["ss_vae_name"] = vae_name
 
+        metadata["ss_vae_scale_factor"] = self.vae_scale_factor
+        metadata["ss_vae_shift_factor"] = self.latent_shift
+        metadata["ss_vae_reflection_padding"] = getattr(args, "vae_reflection_padding", False)
+
         metadata = {k: str(v) for k, v in metadata.items()}
 
         # make minimum metadata for filtering
@@ -1708,6 +1846,9 @@ class NetworkTrainer:
                         train_unet=train_unet,
                         edm2_model=edm2_model,
                     )
+
+                    if loss.ndim != 0:
+                        loss = loss.mean()
 
                     accelerator.backward(loss)
 
@@ -1974,6 +2115,11 @@ def setup_parser() -> argparse.ArgumentParser:
         default="safetensors",
         choices=[None, "ckpt", "pt", "safetensors"],
         help="format to save the model (default is .safetensors) / モデル保存時の形式（デフォルトはsafetensors）",
+    )
+    parser.add_argument(
+        "--disable_cross_attn_mask",
+        action="store_true",
+        help="Disable SDXL cross-attention masking so padded tokens participate normally / SDXLのcross-attentionマスク機能を無効化する",
     )
 
     parser.add_argument("--unet_lr", type=float, default=None, help="learning rate for U-Net / U-Netの学習率")
@@ -2320,6 +2466,91 @@ def setup_parser() -> argparse.ArgumentParser:
         "See original code at https://github.com/ostris/ai-toolkit/commit/2e7b2d9926de40a7b9119322c1d8fc085b1283e4#diff-fb148217f864741f0e90717dc8ab38dff83a42e917a20540f65afb1c3aedaa85",
     )
 
+
+    parser.add_argument(
+        "--vae_reflection_padding",
+        action="store_true",
+        help="switch VAE convolutions to reflection padding (improves border quality for some custom VAEs) / VAEの畳み込みを反射パディングに切り替える",
+    )
+    parser.add_argument(
+        "--vae_custom_scale",
+        type=float,
+        default=None,
+        help="override the latent scaling factor applied after VAE encode / VAEエンコード後のスケーリング係数を上書きする",
+    )
+    parser.add_argument(
+        "--vae_custom_shift",
+        type=float,
+        default=None,
+        help="apply a constant latent shift before scaling (e.g. Flux-style offset) / スケーリング前に潜在表現へ定数シフトを適用する",
+    )
+
+    parser.add_argument(
+        "--flow_model",
+        action="store_true",
+        help="enable Rectified Flow training objective instead of standard diffusion / 通常の拡散ではなくRectified Flowで学習する",
+    )
+    parser.add_argument(
+        "--flow_use_ot",
+        action="store_true",
+        help="pair latents and noise with cosine optimal transport when using Rectified Flow / Rectified Flow使用時にOTでlatentとノイズを対応付ける",
+    )
+    parser.add_argument(
+        "--flow_timestep_distribution",
+        type=str,
+        default="logit_normal",
+        choices=["logit_normal", "uniform"],
+        help="sampling distribution over Rectified Flow sigmas (default: logit_normal) / Rectified Flowのシグマの分布（デフォルトlogit_normal）",
+    )
+    parser.add_argument(
+        "--flow_logit_mean",
+        type=float,
+        default=0.0,
+        help="mean of the logit-normal distribution when using Rectified Flow / Rectified Flowでlogit-normal分布を用いるときの平均値",
+    )
+    parser.add_argument(
+        "--flow_logit_std",
+        type=float,
+        default=1.0,
+        help="stddev of the logit-normal distribution when using Rectified Flow / Rectified Flowでlogit-normal分布を用いるときの標準偏差",
+    )
+    parser.add_argument(
+        "--flow_uniform_shift",
+        action="store_true",
+        help="apply resolution-dependent shift to Rectified Flow timesteps (SD3-style) / Rectified Flowタイムステップに解像度依存のシフトを適用する",
+    )
+    parser.add_argument(
+        "--flow_uniform_base_pixels",
+        type=float,
+        default=1024.0 * 1024.0,
+        help="reference pixel count used for the resolution-dependent timestep shift / タイムステップシフトで使用する基準ピクセル数",
+    )
+    parser.add_argument(
+        "--flow_uniform_static_ratio",
+        type=float,
+        default=None,
+        help="use a fixed sqrt(m/n) ratio (e.g. 2.5) for Rectified Flow timestep shift; overrides resolution-based shift / 一定のsqrt(m/n)比率（例:2.5）でRectified Flowタイムステップをシフトする（解像度依存シフトを上書き）",
+    )
+    parser.add_argument(
+        "--contrastive_flow_matching",
+        action="store_true",
+        help="Enable Contrastive Flow Matching (ΔFM) objective. Works with v-parameterization or Rectified Flow.",
+    )
+    parser.add_argument(
+        "--cfm_lambda",
+        type=float,
+        default=0.05,
+        help="Lambda weight for the contrastive term in ΔFM loss (default: 0.05).",
+    )
+    parser.add_argument(
+        "--use_zero_cond_dropout",
+        type=bool,
+        default=False,
+        help="For full caption dropout, use zero conditioning instead of empty caption"
+    )
+    # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
+    # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")
+    # parser.add_argument("--loraplus_text_encoder_lr_ratio", default=None, type=float, help="LoRA+ text encoder learning rate ratio")
     return parser
 
 

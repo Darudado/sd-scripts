@@ -250,6 +250,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
+        fixed_timesteps=None,
         is_train=True,
     ):
         assert isinstance(noise_scheduler, sd3_train_utils.FlowMatchEulerDiscreteScheduler)

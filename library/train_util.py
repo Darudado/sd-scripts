@@ -14,7 +14,7 @@ import shutil
 import time
 import typing
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
-from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
 from accelerate.utils import set_seed, TorchDynamoPlugin
 import glob
 import math
@@ -710,6 +710,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.width, self.height = (None, None) if resolution is None else resolution
         self.network_multiplier = network_multiplier
         self.debug_dataset = debug_dataset
+        self.log_caption_tag_dropout = False
+        self.log_caption_dropout = False
 
         self.subsets: List[Union[DreamBoothSubset, FineTuningSubset]] = []
 
@@ -842,6 +844,8 @@ class BaseDataset(torch.utils.data.Dataset):
             caption = caption + " " + subset.caption_suffix
 
         # dropoutの決定：tag dropがこのメソッド内にあるのでここで行うのが良い
+        caption_before_dropout = caption
+
         is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
         is_drop_out = (
             is_drop_out
@@ -850,6 +854,10 @@ class BaseDataset(torch.utils.data.Dataset):
         )
 
         if is_drop_out:
+            if self.log_caption_dropout:
+                logger.info(
+                    f"Caption dropout applied. Original caption: \"{caption_before_dropout}\" -> \"\""
+                )
             caption = ""
         else:
             # process wildcards
@@ -881,6 +889,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 caption = caption.split("\n")[0]
 
             if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
+                original_caption = caption
                 fixed_tokens = []
                 flex_tokens = []
                 fixed_suffix_tokens = []
@@ -914,19 +923,46 @@ class BaseDataset(torch.utils.data.Dataset):
                     )
                     flex_tokens = flex_tokens[:tokens_len]
 
-                def dropout_tags(tokens):
+                if not hasattr(self, "_protected_tags"):
+                    self._protected_tags = set()
+                    if hasattr(self, "protected_tags_file") and self.protected_tags_file and os.path.exists(self.protected_tags_file):
+                        logger.info(f"Loading protected tags from {self.protected_tags_file}")
+                        with open(self.protected_tags_file, "r", encoding="utf-8") as f:
+                            self._protected_tags = {line.strip().lower() for line in f if line.strip()}
+                        logger.info(f"Loaded {len(self._protected_tags)} protected tags.")
+
+                log_tag_dropout = self.log_caption_tag_dropout and subset.caption_tag_dropout_rate > 0
+
+                def dropout_tags(tokens, record_details=False):
                     if subset.caption_tag_dropout_rate <= 0:
-                        return tokens
-                    l = []
+                        return tokens, [], []
+                    kept = []
+                    protected_tokens = []
+                    dropped_tokens = []
                     for token in tokens:
-                        if random.random() >= subset.caption_tag_dropout_rate:
-                            l.append(token)
-                    return l
+                        is_protected = token.lower() in self._protected_tags
+                        if is_protected or random.random() >= subset.caption_tag_dropout_rate:
+                            kept.append(token)
+                            if record_details and is_protected:
+                                protected_tokens.append(token)
+                        elif record_details:
+                            dropped_tokens.append(token)
+                    return kept, protected_tokens, dropped_tokens
 
                 if subset.shuffle_caption:
                     random.shuffle(flex_tokens)
 
-                flex_tokens = dropout_tags(flex_tokens)
+                if log_tag_dropout:
+                    before_dropout_tokens = list(flex_tokens)
+                    flex_tokens, protected_tokens, dropped_tokens = dropout_tags(flex_tokens, True)
+                    logger.info("Caption tag dropout details:")
+                    logger.info(f"  Original caption: \"{original_caption}\"")
+                    logger.info(f"  Tokens before dropout: {before_dropout_tokens}")
+                    logger.info(f"  Protected tokens kept: {protected_tokens}")
+                    logger.info(f"  Dropped tokens: {dropped_tokens}")
+                    logger.info(f"  Tokens after dropout: {flex_tokens}")
+                else:
+                    flex_tokens, _, _ = dropout_tags(flex_tokens, False)
 
                 caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
 
@@ -1471,7 +1507,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 input_ids1 = torch.stack(input_ids1, dim=0)
                 input_ids2 = torch.stack(input_ids2, dim=0)
                 cache_batch_text_encoder_outputs(
-                    infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, input_ids1, input_ids2, output_dtype
+                    infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, self.use_zero_cond_dropout, input_ids1, input_ids2, output_dtype
                 )
         else:
             for batch in tqdm(batches):
@@ -1583,6 +1619,7 @@ class BaseDataset(torch.utils.data.Dataset):
         loss_weights = []
         captions = []
         input_ids_list = []
+        attn_mask_list = []
         latents_list = []
         alpha_mask_list = []
         images = []
@@ -1734,7 +1771,6 @@ class BaseDataset(torch.utils.data.Dataset):
 
             if tokenization_required:
                 caption = self.process_caption(subset, image_info.caption)
-                input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
                 # if self.XTI_layers:
                 #     caption_layer = []
                 #     for layer in self.XTI_layers:
@@ -1760,8 +1796,13 @@ class BaseDataset(torch.utils.data.Dataset):
                 #         else:
                 #             token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
                 #         input_ids2_list.append(token_caption2)
+                input_iter, mask_iter = self.tokenize_strategy.tokenize(caption)
+
+                input_ids = [ids [0]  for ids in input_iter]
+                masks = mask_iter
 
             input_ids_list.append(input_ids)
+            attn_mask_list.append(masks)
             captions.append(caption)
 
         def none_or_stack_elements(tensors_list, converter):
@@ -1808,6 +1849,7 @@ class BaseDataset(torch.utils.data.Dataset):
         example["loss_weights"] = torch.FloatTensor(loss_weights)
         example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
+        example["attn_mask_list"] = none_or_stack_elements(attn_mask_list, lambda x: x)
 
         # if one of alpha_masks is not None, we need to replace None with ones
         none_or_not = [x is None for x in alpha_mask_list]
@@ -3212,7 +3254,7 @@ def cache_batch_latents(
 
 
 def cache_batch_text_encoder_outputs(
-    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, input_ids1, input_ids2, dtype
+    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, use_zero_cond_dropout, input_ids1, input_ids2, dtype
 ):
     input_ids1 = input_ids1.to(text_encoders[0].device)
     input_ids2 = input_ids2.to(text_encoders[1].device)
@@ -3220,6 +3262,7 @@ def cache_batch_text_encoder_outputs(
     with torch.no_grad():
         b_hidden_state1, b_hidden_state2, b_pool2 = get_hidden_states_sdxl(
             max_token_length,
+            use_zero_cond_dropout,
             input_ids1,
             input_ids2,
             tokenizers[0],
@@ -4800,6 +4843,22 @@ def add_dataset_arguments(
             default=0.0,
             help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
         )
+        parser.add_argument(
+            "--protected_tags_file",
+            type=str,
+            default=None,
+            help="File containing tags to protect from dropout, one tag per line.",
+        )
+        parser.add_argument(
+            "--log_caption_tag_dropout",
+            action="store_true",
+            help="Log detailed information about caption tag dropout, including protected and dropped tokens.",
+        )
+        parser.add_argument(
+            "--log_caption_dropout",
+            action="store_true",
+            help="Log caption-level dropout decisions and the resulting text sent to the model.",
+        )
 
     if support_dreambooth:
         # DreamBooth dataset
@@ -5914,6 +5973,7 @@ def pool_workaround(
 
 def get_hidden_states_sdxl(
     max_token_length: int,
+    use_zero_cond_dropout: bool,
     input_ids1: torch.Tensor,
     input_ids2: torch.Tensor,
     tokenizer1: CLIPTokenizer,
@@ -5928,17 +5988,73 @@ def get_hidden_states_sdxl(
     input_ids1 = input_ids1.reshape((-1, tokenizer1.model_max_length))  # batch_size*n, 77
     input_ids2 = input_ids2.reshape((-1, tokenizer2.model_max_length))  # batch_size*n, 77
 
-    # text_encoder1
-    enc_out = text_encoder1(input_ids1, output_hidden_states=True, return_dict=True)
-    hidden_states1 = enc_out["hidden_states"][11]
+    #for i, s in enumerate(tokenizer1.batch_decode(input_ids1, skip_special_tokens=True)):
+    #    print(f"[{i}]: {len(tokenizer1.tokenize(s))} -> {s}")
+    
+    # rearrange the token ids to avoid unnecessary computation when using zero cond dropout
+    if use_zero_cond_dropout:
+        b_size_flat = input_ids1.size()[0]
+        # input ids for empty strings are [1 x bos_token_id + 76 x eos_token_id]
+        non_empty_mask = input_ids1[:, 1] != tokenizer1.eos_token_id
+        not_empty = non_empty_mask.any()
+        # non_empty_indices = torch.where(non_empty_mask)[0]
+        input_ids1 = input_ids1[non_empty_mask]
+        input_ids2 = input_ids2[non_empty_mask]
 
-    # text_encoder2
-    enc_out = text_encoder2(input_ids2, output_hidden_states=True, return_dict=True)
-    hidden_states2 = enc_out["hidden_states"][-2]  # penuultimate layer
+        # allocate zeros
+        tensor_kwargs = {}
+        if weight_dtype is not None:
+            tensor_kwargs["dtype"] = weight_dtype
+        hidden_states1_zeros = torch.zeros(
+            (b_size_flat, tokenizer1.model_max_length, text_encoder1.config.hidden_size),
+            device=input_ids1.device,
+            **tensor_kwargs,
+        )
+        hidden_states2_zeros = torch.zeros(
+            (b_size_flat, tokenizer2.model_max_length, text_encoder2.config.hidden_size), 
+            device=input_ids2.device,
+            **tensor_kwargs,
+        )
+        pool2_zeros = torch.zeros(
+            (b_size_flat, text_encoder2.config.projection_dim),
+            device=input_ids2.device,
+            **tensor_kwargs,
+        )
 
-    # pool2 = enc_out["text_embeds"]
-    unwrapped_text_encoder2 = text_encoder2 if accelerator is None else accelerator.unwrap_model(text_encoder2)
-    pool2 = pool_workaround(unwrapped_text_encoder2, enc_out["last_hidden_state"], input_ids2, tokenizer2.eos_token_id)
+    # handle the case when we have an empty batch due to rearranging
+    if use_zero_cond_dropout and (not not_empty):
+        #print("got the entire batch of empty conditionings!")
+        hidden_states1 = hidden_states1_zeros
+        hidden_states2 = hidden_states2_zeros
+        pool2 = pool2_zeros
+    else:
+        # text_encoder1
+        enc_out = text_encoder1(input_ids1, output_hidden_states=True, return_dict=True)
+        hidden_states1 = enc_out["hidden_states"][11]
+
+        # text_encoder2
+        enc_out = text_encoder2(input_ids2, output_hidden_states=True, return_dict=True)
+        hidden_states2 = enc_out["hidden_states"][-2]  # penuultimate layer
+
+        # pool2 = enc_out["text_embeds"]
+        unwrapped_text_encoder2 = text_encoder2 if accelerator is None else accelerator.unwrap_model(text_encoder2)
+        pool2 = pool_workaround(unwrapped_text_encoder2, enc_out["last_hidden_state"], input_ids2, tokenizer2.eos_token_id)
+
+        # reassemble the outputs by copying the computed embeddings into placeholders
+        if use_zero_cond_dropout: 
+            if hidden_states1_zeros.dtype != hidden_states1.dtype:
+                hidden_states1_zeros = hidden_states1_zeros.to(hidden_states1.dtype)
+            if hidden_states2_zeros.dtype != hidden_states2.dtype:
+                hidden_states2_zeros = hidden_states2_zeros.to(hidden_states2.dtype)
+            if pool2_zeros.dtype != pool2.dtype:
+                pool2_zeros = pool2_zeros.to(pool2.dtype)
+            hidden_states1_zeros[non_empty_mask] = hidden_states1
+            hidden_states2_zeros[non_empty_mask] = hidden_states2
+            pool2_zeros[non_empty_mask] = pool2
+
+            hidden_states1 = hidden_states1_zeros
+            hidden_states2 = hidden_states2_zeros
+            pool2 = pool2_zeros
 
     # b*n, 77, 768 or 1280 -> b, n*77, 768 or 1280
     n_size = 1 if max_token_length is None else max_token_length // 75
@@ -6283,8 +6399,47 @@ def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: tor
     return timesteps
 
 
+def cosine_optimal_transport(X: torch.Tensor, Y: torch.Tensor, backend: str = "auto"):
+    """Compute an optimal assignment under cosine distance."""
+
+    X_norm = X / torch.norm(X, dim=1, keepdim=True)
+    Y_norm = Y / torch.norm(Y, dim=1, keepdim=True)
+    cost = -torch.mm(X_norm, Y_norm.t())
+
+    if backend == "cuda":
+        return _cuda_assignment(cost)
+    if backend == "scipy":
+        return _scipy_assignment(cost)
+
+    try:
+        return _cuda_assignment(cost)
+    except (ImportError, RuntimeError) as exc:
+        #logger.warning(
+         #   "CUDA linear assignment not available, falling back to SciPy for optimal transport. "
+          #  f"Reason: {exc}"
+        #)
+        return _scipy_assignment(cost)
+
+
+def _cuda_assignment(cost: torch.Tensor):
+    from torch_linear_assignment import assignment_to_indices, batch_linear_assignment  # type: ignore
+
+    assignment = batch_linear_assignment(cost.unsqueeze(0))
+    row_idx, col_idx = assignment_to_indices(assignment)
+    return cost, (row_idx, col_idx)
+
+
+def _scipy_assignment(cost: torch.Tensor):
+    from scipy.optimize import linear_sum_assignment  # type: ignore
+
+    cost_np = cost.to(torch.float32).detach().cpu().numpy()
+    row_ind, col_ind = linear_sum_assignment(cost_np)
+    row = torch.from_numpy(row_ind).to(cost.device, torch.long)
+    col = torch.from_numpy(col_ind).to(cost.device, torch.long)
+    return cost, (row, col)
+
 def get_noise_noisy_latents_and_timesteps(
-    args, noise_scheduler, latents: torch.FloatTensor, fixed_timesteps=None, is_train=True
+    args, noise_scheduler, latents: torch.FloatTensor, fixed_timesteps=None, is_train=True, pixel_counts=None,
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.IntTensor]:
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
@@ -6299,13 +6454,58 @@ def get_noise_noisy_latents_and_timesteps(
             noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount
         )
 
-    # Sample a random timestep for each image
     b_size = latents.shape[0]
+    flow_model_enabled = getattr(args, "flow_model", False)
+
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
     if fixed_timesteps is not None:
         timesteps = fixed_timesteps
+        if flow_model_enabled:
+            # We need to recover sigmas (float 0.0 to 1.0) from the discrete timesteps
+            timestep_max = noise_scheduler.config.num_train_timesteps - 1
+            sigmas = timesteps.float() / timestep_max
+    elif flow_model_enabled:
+        timestep_max = noise_scheduler.config.num_train_timesteps - 1
+        distribution = getattr(args, "flow_timestep_distribution", "logit_normal")
+        if distribution == "logit_normal":
+            logits = torch.normal(
+                mean=float(getattr(args, "flow_logit_mean", 0.0)),
+                std=float(getattr(args, "flow_logit_std", 1.0)),
+                size=(b_size,),
+                device=latents.device,
+            )
+            sigmas = torch.sigmoid(logits)
+        elif distribution == "uniform":
+            sigmas = torch.rand((b_size,), device=latents.device)
+        else:
+            raise ValueError(f"Unknown flow_timestep_distribution: {distribution}")
+
+        shift_requested = (
+            getattr(args, "flow_uniform_shift", False) or getattr(args, "flow_uniform_static_ratio", None) is not None
+        )
+        if sigmas is not None and shift_requested:
+            static_ratio = getattr(args, "flow_uniform_static_ratio", None)
+            if static_ratio is not None:
+                static_ratio = float(static_ratio)
+                if static_ratio <= 0:
+                    raise ValueError("`flow_uniform_static_ratio` must be positive when used.")
+                ratios = torch.full((b_size,), static_ratio, device=latents.device, dtype=torch.float32)
+            else:
+                if pixel_counts is None:
+                    raise ValueError("Resolution-dependent Rectified Flow shift requires pixel_counts.")
+                base_pixels = getattr(args, "flow_uniform_base_pixels", None)
+                if base_pixels is None or base_pixels <= 0:
+                    raise ValueError("`flow_uniform_base_pixels` must be positive when using flow_uniform_shift.")
+                ratios = torch.sqrt(
+                    torch.as_tensor(pixel_counts, device=latents.device, dtype=torch.float32) / float(base_pixels)
+                )
+
+            t_ref = sigmas
+            sigmas = ratios * t_ref / (1 + (ratios - 1) * t_ref)
+
+        timesteps = torch.clamp((sigmas * timestep_max).long(), 0, timestep_max)
     elif args.timestep_distribution == "logit_normal":
         logits = torch.normal(
             mean=float(args.logit_normal_mean),
@@ -6320,16 +6520,25 @@ def get_noise_noisy_latents_and_timesteps(
     else:
         timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
 
-    # Add noise to the latents according to the noise magnitude at each timestep
-    # (this is the forward diffusion process)
-    if args.ip_noise_gamma and is_train:
-        if args.ip_noise_gamma_random_strength:
-            strength = torch.rand(1, device=latents.device) * args.ip_noise_gamma
-        else:
-            strength = args.ip_noise_gamma
-        noisy_latents = noise_scheduler.add_noise(latents, noise + strength * torch.randn_like(latents), timesteps)
+    if flow_model_enabled:
+        if getattr(args, "flow_use_ot", False) and b_size > 1:
+            with torch.no_grad():
+                lat_flat = latents.view(b_size, -1)
+                noise_flat = noise.view(b_size, -1)
+                _, (_, col_indices) = cosine_optimal_transport(lat_flat, noise_flat)
+                noise = noise[col_indices.squeeze(0)]
+
+        sigmas_view = sigmas.view(-1, 1, 1, 1)
+        noisy_latents = sigmas_view * noise + (1.0 - sigmas_view) * latents
     else:
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        if args.ip_noise_gamma:
+            if args.ip_noise_gamma_random_strength:
+                strength = torch.rand(1, device=latents.device) * args.ip_noise_gamma
+            else:
+                strength = args.ip_noise_gamma
+            noisy_latents = noise_scheduler.add_noise(latents, noise + strength * torch.randn_like(latents), timesteps)
+        else:
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
     # This moves the alphas_cumprod back to the CPU after it is moved in noise_scheduler.add_noise
     noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.cpu()
@@ -7003,6 +7212,11 @@ def sample_images_common(
         requires_safety_checker=False,
         clip_skip=args.clip_skip,
     )
+    if hasattr(pipeline, "latent_scale_factor"):
+        pipeline.latent_scale_factor = getattr(args, "vae_scale_factor", pipeline.latent_scale_factor)
+    if hasattr(pipeline, "latent_shift"):
+        pipeline.latent_shift = getattr(args, "vae_shift_factor", getattr(pipeline, "latent_shift", 0.0))
+
     pipeline.to(distributed_state.device)
     save_dir = args.output_dir + "/sample"
     os.makedirs(save_dir, exist_ok=True)

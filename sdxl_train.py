@@ -17,7 +17,7 @@ init_ipex()
 
 
 from diffusers import DDPMScheduler
-from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec
+from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec, model_util
 
 import library.train_util as train_util
 
@@ -49,22 +49,42 @@ from library.sdxl_original_unet import SdxlUNet2DConditionModel
 UNET_NUM_BLOCKS_FOR_BLOCK_LR = 23
 
 
-def get_block_params_to_optimize(unet: SdxlUNet2DConditionModel, block_lrs: List[float]) -> List[dict]:
+def _unet_block_index_from_name(name: str) -> int:
+    if name.startswith("time_embed.") or name.startswith("label_emb."):
+        return 0  # 0
+    if name.startswith("input_blocks."):  # 1-9
+        return 1 + int(name.split(".")[1])
+    if name.startswith("middle_block."):  # 10-12
+        return 10 + int(name.split(".")[1])
+    if name.startswith("output_blocks."):  # 13-21
+        return 13 + int(name.split(".")[1])
+    if name.startswith("out."):  # 22
+        return 22
+    raise ValueError(f"unexpected parameter name: {name}")
+
+
+def _unet_block_prefix_from_name(name: str) -> str:
+    if name.startswith("time_embed.") or name.startswith("label_emb."):
+        return name.split(".")[0]
+    if name.startswith("input_blocks.") or name.startswith("output_blocks.") or name.startswith("middle_block."):
+        parts = name.split(".")
+        if len(parts) < 2:
+            raise ValueError(f"unexpected block format: {name}")
+        return ".".join(parts[:2])
+    if name.startswith("out."):
+        return name.split(".")[0]
+    raise ValueError(f"unexpected parameter name: {name}")
+
+
+def get_block_params_to_optimize(
+    unet: SdxlUNet2DConditionModel, block_lrs: List[float], frozen_blocks: set[int] | None = None
+) -> List[dict]:
     block_params = [[] for _ in range(len(block_lrs))]
 
     for i, (name, param) in enumerate(unet.named_parameters()):
-        if name.startswith("time_embed.") or name.startswith("label_emb."):
-            block_index = 0  # 0
-        elif name.startswith("input_blocks."):  # 1-9
-            block_index = 1 + int(name.split(".")[1])
-        elif name.startswith("middle_block."):  # 10-12
-            block_index = 10 + int(name.split(".")[1])
-        elif name.startswith("output_blocks."):  # 13-21
-            block_index = 13 + int(name.split(".")[1])
-        elif name.startswith("out."):  # 22
-            block_index = 22
-        else:
-            raise ValueError(f"unexpected parameter name: {name}")
+        block_index = _unet_block_index_from_name(name)
+        if frozen_blocks and block_index in frozen_blocks:
+            continue
 
         block_params[block_index].append(param)
 
@@ -75,6 +95,52 @@ def get_block_params_to_optimize(unet: SdxlUNet2DConditionModel, block_lrs: List
         params_to_optimize.append({"params": params, "lr": block_lrs[i]})
 
     return params_to_optimize
+
+
+def freeze_unet_blocks(unet: SdxlUNet2DConditionModel, frozen_blocks: set[int]) -> None:
+    """Mark selected U-Net blocks as frozen (no gradients)."""
+
+    if not frozen_blocks:
+        return
+
+    for name, param in unet.named_parameters():
+        block_index = _unet_block_index_from_name(name)
+        if block_index in frozen_blocks:
+            param.requires_grad_(False)
+
+
+def describe_unet_blocks(unet: SdxlUNet2DConditionModel):
+    """Collect a short description of each U-Net block index."""
+
+    info = {}
+    for name, param in unet.named_parameters():
+        block_index = _unet_block_index_from_name(name)
+        block_prefix = _unet_block_prefix_from_name(name)
+        block_entry = info.setdefault(block_index, {"example": name, "params": 0, "layers": set()})
+        block_entry["params"] += param.numel()
+
+        layer_path = name.rsplit(".", 1)[0]  # strip parameter name
+        suffix = ""
+        if layer_path == block_prefix:
+            suffix = ""
+        elif layer_path.startswith(f"{block_prefix}."):
+            suffix = layer_path[len(block_prefix) + 1 :]
+        else:
+            suffix = layer_path
+
+        if suffix:
+            tokens = [token for token in suffix.split(".") if token]
+            while tokens and tokens[0].isdigit():
+                tokens.pop(0)
+            layer_name = ".".join(tokens) if tokens else block_prefix
+        else:
+            layer_name = block_prefix
+
+        block_entry["layers"].add(layer_name)
+
+    for entry in info.values():
+        entry["layers"] = sorted(entry["layers"])
+    return info
 
 
 def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
@@ -118,6 +184,79 @@ def train(args):
         ), f"block_lr must have {UNET_NUM_BLOCKS_FOR_BLOCK_LR} values / block_lrは{UNET_NUM_BLOCKS_FOR_BLOCK_LR}個の値を指定してください"
     else:
         block_lrs = None
+
+    frozen_unet_blocks = set()
+    if args.freeze_unet_blocks:
+        for token in args.freeze_unet_blocks.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                idx = int(token)
+            except ValueError as exc:
+                raise ValueError(f"Invalid U-Net block index '{token}' in --freeze_unet_blocks") from exc
+            if idx < 0 or idx >= UNET_NUM_BLOCKS_FOR_BLOCK_LR:
+                raise ValueError(f"--freeze_unet_blocks indices must be in [0, {UNET_NUM_BLOCKS_FOR_BLOCK_LR - 1}]")
+            frozen_unet_blocks.add(idx)
+
+    vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
+    vae_shift_factor = 0.0
+    if args.vae_custom_scale is not None:
+        vae_scale_factor = float(args.vae_custom_scale)
+        logger.info(f"Using custom VAE scale factor: {vae_scale_factor}")
+    if args.vae_custom_shift is not None:
+        vae_shift_factor = float(args.vae_custom_shift)
+        logger.info(f"Using custom VAE shift factor: {vae_shift_factor}")
+    args.vae_scale_factor = vae_scale_factor
+    args.vae_shift_factor = vae_shift_factor
+
+    if args.flow_model:
+        logger.info("Using Rectified Flow training objective.")
+        if args.v_parameterization:
+            raise ValueError("`--flow_model` is incompatible with `--v_parameterization`; Rectified Flow already predicts velocity.")
+        if args.min_snr_gamma:
+            logger.warning("`--min_snr_gamma` is ignored when Rectified Flow is enabled.")
+            args.min_snr_gamma = None
+        if args.debiased_estimation_loss:
+            logger.warning("`--debiased_estimation_loss` is ignored when Rectified Flow is enabled.")
+            args.debiased_estimation_loss = False
+        if args.scale_v_pred_loss_like_noise_pred:
+            logger.warning("`--scale_v_pred_loss_like_noise_pred` is ignored when Rectified Flow is enabled.")
+            args.scale_v_pred_loss_like_noise_pred = False
+        if args.v_pred_like_loss:
+            logger.warning("`--v_pred_like_loss` is ignored when Rectified Flow is enabled.")
+            args.v_pred_like_loss = None
+        if args.flow_use_ot:
+            logger.info("Using cosine optimal transport pairing for Rectified Flow batches.")
+        shift_enabled = args.flow_uniform_shift or args.flow_uniform_static_ratio is not None
+        if args.flow_timestep_distribution == "logit_normal":
+            flow_logit_std = float(getattr(args, "flow_logit_std", 1.0))
+            flow_logit_mean = float(getattr(args, "flow_logit_mean", 0.0))
+            if flow_logit_std <= 0:
+                raise ValueError("`--flow_logit_std` must be positive.")
+            logger.info(
+                "Rectified Flow timesteps sampled from logit-normal distribution with "
+                f"mean={flow_logit_mean}, std={flow_logit_std}."
+            )
+        elif args.flow_timestep_distribution == "uniform":
+            logger.info("Rectified Flow timesteps sampled uniformly in [0, 1].")
+        else:
+            raise ValueError(f"Unknown Rectified Flow timestep distribution: {args.flow_timestep_distribution}")
+        if shift_enabled:
+            if args.flow_uniform_static_ratio is not None:
+                flow_uniform_static_ratio = float(getattr(args, "flow_uniform_static_ratio", 0.0))
+                if flow_uniform_static_ratio <= 0:
+                    raise ValueError("`--flow_uniform_static_ratio` must be positive.")
+                logger.info(
+                    f"Applying Rectified Flow timestep shift with static ratio={flow_uniform_static_ratio}."
+                )
+            else:
+                logger.info(
+                    f"Applying resolution-dependent Rectified Flow timestep shift with base pixels={args.flow_uniform_base_pixels}."
+                )
+
+    if args.contrastive_flow_matching and not (args.v_parameterization or args.flow_model):
+        raise ValueError("`--contrastive_flow_matching` requires either v-parameterization or Rectified Flow.")
 
     cache_latents = args.cache_latents
     use_dreambooth_method = args.in_json is None
@@ -181,6 +320,19 @@ def train(args):
         train_dataset_group = train_util.load_arbitrary_dataset(args)
         val_dataset_group = None
 
+    if args.protected_tags_file:
+        logger.info("Injecting protected_tags_file into datasets...")
+        for ds in train_dataset_group.datasets:
+            ds.protected_tags_file = args.protected_tags_file
+    if args.log_caption_tag_dropout:
+        logger.info("Enabling caption tag dropout logging for datasets...")
+        for ds in train_dataset_group.datasets:
+            ds.log_caption_tag_dropout = True
+    if args.log_caption_dropout:
+        logger.info("Enabling caption dropout logging for datasets...")
+        for ds in train_dataset_group.datasets:
+            ds.log_caption_dropout = True
+
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
     ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -225,10 +377,22 @@ def train(args):
         logit_scale,
         ckpt_info,
     ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype)
+    if args.vae_reflection_padding:
+        vae = model_util.use_reflection_padding(vae)
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
     if args.use_ramtorch_vae:
         vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, vae_dtype)
+        
+    if args.list_unet_blocks:
+        block_info = describe_unet_blocks(unet)
+        accelerator.print("SDXL U-Net block mapping (index -> example parameter) with param counts and layers:")
+        for idx in sorted(block_info.keys()):
+            info = block_info[idx]
+            layers = ", ".join(info.get("layers", [])) or "-"
+            accelerator.print(f"{idx:02d}: {info['example']} (params: {info['params']:,})")
+            accelerator.print(f"    layers: {layers}")
+        return
 
     # verify load/save model formats
     if load_stable_diffusion_format:
@@ -342,6 +506,9 @@ def train(args):
         vae.to(accelerator.device, dtype=vae_dtype)
 
     unet.requires_grad_(train_unet)
+    if train_unet and frozen_unet_blocks:
+        accelerator.print(f"Freezing U-Net blocks: {sorted(frozen_unet_blocks)}")
+        freeze_unet_blocks(unet, frozen_unet_blocks)
     if not train_unet:
         unet.to(accelerator.device, dtype=weight_dtype)  # because of unet is not prepared
 
@@ -350,9 +517,10 @@ def train(args):
     if train_unet:
         training_models.append(unet)
         if block_lrs is None:
-            params_to_optimize.append({"params": list(unet.parameters()), "lr": args.learning_rate})
+            trainable_params = [p for p in unet.parameters() if p.requires_grad]
+            params_to_optimize.append({"params": trainable_params, "lr": args.learning_rate})
         else:
-            params_to_optimize.extend(get_block_params_to_optimize(unet, block_lrs))
+            params_to_optimize.extend(get_block_params_to_optimize(unet, block_lrs, frozen_unet_blocks))
 
     if train_text_encoder1:
         training_models.append(text_encoder1)
@@ -653,12 +821,21 @@ def train(args):
                         if torch.any(torch.isnan(latents)):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
-                latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
+                if args.vae_shift_factor != 0.0:
+                    latents = latents - args.vae_shift_factor
+                latents = latents * args.vae_scale_factor
 
                 text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
                 if text_encoder_outputs_list is not None:
                     # Text Encoder outputs are cached
-                    encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoder_outputs_list
+                    if len(text_encoder_outputs_list) == 5:
+                        encoder_hidden_states1, encoder_hidden_states2, pool2, mask1, mask2 = text_encoder_outputs_list
+                        mask1 = mask1.to(accelerator.device, dtype=weight_dtype)
+                        mask2 = mask2.to(accelerator.device, dtype=weight_dtype)
+                    else:
+                        encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoder_outputs_list
+                        mask1 = None
+                        mask2 = None
                     encoder_hidden_states1 = encoder_hidden_states1.to(accelerator.device, dtype=weight_dtype)
                     encoder_hidden_states2 = encoder_hidden_states2.to(accelerator.device, dtype=weight_dtype)
                     pool2 = pool2.to(accelerator.device, dtype=weight_dtype)
@@ -679,7 +856,7 @@ def train(args):
                         else:
                             input_ids1 = input_ids1.to(accelerator.device)
                             input_ids2 = input_ids2.to(accelerator.device)
-                            encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
+                            encoder_hidden_states1, encoder_hidden_states2, pool2, mask1, mask2 = text_encoding_strategy.encode_tokens(
                                 tokenize_strategy,
                                 [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
                                 [input_ids1, input_ids2],
@@ -699,18 +876,31 @@ def train(args):
                 vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
                 text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
+                needs_dynamic_shift = (
+                    args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None
+                )
+                if needs_dynamic_shift:
+                    if target_size is None:
+                        raise ValueError(
+                            "Resolution-dependent Rectified Flow shift requires target size information in the batch."
+                        )
+                    pixel_counts = (target_size[:, 0] * target_size[:, 1]).to(latents.device, torch.float32)
+                else:
+                    pixel_counts = None
+
                 # Sample noise, sample a random timestep for each image, and add noise to the latents,
                 # with noise offset and/or multires noise if specified
-                noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
+                noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, pixel_counts=pixel_counts)
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 
                 # Predict the noise residual
                 with accelerator.autocast():
-                    noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
+                    noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding, mask1)
 
-                if args.v_parameterization:
-                    # v-parameterization training
+                if args.flow_model:
+                    target = noise - latents
+                elif args.v_parameterization:
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     target = noise
@@ -725,6 +915,18 @@ def train(args):
                 ):
                     # do not mean over batch dimension for snr weight or scale v-pred loss
                     loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, scale=float(args.loss_scale))
+                    if args.contrastive_flow_matching and latents.size(0) > 1:
+                        negative_latents = latents.roll(1, 0)
+                        negative_noise = noise.roll(1, 0)
+                        with torch.no_grad():
+                            if args.flow_model:
+                                target_negative = negative_noise - negative_latents
+                            else:
+                                target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
+                        loss_contrastive = torch.nn.functional.mse_loss(
+                            noise_pred.float(), target_negative.float(), reduction="none"
+                        )
+                        loss = loss - args.cfm_lambda * loss_contrastive
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
                     loss = loss.mean([1, 2, 3])
@@ -738,9 +940,25 @@ def train(args):
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
 
-                    loss = loss.mean()  # mean over batch dimension
+                    loss = loss.mean()
                 else:
-                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "mean", huber_c, scale=float(args.loss_scale))
+                    per_pixel_loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "mean", huber_c, scale=float(args.loss_scale))
+                    if args.contrastive_flow_matching and latents.size(0) > 1:
+                        negative_latents = latents.roll(1, 0)
+                        negative_noise = noise.roll(1, 0)
+                        with torch.no_grad():
+                            if args.flow_model:
+                                target_negative = negative_noise - negative_latents
+                            else:
+                                target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
+                        loss_contrastive = torch.nn.functional.mse_loss(
+                            noise_pred.float(), target_negative.float(), reduction="none"
+                        )
+                        per_pixel_loss = per_pixel_loss - args.cfm_lambda * loss_contrastive
+                    loss = per_pixel_loss.mean()
+
+                if loss.ndim != 0:
+                    loss = loss.mean()
 
                 accelerator.backward(loss)
 
@@ -932,11 +1150,44 @@ def setup_parser() -> argparse.ArgumentParser:
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
     )
     parser.add_argument(
+        "--vae_reflection_padding",
+        action="store_true",
+        help="switch VAE convolutions to reflection padding (improves border quality for some custom VAEs) / VAEの畳み込みを反射パディングに切り替える",
+    )
+    parser.add_argument(
+        "--vae_custom_scale",
+        type=float,
+        default=None,
+        help="override the latent scaling factor applied after VAE encode (default matches SDXL) / VAEエンコード後のスケーリング係数を上書きする",
+    )
+    parser.add_argument(
+        "--vae_custom_shift",
+        type=float,
+        default=None,
+        help="apply a constant latent shift before scaling (e.g. Flux-style offset) / スケーリング前に潜在表現へ定数シフトを適用する",
+    )
+    parser.add_argument(
+        "--disable_cross_attn_mask",
+        action="store_true",
+        help="disable SDXL cross-attention masking so padded tokens are treated as normal tokens / SDXLのcross-attentionマスク処理を無効化する",
+    )
+    parser.add_argument(
         "--block_lr",
         type=str,
         default=None,
         help=f"learning rates for each block of U-Net, comma-separated, {UNET_NUM_BLOCKS_FOR_BLOCK_LR} values / "
         + f"U-Netの各ブロックの学習率、カンマ区切り、{UNET_NUM_BLOCKS_FOR_BLOCK_LR}個の値",
+    )
+    parser.add_argument(
+        "--list_unet_blocks",
+        action="store_true",
+        help="print SDXL U-Net block indices with example parameter names, then exit / U-Netブロックの番号とサンプルのパラメータ名を表示して終了",
+    )
+    parser.add_argument(
+        "--freeze_unet_blocks",
+        type=str,
+        default=None,
+        help="comma-separated block indices to freeze in the U-Net (0=time/label embed, 1-9=input, 10-12=middle, 13-21=output, 22=out conv) / U-Net内で学習しないブロック番号を指定（カンマ区切り）",
     )
     parser.add_argument(
         "--fused_optimizer_groups",
@@ -955,6 +1206,69 @@ def setup_parser() -> argparse.ArgumentParser:
         "--use_ramtorch_vae",
         action="store_true",
         help="Use RamTorch to reduce GPU memory usage by keeping linear weights in system RAM for VAE.",
+    )
+    parser.add_argument(
+        "--flow_model",
+        action="store_true",
+        help="enable Rectified Flow training objective instead of standard diffusion / 通常の拡散ではなくRectified Flowで学習する",
+    )
+    parser.add_argument(
+        "--flow_use_ot",
+        action="store_true",
+        help="pair latents and noise with cosine optimal transport when using Rectified Flow / Rectified Flow使用時にOTでlatentとノイズを対応付ける",
+    )
+    parser.add_argument(
+        "--flow_timestep_distribution",
+        type=str,
+        default="logit_normal",
+        choices=["logit_normal", "uniform"],
+        help="sampling distribution over Rectified Flow sigmas (default: logit_normal) / Rectified Flowのシグマの分布（デフォルトlogit_normal）",
+    )
+    parser.add_argument(
+        "--flow_logit_mean",
+        type=float,
+        default=0.0,
+        help="mean of the logit-normal distribution when using Rectified Flow / Rectified Flowでlogit-normal分布を用いるときの平均値",
+    )
+    parser.add_argument(
+        "--flow_logit_std",
+        type=float,
+        default=1.0,
+        help="stddev of the logit-normal distribution when using Rectified Flow / Rectified Flowでlogit-normal分布を用いるときの標準偏差",
+    )
+    parser.add_argument(
+        "--flow_uniform_shift",
+        action="store_true",
+        help="apply resolution-dependent shift to Rectified Flow timesteps (SD3-style) / Rectified Flowタイムステップに解像度依存のシフトを適用する",
+    )
+    parser.add_argument(
+        "--flow_uniform_base_pixels",
+        type=float,
+        default=1024.0 * 1024.0,
+        help="reference pixel count used for the resolution-dependent timestep shift / タイムステップシフトで使用する基準ピクセル数",
+    )
+    parser.add_argument(
+        "--flow_uniform_static_ratio",
+        type=float,
+        default=None,
+        help="use a fixed sqrt(m/n) ratio (e.g. 2.5) for Rectified Flow timestep shift; overrides resolution-based shift / 一定のsqrt(m/n)比率（例:2.5）でRectified Flowタイムステップをシフトする（解像度依存シフトを上書き）",
+    )
+    parser.add_argument(
+        "--contrastive_flow_matching",
+        action="store_true",
+        help="Enable Contrastive Flow Matching (ΔFM) objective. Works with v-parameterization or Rectified Flow.",
+    )
+    parser.add_argument(
+        "--cfm_lambda",
+        type=float,
+        default=0.05,
+        help="Lambda weight for the contrastive term in ΔFM loss (default: 0.05).",
+    )
+    parser.add_argument(
+        "--use_zero_cond_dropout",
+        type=bool,
+        default=False,
+        help="For full caption dropout, use zero conditioning instead of empty caption"
     )
     return parser
 

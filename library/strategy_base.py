@@ -218,6 +218,100 @@ class TokenizeStrategy:
         )
         return torch.tensor(tokens).unsqueeze(0), torch.tensor(weights).unsqueeze(0)
 
+    def _tokenize_tags(self, tokenizer, text_prompts: list, num_chunks: int = 3) -> tuple[
+        torch.Tensor, torch.Tensor]:
+        """
+        Advanced tokenizer with granular padding masks, specifically designed to output
+        the shapes required by Kohya's sd-scripts data loading pipeline.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - final_input_ids: Shape [B * N, S] for direct use with the encoder.
+                - final_cross_attention_mask: Shape [B, N, S] for later reshaping for the U-Net.
+        """
+        B = len(text_prompts)
+
+        text_input = tokenizer(
+            text=text_prompts,
+            padding="max_length",
+            max_length=77 * num_chunks,
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        device = text_input['input_ids'].device
+        bos_token_id = 49406
+        eos_token_id = 49407
+        comma_token_ids = torch.tensor([267, 2361], device=device)
+
+        token_chunks = torch.zeros(B, num_chunks, 77, dtype=torch.long, device=device)
+        token_cross_attention_mask = torch.zeros(B, num_chunks, 77, dtype=torch.bool, device=device)
+
+        # --- Create the SAFE unconditional chunk and masks once to reuse ---
+        uncond_chunk = torch.full((77,), eos_token_id, dtype=torch.long, device=device)
+        uncond_chunk[0] = bos_token_id
+        ones_mask_chunk = torch.ones(77, dtype=torch.bool, device=device)  # A mask of all True
+
+        for j in range(B):
+            prompt_tokens: torch.Tensor = text_input['input_ids'][j]
+            start_index = 0
+            is_comma = (prompt_tokens[:, None] == comma_token_ids).any(dim=1)
+            comma_indices = torch.where(is_comma)[0]
+
+            # --- Handle Caption Dropout ---
+            is_dropout = prompt_tokens[1] == eos_token_id
+            if is_dropout:
+                # The first chunk is the "meaningful" unconditional concept.
+                # It gets the standard empty prompt tokens and a MASK OF ALL ONES.
+                token_chunks[j, 0] = uncond_chunk
+                token_cross_attention_mask[j, 0] = ones_mask_chunk
+
+                # Subsequent chunks are ignored padding.
+                # They get the same tokens, but their mask remains all zeros.
+                for i in range(1, num_chunks):
+                    token_chunks[j, i] = uncond_chunk
+
+                # Skip the rest of the loop for this prompt.
+                continue
+            # --- End of Dropout Logic ---
+
+            for i in range(num_chunks):
+                valid_comma_indices = comma_indices[comma_indices < start_index + 75]
+                if len(valid_comma_indices) == 0:
+                    eos_indices = torch.where(prompt_tokens == eos_token_id)[0]
+                    split_point = eos_indices[0] if len(eos_indices) > 0 else (start_index + 75)
+                else:
+                    split_point = valid_comma_indices[-1]
+
+                # If a split results in an empty chunk, it's an ignored padding chunk.
+                if split_point <= start_index:
+                    token_chunks[j, i] = uncond_chunk
+                    continue  # Mask remains all zeros
+
+                chunk = prompt_tokens[start_index + 1: split_point + 1]
+                if len(chunk) == 1 and chunk[0] in comma_token_ids:
+                    token_chunks[j, i] = uncond_chunk
+                    continue  # Mask remains all zeros
+
+                bos_tensor = torch.tensor([bos_token_id], device=device)
+                chunk_with_bos = torch.cat([bos_tensor, chunk])
+
+                padded_chunk = torch.full((77,), eos_token_id, dtype=torch.long, device=device)
+                actual_len = min(len(chunk_with_bos), 77)
+                padded_chunk[:actual_len] = chunk_with_bos[:actual_len]
+
+                mask_chunk = torch.zeros(77, dtype=torch.bool, device=device)
+                mask_chunk[:actual_len] = True
+
+                token_chunks[j, i] = padded_chunk
+                token_cross_attention_mask[j, i] = mask_chunk
+                start_index = split_point
+
+        final_input_ids = token_chunks.view(B * num_chunks, 77)
+        final_cross_attention_mask = token_cross_attention_mask
+
+        return final_input_ids, final_cross_attention_mask
+
     def _get_input_ids(
         self, tokenizer: CLIPTokenizer, text: str, max_length: Optional[int] = None, weighted: bool = False
     ) -> torch.Tensor:
@@ -298,8 +392,12 @@ class TextEncodingStrategy:
         return cls._strategy
 
     def encode_tokens(
-        self, tokenize_strategy: TokenizeStrategy, models: List[Any], tokens: List[torch.Tensor]
-    ) -> List[torch.Tensor]:
+        self,
+        tokenize_strategy: TokenizeStrategy,
+        models: List[Any],
+        tokens: list[torch.Tensor],
+        attn_masks: Optional[list[Optional[torch.Tensor]]] = None,
+    ) -> tuple[List[torch.Tensor], List[Optional[torch.Tensor]]]:
         """
         Encode tokens into embeddings and outputs.
         :param tokens: list of token tensors for each TextModel

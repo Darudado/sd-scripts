@@ -331,6 +331,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
+        fixed_timesteps=None,
         is_train=True,
     ):
         # Sample noise that we'll add to the latents
