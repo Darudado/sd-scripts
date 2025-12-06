@@ -926,7 +926,7 @@ def train(args):
                         loss_contrastive = torch.nn.functional.mse_loss(
                             noise_pred.float(), target_negative.float(), reduction="none"
                         )
-                        loss = loss - args.cfm_lambda * loss_contrastive
+                        loss = loss - float(args.cfm_lambda) * loss_contrastive
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
                     loss = loss.mean([1, 2, 3])
@@ -954,7 +954,7 @@ def train(args):
                         loss_contrastive = torch.nn.functional.mse_loss(
                             noise_pred.float(), target_negative.float(), reduction="none"
                         )
-                        per_pixel_loss = per_pixel_loss - args.cfm_lambda * loss_contrastive
+                        per_pixel_loss = per_pixel_loss - float(args.cfm_lambda) * loss_contrastive
                     loss = per_pixel_loss.mean()
 
                 if loss.ndim != 0:
