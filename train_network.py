@@ -971,7 +971,7 @@ class NetworkTrainer:
             #move all network weights to cpu first as base device
             network = network.to("cpu")
             logger.info("Applying RamTorch to network/lora.")
-            network = apply_ramtorch_to_module(network, "network/lora", accelerator.device, weight_dtype)
+            network = apply_ramtorch_to_module(network, "network/lora", accelerator.device)
 
         if args.gradient_checkpointing:
             if args.cpu_offload_checkpointing:
