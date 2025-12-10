@@ -816,8 +816,8 @@ class NetworkTrainer:
             if distribution == "logit_normal":
                 flow_logit_std = float(getattr(args, "flow_logit_std", 1.0))
                 flow_logit_mean = float(getattr(args, "flow_logit_mean", 0.0))
-                if flow_logit_std <= 0:
-                    raise ValueError("`--flow_logit_std` must be positive.")
+                if flow_logit_std == 0:
+                    raise ValueError("`--flow_logit_std` must be non-zero.")
                 logger.info(
                     "Rectified Flow timesteps sampled from logit-normal distribution with "
                     f"mean={flow_logit_mean}, std={flow_logit_std}."
