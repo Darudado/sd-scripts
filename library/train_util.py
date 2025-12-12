@@ -2120,9 +2120,11 @@ class DreamBoothDataset(BaseDataset):
                     # Otherwise the img_paths remain as original img_paths and no split
                     # required for training images dataset of regularization images
                 else:
-                    img_paths, sizes = split_train_val(
-                        img_paths, sizes, self.is_training_dataset, self.validation_split, self.validation_seed
-                    )
+                    if self.is_training_dataset is False and not subset.is_val:
+                        img_paths, sizes = split_train_val(
+                            img_paths, sizes, self.is_training_dataset, self.validation_split, self.validation_seed
+                        )
+                        subset.is_val = True
 
             logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
 

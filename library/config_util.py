@@ -509,6 +509,27 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
 
                 val_subsets.append(subset_klass(**asdict(subset_blueprint.params)))
             else:
+                if (float(dataset_blueprint.params.validation_split) > 0.0 
+                and not (getattr(subset_blueprint.params,'is_val', False) or 
+                subset_blueprint.params == ControlNetSubsetParams or 
+                subset_blueprint.params.is_reg)):
+
+                    subset_blueprint_params_copy = copy.deepcopy(subset_blueprint.params)
+
+                    # Set values for consistency
+                    subset_blueprint_params_copy.num_repeats = 1
+                    subset_blueprint_params_copy.color_aug = False
+                    subset_blueprint_params_copy.flip_aug = False
+                    subset_blueprint_params_copy.random_crop = False
+                    subset_blueprint_params_copy.random_crop_padding_percent = 0.0
+                    subset_blueprint_params_copy.caption_dropout_rate = 0.0
+                    subset_blueprint_params_copy.caption_dropout_every_n_epochs = 0
+                    subset_blueprint_params_copy.caption_tag_dropout_rate = 0.0
+                    subset_blueprint_params_copy.token_warmup_step = 0
+                    subset_blueprint_params_copy.shuffle_caption = False
+
+                    val_subsets.append(subset_klass(**asdict(subset_blueprint_params_copy)))
+
                 subsets.append(subset_klass(**asdict(subset_blueprint.params)))
 
         if len(val_subsets) > 0:
@@ -517,48 +538,6 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
 
         dataset = dataset_klass(subsets=subsets, is_training_dataset=True, **asdict(dataset_blueprint.params))
         datasets.append(dataset)
-
-    for dataset_blueprint in dataset_group_blueprint.datasets:
-        if float(dataset_blueprint.params.validation_split) <= 0.0:
-            continue
-        if dataset_blueprint.is_controlnet:
-            subset_klass = ControlNetSubset
-            dataset_klass = ControlNetDataset
-        elif dataset_blueprint.is_dreambooth:
-            subset_klass = DreamBoothSubset
-            dataset_klass = DreamBoothDataset
-        else:            
-            subset_klass = FineTuningSubset
-            dataset_klass = FineTuningDataset
-
-        val_subsets = []
-        for subset_blueprint in dataset_blueprint.subsets:
-            # Already handled by earlier logic, or controlnet and shouldn't be val
-            if (getattr(subset_blueprint.params,'is_val', False) or 
-                subset_blueprint.params == ControlNetSubsetParams or 
-                subset_blueprint.params.is_reg):
-                continue
-
-            subset_blueprint_params_copy = copy.deepcopy(subset_blueprint.params)
-
-            # Set values for consistency
-            subset_blueprint_params_copy.num_repeats = 1
-            subset_blueprint_params_copy.color_aug = False
-            subset_blueprint_params_copy.flip_aug = False
-            subset_blueprint_params_copy.random_crop = False
-            subset_blueprint_params_copy.random_crop_padding_percent = 0.0
-            subset_blueprint_params_copy.caption_dropout_rate = 0.0
-            subset_blueprint_params_copy.caption_dropout_every_n_epochs = 0
-            subset_blueprint_params_copy.caption_tag_dropout_rate = 0.0
-            subset_blueprint_params_copy.token_warmup_step = 0
-            subset_blueprint_params_copy.shuffle_caption = False
-            subset_blueprint_params_copy.is_val = True
-
-            val_subsets.append(subset_klass(**asdict(subset_blueprint_params_copy)))
-
-        if len(val_subsets) > 0:
-            dataset = dataset_klass(subsets=val_subsets, is_training_dataset=False, **asdict(dataset_blueprint.params))
-            val_datasets.append(dataset)
 
     def print_info(_datasets, dataset_type: str):
         info = ""
