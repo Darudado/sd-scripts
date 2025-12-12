@@ -2235,32 +2235,35 @@ class DreamBoothDataset(BaseDataset):
             subset.img_count = len(img_paths)
             self.subsets.append(subset)
 
-        images_split_name = "train" if self.is_training_dataset else "validation"
-        logger.info(f"{num_train_images} {images_split_name} images with repeats.")
+        if subset.is_val:
+            logger.info(f"{num_val_images} validation images with repeats.")
+        else:
+            logger.info(f"{num_train_images} train images with repeats.")
 
         self.num_train_images = num_train_images
 
-        logger.info(f"{num_reg_images} reg images with repeats.")
-        if num_train_images < num_reg_images:
-            logger.warning("some of reg images are not used / 正則化画像の数が多いので、一部使用されない正則化画像があります")
+        if subset.is_reg:
+            logger.info(f"{num_reg_images} reg images with repeats.")
+            if num_train_images < num_reg_images:
+                logger.warning("some of reg images are not used / 正則化画像の数が多いので、一部使用されない正則化画像があります")
 
-        if num_reg_images == 0:
-            logger.warning("no regularization images / 正則化画像が見つかりませんでした")
-        else:
-            # num_repeatsを計算する：どうせ大した数ではないのでループで処理する
-            n = 0
-            first_loop = True
-            while n < num_train_images:
-                for info, subset in reg_infos:
-                    if first_loop:
-                        self.register_image(info, subset)
-                        n += info.num_repeats
-                    else:
-                        info.num_repeats += 1  # rewrite registered info
-                        n += 1
-                    if n >= num_train_images:
-                        break
-                first_loop = False
+            if num_reg_images == 0:
+                logger.warning("no regularization images / 正則化画像が見つかりませんでした")
+            else:
+                # num_repeatsを計算する：どうせ大した数ではないのでループで処理する
+                n = 0
+                first_loop = True
+                while n < num_train_images:
+                    for info, subset in reg_infos:
+                        if first_loop:
+                            self.register_image(info, subset)
+                            n += info.num_repeats
+                        else:
+                            info.num_repeats += 1  # rewrite registered info
+                            n += 1
+                        if n >= num_train_images:
+                            break
+                    first_loop = False
 
         self.num_reg_images = num_reg_images
         self.num_val_images = num_val_images
