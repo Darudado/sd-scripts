@@ -175,16 +175,17 @@ def split_train_val(
     paths, sizes = zip(*dataset)
     paths = list(paths)
     sizes = list(sizes)
+
     # Split the dataset between training and validation
+    val_count = round(len(paths) * validation_split)
+    split_index = len(paths) - val_count
+
     if is_training_dataset:
         # Training dataset we split to the first part
-        split = math.ceil(len(paths) * (1 - validation_split))
-        return paths[0:split], sizes[0:split]
+        return paths[:split_index], sizes[:split_index]
     else:
         # Validation dataset we split to the second part
-        split = len(paths) - round(len(paths) * validation_split)
-        return paths[split:], sizes[split:]
-
+        return paths[split_index:], sizes[split_index:]
 
 class ImageInfo:
     def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, is_val: bool, absolute_path: str) -> None:
@@ -2125,6 +2126,11 @@ class DreamBoothDataset(BaseDataset):
                             img_paths, sizes, self.is_training_dataset, self.validation_split, self.validation_seed
                         )
                         subset.is_val = True
+                    elif not subset.is_val:
+                        img_paths, sizes = split_train_val(
+                            img_paths, sizes, self.is_training_dataset, self.validation_split, self.validation_seed
+                        )
+
 
             logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
 
