@@ -1685,6 +1685,7 @@ class NetworkTrainer:
 
         if args.edm2_loss_weighting:
             loss_scaled_recorder = train_util.EMARecorder()
+            loss_edm2_recorder = train_util.EMARecorder()
 
         del train_dataset_group
         if val_dataset_group is not None:
@@ -1779,6 +1780,8 @@ class NetworkTrainer:
                 edm2_lr_scheduler,
                 current_global_step_loss_scaled,
                 average_loss_scaled,
+                current_global_step_loss_edm2,
+                average_loss_edm2,
                 current_val_loss=current_val_loss, 
                 average_val_loss=average_val_loss
             )
