@@ -1884,6 +1884,7 @@ class NetworkTrainer:
                     )
                     mean_grad_norm = None
                     mean_combined_norm = None
+                    mean_norm = mean_norm.item() if isinstance(mean_norm, torch.Tensor) else mean_norm
                     max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
                 else:
                     #if hasattr(network, "weight_norms"):
