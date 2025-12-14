@@ -80,6 +80,8 @@ class NetworkTrainer:
         edm2_lr_scheduler=None,
         current_loss_scaled=None, 
         average_loss_scaled=None, 
+        current_loss_edm2=None, 
+        average_loss_edm2=None, 
         current_val_loss=None,
         average_val_loss=None,
     ):
@@ -88,6 +90,10 @@ class NetworkTrainer:
         if current_loss_scaled is not None:
             logs["loss/current_scaled"] = current_loss_scaled
             logs["loss/average_scaled"] = average_loss_scaled
+
+        if current_loss_scaled is not None:
+            logs["loss/current_edm2"] = current_loss_edm2
+            logs["loss/average_edm2"] = average_loss_edm2
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -1732,6 +1738,8 @@ class NetworkTrainer:
         current_global_step_loss = 0.0
         current_global_step_loss_scaled = 0.0 if args.edm2_loss_weighting else None
         average_loss_scaled = 0.0 if args.edm2_loss_weighting else None
+        current_global_step_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
+        average_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
         avr_loss = 0.0
         accumulation_counter = 0
 
@@ -1855,6 +1863,7 @@ class NetworkTrainer:
                     if args.use_ramtorch or args.use_ramtorch_network:
                         torch.cuda.synchronize() 
 
+                    edm2_loss = loss
                     loss = pre_scaling_loss
 
                     if accelerator.sync_gradients:
@@ -1884,7 +1893,7 @@ class NetworkTrainer:
                     )
                     mean_grad_norm = None
                     mean_combined_norm = None
-                    mean_norm = mean_norm.item() if isinstance(mean_norm, torch.Tensor) else mean_norm
+                    mean_norm = mean_norm.detach().item() if isinstance(mean_norm, torch.Tensor) else mean_norm
                     max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
                 else:
                     #if hasattr(network, "weight_norms"):
@@ -1975,13 +1984,17 @@ class NetworkTrainer:
                 current_global_step_loss += loss.detach().item()
                 if args.edm2_loss_weighting:
                     current_global_step_loss_scaled += loss_scaled.detach().item()
+                    current_global_step_loss_edm2 += edm2_loss.detach().item()
                 else:
                     current_global_step_loss_scaled = None
+                    current_global_step_loss_edm2 = None
 
                 if accelerator.sync_gradients:
                     loss_recorder.add(current_global_step_loss / accumulation_counter)
                     if args.edm2_loss_weighting:
                         loss_scaled_recorder.add(current_global_step_loss_scaled / accumulation_counter)
+                        loss_edm2_recorder.add(current_global_step_loss_edm2 / accumulation_counter)
+                        
                     avr_loss: float = loss_recorder.average
                     logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                     progress_bar.set_postfix(**{**max_mean_logs, **logs})
@@ -1991,9 +2004,13 @@ class NetworkTrainer:
                         if args.edm2_loss_weighting:
                             current_global_step_loss_scaled = (current_global_step_loss_scaled / accumulation_counter)
                             average_loss_scaled: float = loss_scaled_recorder.average
+                            current_global_step_loss_edm2 = (current_global_step_loss_edm2 / accumulation_counter)
+                            average_loss_edm2: float = loss_edm2_recorder.average
                         else:
                             current_global_step_loss_scaled = None
                             average_loss_scaled = None
+                            current_global_step_loss_edm2 = None
+                            average_loss_edm2 = None
 
                         logs = self.generate_step_logs(
                             args,
@@ -2010,6 +2027,8 @@ class NetworkTrainer:
                             edm2_lr_scheduler,
                             current_global_step_loss_scaled,
                             average_loss_scaled,
+                            current_global_step_loss_edm2,
+                            average_loss_edm2,
                             current_val_loss=current_val_loss, 
                             average_val_loss=average_val_loss
                         )
@@ -2017,6 +2036,7 @@ class NetworkTrainer:
                     current_global_step_loss = 0.0
                     if args.edm2_loss_weighting:
                         current_global_step_loss_scaled = 0.0
+                        current_global_step_loss_edm2 = 0.0
                     accumulation_counter = 0
 
                 if global_step >= args.max_train_steps:
