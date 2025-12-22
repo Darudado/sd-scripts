@@ -313,7 +313,7 @@ class NetworkTrainer:
             pixel_counts = self.get_flow_pixel_counts(args, batch, latents.device)
 
         noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
-            args, noise_scheduler, latents, fixed_timesteps, is_train, pixel_counts=pixel_counts
+            args, noise_scheduler, latents, fixed_timesteps=fixed_timesteps, is_train=is_train, pixel_counts=pixel_counts
         )
 
 
@@ -490,7 +490,7 @@ class NetworkTrainer:
                         tokenize_strategy,
                         self.get_models_for_text_encoding(args, accelerator, text_encoders),
                         input_ids,
-                        masks,
+                        attn_masks=masks,
                     )
                 if args.full_fp16:
                     encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
@@ -642,7 +642,7 @@ class NetworkTrainer:
                             tokenize_strategy,
                             self.get_models_for_text_encoding(args, accelerator, text_encoders),
                             input_ids,
-                            masks,
+                            attn_masks=masks,
                         )
                     if args.full_fp16:
                         encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
@@ -659,7 +659,6 @@ class NetworkTrainer:
             batch_size = latents.shape[0]
             for fixed_timesteps in timesteps_list:
                 timesteps = torch.full((batch_size,), fixed_timesteps, dtype=torch.long, device=latents.device)
-
                 # sample noise, call unet, get target
                 noise_pred, target, _, _, _ = self.get_noise_pred_and_target(
                     args,
@@ -673,7 +672,7 @@ class NetworkTrainer:
                     network,
                     weight_dtype,
                     train_unet,
-                    timesteps,
+                    fixed_timesteps=timesteps,
                     is_train=False,
                 )
 

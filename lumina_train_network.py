@@ -246,6 +246,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         latents,
         batch,
         text_encoder_conds: Tuple[Tensor, Tensor, Tensor],  # (hidden_states, input_ids, attention_masks)
+        text_encoder_masks,
         dit: lumina_models.NextDiT,
         network,
         weight_dtype,
@@ -257,7 +258,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         noise = torch.randn_like(latents)
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = lumina_train_util.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, fixed_timesteps=fixed_timesteps, is_train=is_train
         )
 
         # ensure the hidden state will require grad

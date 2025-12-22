@@ -1757,6 +1757,7 @@ class BaseDataset(torch.utils.data.Dataset):
             )
             text_encoder_outputs = None
             input_ids = None
+            masks = None
 
             if image_info.text_encoder_outputs is not None:
                 # cached

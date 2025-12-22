@@ -804,7 +804,7 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None) -> Tensor
 
 
 def get_noisy_model_input_and_timesteps(
-    args, noise_scheduler, latents, noise, device, dtype
+    args, noise_scheduler, latents, noise, device, dtype, fixed_timesteps=None, is_train=True
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
     Get noisy model input and timesteps.

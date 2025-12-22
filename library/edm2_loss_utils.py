@@ -68,7 +68,6 @@ def prepare_edm2_loss_weighting(args, noise_scheduler, accelerator):
         edm2_lr_scheduler = None
         edm2_model = None
 
-
     return edm2_model, edm2_optimizer, edm2_lr_scheduler
 
 def handle_conflicting_configuration(args):

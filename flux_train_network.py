@@ -160,7 +160,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         if args.use_ramtorch:
             logger.info("Applying RamTorch to FLUX model.")
             model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
-            clip_l = apply_ramtorch_to_module(clip_l, "clip_l", accelerator.device, weight_dtype)
+            if self.use_clip_l:
+                clip_l = apply_ramtorch_to_module(clip_l, "clip_l", accelerator.device, weight_dtype)
             t5xxl = apply_ramtorch_to_module(t5xxl, "t5xxl", accelerator.device, t5xxl.dtype)
 
         model_version = flux_utils.MODEL_VERSION_FLUX_V1 if self.model_type != "chroma" else flux_utils.MODEL_VERSION_CHROMA
@@ -324,6 +325,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         latents,
         batch,
         text_encoder_conds,
+        text_encoder_masks,
         unet: flux_models.Flux,
         network,
         weight_dtype,
@@ -337,7 +339,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, fixed_timesteps=fixed_timesteps, is_train=is_train
         )
 
         # pack latents and get img_ids
@@ -353,7 +355,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         with accelerator.autocast(), torch.no_grad():
             mod_vectors = unet.get_mod_vectors(timesteps=timesteps / 1000, guidance=guidance_vec, batch_size=bsz)
 
-        if args.gradient_checkpointing:
+        if is_train and args.gradient_checkpointing:
             noisy_model_input.requires_grad_(True)
             for t in text_encoder_conds:
                 if t is not None and t.dtype.is_floating_point:
@@ -439,7 +441,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         return loss
