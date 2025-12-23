@@ -1120,6 +1120,8 @@ class NetworkTrainer:
             network = network.to("cpu")
             logger.info("Applying RamTorch to network/lora.")
             network = apply_ramtorch_to_module(network, "network/lora", accelerator.device)
+            # Make sure the rest of the network is moved to the accelerator.device
+            network = network.to(accelerator.device)
 
         if args.gradient_checkpointing:
             if args.cpu_offload_checkpointing:
