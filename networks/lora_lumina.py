@@ -873,7 +873,7 @@ class LoRANetwork(torch.nn.Module):
         # make sure text_encoder_lr as list of two elements
         # if float, use the same value for both text encoders
         if text_encoder_lr is None or (isinstance(text_encoder_lr, list) and len(text_encoder_lr) == 0):
-            text_encoder_lr = [default_lr, default_lr]
+            text_encoder_lr = [learning_rate, learning_rate]
         elif isinstance(text_encoder_lr, float) or isinstance(text_encoder_lr, int):
             text_encoder_lr = [float(text_encoder_lr), float(text_encoder_lr)]
         elif len(text_encoder_lr) == 1:
@@ -930,7 +930,7 @@ class LoRANetwork(torch.nn.Module):
         if self.unet_loras:
             params, descriptions = assemble_params(
                 self.unet_loras,
-                unet_lr if unet_lr is not None else default_lr,
+                unet_lr if unet_lr is not None else learning_rate,
                 self.loraplus_unet_lr_ratio or self.loraplus_lr_ratio,
             )
             all_params.extend(params)
