@@ -411,7 +411,7 @@ class SingleStreamBlock(nn.Module):
             k[i] = None
             v[i] = None
 
-            attn_i = torch.zeros((1, x.shape[1], attn_trimmed.shape[-1]), dtype=attn_trimmed.dtype, device=x.device) #TODO: device=device=x.device is bandaid for ramtorch, need to evaluate further
+            attn_i = torch.zeros((1, x.shape[1], attn_trimmed.shape[-1]), dtype=attn_trimmed.dtype, device=x.device)
             attn_i[:, : img_len + txt_seq_len[i], :] = attn_trimmed
             del attn_trimmed
             attn.append(attn_i)
