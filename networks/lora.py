@@ -86,9 +86,7 @@ class AsyncTensorStreamer:
         # The NEXT time we try to write to 'slot_idx', we will wait for this event.
         ready_event.record()
         
-        # 7. Detach for Safety
-        # Returns a leaf tensor for Autograd, allowing in-place modification in GLoRA
-        return self.buffers[slot_idx].detach()
+        return self.buffers[slot_idx]
 
 # Global registry for multi-gpu support
 _STREAMERS = {}
@@ -100,6 +98,9 @@ def transfer_ramtensor_to_device(tensor_cpu: torch.Tensor, device: torch.device)
     """
     if not getattr(tensor_cpu, 'is_ramtorch', False):
         return tensor_cpu.to(device, non_blocking=True)
+    
+    if device.type == 'cpu':
+        return tensor_cpu
 
     if device not in _STREAMERS:
         _STREAMERS[device] = AsyncTensorStreamer(device)
