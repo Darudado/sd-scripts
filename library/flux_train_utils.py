@@ -530,7 +530,7 @@ def get_noisy_model_input_and_timesteps(
     else:
         noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
 
-    return noisy_model_input.to(dtype), timesteps.to(dtype), sigmas
+    return noisy_model_input.to(dtype=dtype, device=device), timesteps.to(dtype=dtype, device=device), sigmas.to(dtype=dtype, device=device)
 
 
 def apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas):

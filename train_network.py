@@ -30,6 +30,7 @@ from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
+from library.strategy_sdxl import SdxlTextEncodingStrategy
 
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset
@@ -464,8 +465,8 @@ class NetworkTrainer:
         masks_reshaped = []
         text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
         if text_encoder_outputs_list is not None:
-            text_encoder_conds = text_encoder_outputs_list[:3]  # List of text encoder outputs
-            if len(text_encoder_outputs_list) > 3:
+            text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
+            if isinstance(text_encoding_strategy, SdxlTextEncodingStrategy):
                 masks_reshaped = text_encoder_outputs_list[3:]
 
         if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
@@ -482,16 +483,20 @@ class NetworkTrainer:
                     )
                 else:
                     input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
-                    if self.is_sdxl:
+                    if isinstance(text_encoding_strategy, SdxlTextEncodingStrategy):
                         masks = [mask.to(accelerator.device) for mask in batch["attn_mask_list"]]
+                        encoded_text_encoder_conds, masks_reshaped = text_encoding_strategy.encode_tokens(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids,
+                            attn_masks=masks,
+                        )
                     else:
-                        masks = None
-                    encoded_text_encoder_conds, masks_reshaped = text_encoding_strategy.encode_tokens(
-                        tokenize_strategy,
-                        self.get_models_for_text_encoding(args, accelerator, text_encoders),
-                        input_ids,
-                        attn_masks=masks,
-                    )
+                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids
+                        )
                 if args.full_fp16:
                     encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
 
@@ -616,8 +621,8 @@ class NetworkTrainer:
             masks_reshaped = []
             text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
             if text_encoder_outputs_list is not None:
-                text_encoder_conds = text_encoder_outputs_list[:3]  # List of text encoder outputs
-                if len(text_encoder_outputs_list) > 3:
+                text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
+                if isinstance(text_encoding_strategy, SdxlTextEncodingStrategy):
                     masks_reshaped = text_encoder_outputs_list[3:]
 
             if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
@@ -634,16 +639,20 @@ class NetworkTrainer:
                         )
                     else:
                         input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
-                        if self.is_sdxl:
-                            masks = [ids.to(accelerator.device) for ids in batch["attn_mask_list"]]
+                        if isinstance(text_encoding_strategy, SdxlTextEncodingStrategy):
+                            masks = [mask.to(accelerator.device) for mask in batch["attn_mask_list"]]
+                            encoded_text_encoder_conds, masks_reshaped = text_encoding_strategy.encode_tokens(
+                                tokenize_strategy,
+                                self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                                input_ids,
+                                attn_masks=masks,
+                            )
                         else:
-                            masks = None
-                        encoded_text_encoder_conds, masks_reshaped = text_encoding_strategy.encode_tokens(
-                            tokenize_strategy,
-                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
-                            input_ids,
-                            attn_masks=masks,
-                        )
+                            encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                                tokenize_strategy,
+                                self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                                input_ids
+                            )
                     if args.full_fp16:
                         encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
 
@@ -1747,6 +1756,11 @@ class NetworkTrainer:
         if train_util.sample_images_check(args, 0, global_step) or train_util.calculate_val_loss_check(args, global_step, 0, val_dataloader, train_dataloader):
             #Switch network to eval mode
             accelerator.unwrap_model(network).eval()
+            if args.gradient_checkpointing:
+                accelerator.unwrap_model(unet).eval()
+                for t_enc in text_encoders:
+                    accelerator.unwrap_model(t_enc).eval()
+
             optimizer_eval_fn()
             self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
             if train_util.calculate_val_loss_check(args, global_step, 0, val_dataloader, train_dataloader):
@@ -1758,6 +1772,10 @@ class NetworkTrainer:
             #Switch network to train mode
             optimizer_train_fn()
             accelerator.unwrap_model(network).train()
+            if args.gradient_checkpointing:
+                accelerator.unwrap_model(unet).train()
+                for t_enc in text_encoders:
+                    accelerator.unwrap_model(t_enc).train()
 
         if plot_edm2_loss_weighting_check(args, global_step):
             plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
@@ -1924,6 +1942,11 @@ class NetworkTrainer:
                         args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0):
 
                         accelerator.unwrap_model(network).eval()
+                        if args.gradient_checkpointing:
+                            accelerator.unwrap_model(unet).eval()
+                            for t_enc in text_encoders:
+                                accelerator.unwrap_model(t_enc).eval()
+
                         optimizer_eval_fn()
                         self.sample_images(
                             accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
@@ -1980,6 +2003,10 @@ class NetworkTrainer:
                             plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
                         optimizer_train_fn()
                         accelerator.unwrap_model(network).train()
+                        if args.gradient_checkpointing:
+                            accelerator.unwrap_model(unet).train()
+                            for t_enc in text_encoders:
+                                accelerator.unwrap_model(t_enc).train()
                     else:
                         current_val_loss, average_val_loss, val_logs = None, None, None
 
@@ -2057,6 +2084,11 @@ class NetworkTrainer:
                 # 指定エポックごとにモデルを保存
                 optimizer_eval_fn()
                 accelerator.unwrap_model(network).eval()
+                if args.gradient_checkpointing:
+                    accelerator.unwrap_model(unet).eval()
+                    for t_enc in text_encoders:
+                        accelerator.unwrap_model(t_enc).eval()
+
                 if args.save_every_n_epochs is not None:
                     saving = (current_epoch.value) % args.save_every_n_epochs == 0 and (current_epoch.value) < num_train_epochs
                     if is_main_process and saving:
@@ -2083,6 +2115,10 @@ class NetworkTrainer:
                 progress_bar.unpause()
                 optimizer_train_fn()
                 accelerator.unwrap_model(network).train()
+                if args.gradient_checkpointing:
+                    accelerator.unwrap_model(unet).train()
+                    for t_enc in text_encoders:
+                        accelerator.unwrap_model(t_enc).train()
 
             # end of epoch
 

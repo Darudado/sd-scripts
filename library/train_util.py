@@ -40,6 +40,7 @@ import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
+from library.strategy_sdxl import SdxlTokenizeStrategy
 
 init_ipex()
 
@@ -1798,10 +1799,14 @@ class BaseDataset(torch.utils.data.Dataset):
                 #         else:
                 #             token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
                 #         input_ids2_list.append(token_caption2)
-                input_iter, mask_iter = self.tokenize_strategy.tokenize(caption)
+                if isinstance(self.tokenize_strategy, SdxlTokenizeStrategy):
+                    input_iter, mask_iter = self.tokenize_strategy.tokenize(caption)
+                    masks = mask_iter
+                else:
+                    input_iter = self.tokenize_strategy.tokenize(caption)
+                    masks = None
 
                 input_ids = [ids [0]  for ids in input_iter]
-                masks = mask_iter
 
             input_ids_list.append(input_ids)
             attn_mask_list.append(masks)

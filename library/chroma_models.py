@@ -144,7 +144,7 @@ def _modulation_shift_scale_fn(x, scale, shift):
 
 
 def _modulation_gate_fn(x, gate, gate_params):
-    return x + gate * gate_params
+    return x + gate * gate_params.to(device=x.device, non_blocking=True) # TODO: To device is bandaid fix, need to evaluate further
 
 
 class DoubleStreamBlock(nn.Module):
@@ -411,7 +411,7 @@ class SingleStreamBlock(nn.Module):
             k[i] = None
             v[i] = None
 
-            attn_i = torch.zeros((1, x.shape[1], attn_trimmed.shape[-1]), dtype=attn_trimmed.dtype, device=self.device)
+            attn_i = torch.zeros((1, x.shape[1], attn_trimmed.shape[-1]), dtype=attn_trimmed.dtype, device=x.device) #TODO: device=device=x.device is bandaid for ramtorch, need to evaluate further
             attn_i[:, : img_len + txt_seq_len[i], :] = attn_trimmed
             del attn_trimmed
             attn.append(attn_i)

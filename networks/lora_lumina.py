@@ -864,7 +864,12 @@ class LoRANetwork(torch.nn.Module):
         logger.info(f"LoRA+ UNet LR Ratio: {self.loraplus_unet_lr_ratio or self.loraplus_lr_ratio}")
         logger.info(f"LoRA+ Text Encoder LR Ratio: {self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}")
 
-    def prepare_optimizer_params_with_multiple_te_lrs(self, text_encoder_lr, unet_lr, default_lr):
+    def prepare_optimizer_params_with_multiple_te_lrs(self,
+                                                      text_encoder_lr: float, 
+                                                      unet_lr: float, 
+                                                      learning_rate: float, 
+                                                      apply_orthograd: bool, 
+                                                      orthograd_targets: list[str]):
         # make sure text_encoder_lr as list of two elements
         # if float, use the same value for both text encoders
         if text_encoder_lr is None or (isinstance(text_encoder_lr, list) and len(text_encoder_lr) == 0):
