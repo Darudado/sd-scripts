@@ -1756,28 +1756,29 @@ class NetworkTrainer:
 
         # For --sample_at_first
         if train_util.sample_images_check(args, 0, global_step) or train_util.calculate_val_loss_check(args, global_step, 0, val_dataloader, train_dataloader):
-            #Switch network to eval mode
-            accelerator.unwrap_model(network).eval()
-            if args.gradient_checkpointing:
-                accelerator.unwrap_model(unet).eval()
-                for t_enc in text_encoders:
-                    accelerator.unwrap_model(t_enc).eval()
+            with torch.no_grad():
+                #Switch network to eval mode
+                accelerator.unwrap_model(network).eval()
+                if args.gradient_checkpointing:
+                    accelerator.unwrap_model(unet).eval()
+                    for t_enc in text_encoders:
+                        accelerator.unwrap_model(t_enc).eval()
 
-            optimizer_eval_fn()
-            self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
-            if train_util.calculate_val_loss_check(args, global_step, 0, val_dataloader, train_dataloader):
-                current_val_loss, average_val_loss, val_logs = self.calculate_val_loss(
-                    global_step, 0, train_dataloader, val_loss_recorder, val_dataloader, 
-                    cyclic_val_dataloader, network, tokenize_strategy, 
-                    text_encoders, text_encoding_strategy, unet, vae, noise_scheduler, 
-                    vae_dtype, weight_dtype, accelerator, args, 0, None, train_text_encoder)
-            #Switch network to train mode
-            optimizer_train_fn()
-            accelerator.unwrap_model(network).train()
-            if args.gradient_checkpointing:
-                accelerator.unwrap_model(unet).train()
-                for t_enc in text_encoders:
-                    accelerator.unwrap_model(t_enc).train()
+                optimizer_eval_fn()
+                self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+                if train_util.calculate_val_loss_check(args, global_step, 0, val_dataloader, train_dataloader):
+                    current_val_loss, average_val_loss, val_logs = self.calculate_val_loss(
+                        global_step, 0, train_dataloader, val_loss_recorder, val_dataloader, 
+                        cyclic_val_dataloader, network, tokenize_strategy, 
+                        text_encoders, text_encoding_strategy, unet, vae, noise_scheduler, 
+                        vae_dtype, weight_dtype, accelerator, args, 0, None, train_text_encoder)
+                #Switch network to train mode
+                optimizer_train_fn()
+                accelerator.unwrap_model(network).train()
+                if args.gradient_checkpointing:
+                    accelerator.unwrap_model(unet).train()
+                    for t_enc in text_encoders:
+                        accelerator.unwrap_model(t_enc).train()
 
         if plot_edm2_loss_weighting_check(args, global_step):
             plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
@@ -1942,73 +1943,73 @@ class NetworkTrainer:
                     if (train_util.sample_images_check(args, None, global_step) or 
                         train_util.calculate_val_loss_check(args, global_step, step, val_dataloader, train_dataloader) or 
                         args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0):
+                        with torch.no_grad():
+                            accelerator.unwrap_model(network).eval()
+                            if args.gradient_checkpointing:
+                                accelerator.unwrap_model(unet).eval()
+                                for t_enc in text_encoders:
+                                    accelerator.unwrap_model(t_enc).eval()
 
-                        accelerator.unwrap_model(network).eval()
-                        if args.gradient_checkpointing:
-                            accelerator.unwrap_model(unet).eval()
-                            for t_enc in text_encoders:
-                                accelerator.unwrap_model(t_enc).eval()
+                            optimizer_eval_fn()
+                            self.sample_images(
+                                accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
+                            )
 
-                        optimizer_eval_fn()
-                        self.sample_images(
-                            accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
-                        )
+                            if train_util.calculate_val_loss_check(args, global_step, step, val_dataloader, train_dataloader):
+                                current_val_loss, average_val_loss, val_logs = self.calculate_val_loss(global_step, step, 
+                                                                                                        skipped_dataloader or train_dataloader, 
+                                                                                                        val_loss_recorder, 
+                                                                                                        val_dataloader, 
+                                                                                                        cyclic_val_dataloader, 
+                                                                                                        network,
+                                                                                                        tokenize_strategy, 
+                                                                                                        text_encoders, 
+                                                                                                        text_encoding_strategy, 
+                                                                                                        unet, 
+                                                                                                        vae, 
+                                                                                                        noise_scheduler, 
+                                                                                                        vae_dtype, 
+                                                                                                        weight_dtype, 
+                                                                                                        accelerator, 
+                                                                                                        args, 
+                                                                                                        batch,
+                                                                                                        current_epoch.value,
+                                                                                                        train_text_encoder)
+                            else:
+                                current_val_loss, average_val_loss, val_logs = None, None, {}
+                            progress_bar.unpause()
 
-                        if train_util.calculate_val_loss_check(args, global_step, step, val_dataloader, train_dataloader):
-                            current_val_loss, average_val_loss, val_logs = self.calculate_val_loss(global_step, step, 
-                                                                                                    skipped_dataloader or train_dataloader, 
-                                                                                                    val_loss_recorder, 
-                                                                                                    val_dataloader, 
-                                                                                                    cyclic_val_dataloader, 
-                                                                                                    network,
-                                                                                                    tokenize_strategy, 
-                                                                                                    text_encoders, 
-                                                                                                    text_encoding_strategy, 
-                                                                                                    unet, 
-                                                                                                    vae, 
-                                                                                                    noise_scheduler, 
-                                                                                                    vae_dtype, 
-                                                                                                    weight_dtype, 
-                                                                                                    accelerator, 
-                                                                                                    args, 
-                                                                                                    batch,
-                                                                                                    current_epoch.value,
-                                                                                                    train_text_encoder)
-                        else:
-                            current_val_loss, average_val_loss, val_logs = None, None, {}
-                        progress_bar.unpause()
-
-                        # 指定ステップごとにモデルを保存
-                        if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
-                            accelerator.wait_for_everyone()
-                            if accelerator.is_main_process:
-                                ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
-                                save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
-
-                                if args.edm2_loss_weighting:
-                                    loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step, "_edm2_loss_weights")
-                                    save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, epoch, dtype_override=torch.float32)
-
-                                if args.save_state:
-                                    train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
-
-                                remove_step_no = train_util.get_remove_step_no(args, global_step)
-                                if remove_step_no is not None:
-                                    remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
-                                    remove_model(remove_ckpt_name)
+                            # 指定ステップごとにモデルを保存
+                            if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                                accelerator.wait_for_everyone()
+                                if accelerator.is_main_process:
+                                    ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
+                                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
 
                                     if args.edm2_loss_weighting:
-                                        remove_loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no, "_edm2_loss_weights")
-                                        remove_model(remove_loss_weights_ckpt_name)
+                                        loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step, "_edm2_loss_weights")
+                                        save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, epoch, dtype_override=torch.float32)
 
-                        if plot_edm2_loss_weighting_check(args, global_step):
-                            plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
-                        optimizer_train_fn()
-                        accelerator.unwrap_model(network).train()
-                        if args.gradient_checkpointing:
-                            accelerator.unwrap_model(unet).train()
-                            for t_enc in text_encoders:
-                                accelerator.unwrap_model(t_enc).train()
+                                    if args.save_state:
+                                        train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+
+                                    remove_step_no = train_util.get_remove_step_no(args, global_step)
+                                    if remove_step_no is not None:
+                                        remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
+                                        remove_model(remove_ckpt_name)
+
+                                        if args.edm2_loss_weighting:
+                                            remove_loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no, "_edm2_loss_weights")
+                                            remove_model(remove_loss_weights_ckpt_name)
+
+                            if plot_edm2_loss_weighting_check(args, global_step):
+                                plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
+                            optimizer_train_fn()
+                            accelerator.unwrap_model(network).train()
+                            if args.gradient_checkpointing:
+                                accelerator.unwrap_model(unet).train()
+                                for t_enc in text_encoders:
+                                    accelerator.unwrap_model(t_enc).train()
                     else:
                         current_val_loss, average_val_loss, val_logs = None, None, None
 
@@ -2082,45 +2083,45 @@ class NetworkTrainer:
 
             if (train_util.sample_images_check(args, current_epoch.value, global_step) or 
                 args.save_every_n_epochs is not None):
+                with torch.no_grad():
+                    # 指定エポックごとにモデルを保存
+                    optimizer_eval_fn()
+                    accelerator.unwrap_model(network).eval()
+                    if args.gradient_checkpointing:
+                        accelerator.unwrap_model(unet).eval()
+                        for t_enc in text_encoders:
+                            accelerator.unwrap_model(t_enc).eval()
 
-                # 指定エポックごとにモデルを保存
-                optimizer_eval_fn()
-                accelerator.unwrap_model(network).eval()
-                if args.gradient_checkpointing:
-                    accelerator.unwrap_model(unet).eval()
-                    for t_enc in text_encoders:
-                        accelerator.unwrap_model(t_enc).eval()
-
-                if args.save_every_n_epochs is not None:
-                    saving = (current_epoch.value) % args.save_every_n_epochs == 0 and (current_epoch.value) < num_train_epochs
-                    if is_main_process and saving:
-                        ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, current_epoch.value)
-                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, current_epoch.value)
-
-                        if args.edm2_loss_weighting:
-                            loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, current_epoch.value, "_edm2_loss_weights")
-                            save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, current_epoch.value, dtype_override=torch.float32)
-
-                        remove_epoch_no = train_util.get_remove_epoch_no(args, current_epoch.value)
-                        if remove_epoch_no is not None:
-                            remove_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
-                            remove_model(remove_ckpt_name)
+                    if args.save_every_n_epochs is not None:
+                        saving = (current_epoch.value) % args.save_every_n_epochs == 0 and (current_epoch.value) < num_train_epochs
+                        if is_main_process and saving:
+                            ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, current_epoch.value)
+                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, current_epoch.value)
 
                             if args.edm2_loss_weighting:
-                                remove_loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no, "_edm2_loss_weights")
-                                remove_model(remove_loss_weights_ckpt_name)
+                                loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, current_epoch.value, "_edm2_loss_weights")
+                                save_model(loss_weights_ckpt_name, accelerator.unwrap_model(edm2_model), global_step, current_epoch.value, dtype_override=torch.float32)
 
-                        if args.save_state:
-                            train_util.save_and_remove_state_on_epoch_end(args, accelerator, current_epoch.value)
+                            remove_epoch_no = train_util.get_remove_epoch_no(args, current_epoch.value)
+                            if remove_epoch_no is not None:
+                                remove_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
+                                remove_model(remove_ckpt_name)
 
-                self.sample_images(accelerator, args, current_epoch.value, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
-                progress_bar.unpause()
-                optimizer_train_fn()
-                accelerator.unwrap_model(network).train()
-                if args.gradient_checkpointing:
-                    accelerator.unwrap_model(unet).train()
-                    for t_enc in text_encoders:
-                        accelerator.unwrap_model(t_enc).train()
+                                if args.edm2_loss_weighting:
+                                    remove_loss_weights_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no, "_edm2_loss_weights")
+                                    remove_model(remove_loss_weights_ckpt_name)
+
+                            if args.save_state:
+                                train_util.save_and_remove_state_on_epoch_end(args, accelerator, current_epoch.value)
+
+                    self.sample_images(accelerator, args, current_epoch.value, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+                    progress_bar.unpause()
+                    optimizer_train_fn()
+                    accelerator.unwrap_model(network).train()
+                    if args.gradient_checkpointing:
+                        accelerator.unwrap_model(unet).train()
+                        for t_enc in text_encoders:
+                            accelerator.unwrap_model(t_enc).train()
 
             # end of epoch
 
