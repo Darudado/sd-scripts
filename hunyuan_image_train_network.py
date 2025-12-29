@@ -372,7 +372,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         vae.to(dtype=torch.float16)  # VAE is always fp16
         vae.eval()
 
-        if args.use_ramtorch:
+        if args.use_ramtorch and not args.cache_text_encoder_outputs:
             logger.info("Applying RamTorch to Hunyuan model TEs and vae.")
             text_encoder_vlm = apply_ramtorch_to_module(text_encoder_vlm, "vlm", accelerator.device, vl_dtype)
             text_encoder_byt5 = apply_ramtorch_to_module(text_encoder_byt5, "byt5", accelerator.device, torch.float16) # byt5 is always fp16
@@ -390,7 +390,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
             gc.collect()
 
         loading_dtype = None if args.fp8_scaled else weight_dtype
-        loading_device = "cpu" if self.is_swapping_blocks else accelerator.device
+        loading_device = "cpu" if self.is_swapping_blocks or args.use_ramtorch else accelerator.device
 
         attn_mode = "torch"
         if args.xformers:
@@ -409,14 +409,14 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
             args.fp8_scaled,
         )
 
+        if args.use_ramtorch:
+            logger.info("Applying RamTorch to Hunyuan model dit.")
+            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
+
         if self.is_swapping_blocks:
             # Swap blocks between CPU and GPU to reduce memory usage, in forward and backward passes.
             logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
             model.enable_block_swap(args.blocks_to_swap, accelerator.device, supports_backward=True)
-
-        if args.use_ramtorch:
-            logger.info("Applying RamTorch to Hunyuan model dit.")
-            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
 
         return model, text_encoders
 

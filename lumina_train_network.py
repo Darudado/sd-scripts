@@ -75,6 +75,10 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 )
                 model.to(torch.float8_e4m3fn)
 
+        if args.use_ramtorch:
+            logger.info("Applying RamTorch to Lumina model.")
+            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
+
         if args.blocks_to_swap:
             logger.info(f"Lumina 2: Enabling block swap: {args.blocks_to_swap}")
             model.enable_block_swap(args.blocks_to_swap, accelerator.device)
@@ -84,9 +88,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         gemma2.eval()
         ae = lumina_util.load_ae(args.ae, weight_dtype, "cpu")
 
-        if args.use_ramtorch:
-            logger.info("Applying RamTorch to Lumina model.")
-            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
+        if args.use_ramtorch and not args.cache_text_encoder_outputs:
             gemma2 = apply_ramtorch_to_module(gemma2, "gemma2", accelerator.device, weight_dtype)
 
         return lumina_util.MODEL_VERSION_LUMINA_V2, [gemma2], ae, model

@@ -75,6 +75,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         if args.max_token_length is not None:
             logger.warning("max_token_length is not used in Flux training / max_token_lengthはFluxのトレーニングでは使用されません")
 
+        args.blocks_to_swap = int(getattr(args, "blocks_to_swap", 0))
+
         assert (
             args.blocks_to_swap is None or args.blocks_to_swap == 0
         ) or not args.cpu_offload_checkpointing, "blocks_to_swap is not supported with cpu_offload_checkpointing / blocks_to_swapはcpu_offload_checkpointingと併用できません"
@@ -127,6 +129,10 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         # if args.split_mode:
         #     model = self.prepare_split_model(model, weight_dtype, accelerator)
 
+        if args.use_ramtorch:
+            logger.info("Applying RamTorch to FLUX model.")
+            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
+
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
         if self.is_swapping_blocks:
             # Swap blocks between CPU and GPU to reduce memory usage, in forward and backward passes.
@@ -157,15 +163,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
 
-        if args.use_ramtorch:
-            logger.info("Applying RamTorch to FLUX model.")
-            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
-            if self.use_clip_l and not args.cache_text_encoder_outputs:
-                clip_l = apply_ramtorch_to_module(clip_l, "clip_l", accelerator.device, weight_dtype)
-
-            # No need for ramtorch if caching
-            if not args.cache_text_encoder_outputs:
-                t5xxl = apply_ramtorch_to_module(t5xxl, "t5xxl", accelerator.device, t5xxl.dtype)
+        if args.use_ramtorch and not args.cache_text_encoder_outputs:
+            clip_l = apply_ramtorch_to_module(clip_l, "clip_l", accelerator.device, weight_dtype)
+            t5xxl = apply_ramtorch_to_module(t5xxl, "t5xxl", accelerator.device, t5xxl.dtype)
 
         model_version = flux_utils.MODEL_VERSION_FLUX_V1 if self.model_type != "chroma" else flux_utils.MODEL_VERSION_CHROMA
         return model_version, [clip_l, t5xxl], ae, model

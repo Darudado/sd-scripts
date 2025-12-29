@@ -58,6 +58,8 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         if args.max_token_length is not None:
             logger.warning("max_token_length is not used in Flux training / max_token_lengthはFluxのトレーニングでは使用されません")
 
+        args.blocks_to_swap = int(getattr(args, "blocks_to_swap", 0))
+
         assert (
             args.blocks_to_swap is None or args.blocks_to_swap == 0
         ) or not args.cpu_offload_checkpointing, "blocks_to_swap is not supported with cpu_offload_checkpointing / blocks_to_swapはcpu_offload_checkpointingと併用できません"
@@ -105,6 +107,11 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
                     " / SD3モデルをfp8に変換しています。これには時間がかかる場合があります。fp8チェックポイントを使用することで時間を短縮できます。"
                 )
                 mmdit.to(torch.float8_e4m3fn)
+
+        if args.use_ramtorch:
+            logger.info("Applying RamTorch to SD3 model.")
+            mmdit = apply_ramtorch_to_module(mmdit, "unet/dit", accelerator.device, mmdit.dtype)
+
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
         if self.is_swapping_blocks:
             # Swap blocks between CPU and GPU to reduce memory usage, in forward and backward passes.
@@ -142,9 +149,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
             args.vae, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors, state_dict=state_dict
         )
 
-        if args.use_ramtorch:
-            logger.info("Applying RamTorch to SD3 model.")
-            mmdit = apply_ramtorch_to_module(mmdit, "unet/dit", accelerator.device, mmdit.dtype)
+        if args.use_ramtorch and not args.cache_text_encoder_outputs:
             clip_l = apply_ramtorch_to_module(clip_l, "clip_l", accelerator.device, weight_dtype)
             clip_g = apply_ramtorch_to_module(clip_g, "clip_g", accelerator.device, weight_dtype)
             t5xxl = apply_ramtorch_to_module(t5xxl, "t5xxl", accelerator.device, t5xxl.dtype)

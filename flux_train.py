@@ -79,6 +79,8 @@ def train(args):
         )
         args.gradient_checkpointing = True
 
+    args.blocks_to_swap = int(getattr(args, "blocks_to_swap", 0))
+
     assert (
         args.blocks_to_swap is None or args.blocks_to_swap == 0
     ) or not args.cpu_offload_checkpointing, (
@@ -283,8 +285,10 @@ def train(args):
 
     # backward compatibility
     if args.blocks_to_swap is None:
-        blocks_to_swap = args.double_blocks_to_swap or 0
-        if args.single_blocks_to_swap is not None:
+        args.double_blocks_to_swap = int(getattr(args,"double_blocks_to_swap", 0))
+        args.single_blocks_to_swap = int(getattr(args,"single_blocks_to_swap", 0))
+        blocks_to_swap = args.double_blocks_to_swap
+        if args.single_blocks_to_swap is not None and args.single_blocks_to_swap > 0:
             blocks_to_swap += args.single_blocks_to_swap // 2
         if blocks_to_swap > 0:
             logger.warning(

@@ -980,8 +980,9 @@ class NetworkTrainer:
         self.assert_extra_args(args, train_dataset_group, val_dataset_group)  # may change some args
 
         # acceleratorを準備する
-        logger.info("preparing accelerator")
+        logger.info(f"preparing accelerator")
         accelerator = train_util.prepare_accelerator(args)
+        logger.info(f"prepared accelerator on {accelerator.device}")
         is_main_process = accelerator.is_main_process
 
         # mixed precisionに対応した型を用意しておき適宜castする
