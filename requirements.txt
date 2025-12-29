@@ -35,7 +35,7 @@ matplotlib~=3.10.8
 scipy~=1.16.3
 RamTorch @ git+https://github.com/67372a/RamTorch
 customized-optimizers @ git+https://github.com/67372a/customized-optimizers
-lycoris-lora @ git+https://github.com/67372a/LyCORIS
+lycoris-lora @ git+https://github.com/67372a/LyCORIS@dev
 PyWavelets~=1.9.0
 # for Image utils
 imagesize~=1.4.1
