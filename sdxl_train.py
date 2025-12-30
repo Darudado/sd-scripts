@@ -825,46 +825,45 @@ def train(args):
                     latents = latents - args.vae_shift_factor
                 latents = latents * args.vae_scale_factor
 
+                text_encoder_conds = []
+                masks_reshaped = []
                 text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
                 if text_encoder_outputs_list is not None:
-                    # Text Encoder outputs are cached
-                    if len(text_encoder_outputs_list) == 5:
-                        encoder_hidden_states1, encoder_hidden_states2, pool2, mask1, mask2 = text_encoder_outputs_list
-                        mask1 = mask1.to(accelerator.device, dtype=weight_dtype)
-                        mask2 = mask2.to(accelerator.device, dtype=weight_dtype)
-                    else:
-                        encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoder_outputs_list
-                        mask1 = None
-                        mask2 = None
-                    encoder_hidden_states1 = encoder_hidden_states1.to(accelerator.device, dtype=weight_dtype)
-                    encoder_hidden_states2 = encoder_hidden_states2.to(accelerator.device, dtype=weight_dtype)
-                    pool2 = pool2.to(accelerator.device, dtype=weight_dtype)
-                else:
-                    input_ids1, input_ids2 = batch["input_ids_list"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
+                    text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
+                    masks_reshaped = text_encoder_outputs_list[3:]
+
+                if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or args.train_text_encoder:
+                    # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
+                    with torch.set_grad_enabled(args.train_text_encoder), accelerator.autocast():
                         # Get the text embedding for conditioning
                         if args.weighted_captions:
                             input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
-                            encoder_hidden_states1, encoder_hidden_states2, pool2 = (
-                                text_encoding_strategy.encode_tokens_with_weights(
-                                    tokenize_strategy,
-                                    [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
-                                    input_ids_list,
-                                    weights_list,
-                                )
-                            )
-                        else:
-                            input_ids1 = input_ids1.to(accelerator.device)
-                            input_ids2 = input_ids2.to(accelerator.device)
-                            encoder_hidden_states1, encoder_hidden_states2, pool2, mask1, mask2 = text_encoding_strategy.encode_tokens(
+                            encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
                                 tokenize_strategy,
                                 [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
-                                [input_ids1, input_ids2],
+                                input_ids_list,
+                                weights_list,
+                            )
+                        else:
+                            input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
+                            masks = [mask.to(accelerator.device) for mask in batch["attn_mask_list"]]
+                            encoded_text_encoder_conds, masks_reshaped = text_encoding_strategy.encode_tokens(
+                                tokenize_strategy,
+                                [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
+                                input_ids,
+                                attn_masks=masks,
                             )
                         if args.full_fp16:
-                            encoder_hidden_states1 = encoder_hidden_states1.to(weight_dtype)
-                            encoder_hidden_states2 = encoder_hidden_states2.to(weight_dtype)
-                            pool2 = pool2.to(weight_dtype)
+                            encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+
+                    # if text_encoder_conds is not cached, use encoded_text_encoder_conds
+                    if len(text_encoder_conds) == 0:
+                        text_encoder_conds = encoded_text_encoder_conds
+                    else:
+                        # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
+                        for i in range(len(encoded_text_encoder_conds)):
+                            if encoded_text_encoder_conds[i] is not None:
+                                text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
                 # get size embeddings
                 orig_size = batch["original_sizes_hw"]
@@ -873,6 +872,7 @@ def train(args):
                 embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
 
                 # concat embeddings
+                encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoder_conds
                 vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
                 text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
@@ -896,7 +896,7 @@ def train(args):
 
                 # Predict the noise residual
                 with accelerator.autocast():
-                    noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding, mask1)
+                    noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding, encoder_attention_mask=masks_reshaped[1])
 
                 if args.flow_model:
                     target = noise - latents
