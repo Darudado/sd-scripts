@@ -26,7 +26,7 @@ from library import config_util, model_util, sdxl_train_util, train_util
 from library.config_util import BlueprintGenerator, ConfigSanitizer
 from copy import deepcopy
 
-from library.train_util import IMAGE_TRANSFORMS, load_image, save_latents_to_disk, trim_and_resize_if_required
+from library.train_util import IMAGE_TRANSFORMS, load_image, trim_and_resize_if_required
 from library.utils import add_logging_arguments, setup_logging
 
 setup_logging()
@@ -56,6 +56,46 @@ def build_dataset_group(args, tokenizers):
 
     train_dataset_group.verify_bucket_reso_steps(32)
     return train_dataset_group
+
+def save_latents_to_disk(
+    npz_path,
+    latents_tensor,
+    original_size,
+    crop_ltrb,
+    flipped_latents_tensor=None,
+    alpha_mask=None,
+    key_reso_suffix="",
+):
+    """
+    Args:
+        npz_path (str): Path to the npz file.
+        latents_tensor (torch.Tensor): Latent tensor
+        original_size (List[int]): Original size of the image
+        crop_ltrb (List[int]): Crop left top right bottom
+        flipped_latents_tensor (Optional[torch.Tensor]): Flipped latent tensor
+        alpha_mask (Optional[torch.Tensor]): Alpha mask
+        key_reso_suffix (str): Key resolution suffix
+
+    Returns:
+        None
+    """
+    kwargs = {}
+
+    if os.path.exists(npz_path):
+        # load existing npz and update it
+        npz = np.load(npz_path)
+        for key in npz.files:
+            kwargs[key] = npz[key]
+
+    # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
+    kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
+    kwargs["original_size" + key_reso_suffix] = np.array(original_size)
+    kwargs["crop_ltrb" + key_reso_suffix] = np.array(crop_ltrb)
+    if flipped_latents_tensor is not None:
+        kwargs["latents_flipped" + key_reso_suffix] = flipped_latents_tensor.float().cpu().numpy()
+    if alpha_mask is not None:
+        kwargs["alpha_mask" + key_reso_suffix] = alpha_mask.float().cpu().numpy()
+    np.savez(npz_path, **kwargs)
 
 
 class ShardSampler(Sampler[int]):
