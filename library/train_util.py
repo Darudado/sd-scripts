@@ -5453,7 +5453,7 @@ def get_optimizer(args, trainable_params, optimizer_kwargs: Dict = {}) -> tuple[
 
 
 def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) -> Tuple[Callable, Callable]:
-    if not is_schedulefree_optimizer(optimizer, args) or getattr(args,"fused_optimizer_groups", False):
+    if not is_schedulefree_optimizer(optimizer, args) or getattr(args, "fused_optimizer_groups", False):
         # return dummy func
         return lambda: None, lambda: None
 

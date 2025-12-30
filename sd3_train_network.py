@@ -58,7 +58,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         if args.max_token_length is not None:
             logger.warning("max_token_length is not used in Flux training / max_token_lengthはFluxのトレーニングでは使用されません")
 
-        args.blocks_to_swap = int(getattr(args, "blocks_to_swap", 0))
+        args.blocks_to_swap = utils.getattr_cast(args, "blocks_to_swap", 0)
 
         assert (
             args.blocks_to_swap is None or args.blocks_to_swap == 0
