@@ -447,8 +447,6 @@ def cache_latents(args: argparse.Namespace) -> None:
         logger.error("No images were loaded from the dataset. Please check your dataset_config.")
         return
 
-    logger.info(f"train_dataset_group={train_dataset_group}")
-
     # prepare accelerator and VAE
     logger.info("prepare accelerator")
     args.deepspeed = False
