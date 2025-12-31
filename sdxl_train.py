@@ -1197,17 +1197,6 @@ def setup_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--use_ramtorch",
-        action="store_true",
-        help="Use RamTorch to reduce GPU memory usage by keeping base/original linear model weights in system RAM for UNET and TEs.",
-    )
-
-    parser.add_argument(
-        "--use_ramtorch_vae",
-        action="store_true",
-        help="Use RamTorch to reduce GPU memory usage by keeping linear weights in system RAM for VAE.",
-    )
-    parser.add_argument(
         "--flow_model",
         action="store_true",
         help="enable Rectified Flow training objective instead of standard diffusion / 通常の拡散ではなくRectified Flowで学習する",

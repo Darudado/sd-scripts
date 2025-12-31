@@ -49,10 +49,10 @@ def build_dataset_group(args, tokenizers):
             raise ValueError("--dataset_config is required for caching latents")
 
         blueprint = blueprint_generator.generate(user_config, args, tokenizer=tokenizers)
-        train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        train_dataset_group, _ = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     else:
         # fallback for arbitrary dataset classes
-        train_dataset_group = train_util.load_arbitrary_dataset(args, tokenizers)
+        train_dataset_group, _ = train_util.load_arbitrary_dataset(args, tokenizers)
 
     train_dataset_group.verify_bucket_reso_steps(32)
     return train_dataset_group
@@ -274,6 +274,12 @@ def cache_latents_fast(dataset, vae, accelerator, args):
         leave=True,
     )
 
+    fast_autocast_dtype = torch.float32
+    if args.fast_autocast_dtype == "fp16":
+        fast_autocast_dtype = torch.float16
+    elif args.fast_autocast_dtype == "bf16":
+        fast_autocast_dtype = torch.bfloat16
+
     for condition, batch_infos in iterator:
         if stop_event.is_set():
             logger.info("Interrupt received; stopping after current batch.")
@@ -296,7 +302,7 @@ def cache_latents_fast(dataset, vae, accelerator, args):
             random_crop=condition.random_crop,
             device=device,
             non_blocking=True,
-            autocast_dtype=args.fast_autocast_dtype,
+            autocast_dtype=fast_autocast_dtype,
         )
 
         for i, (info, original_size, crop_ltrb, alpha_mask) in enumerate(
@@ -425,6 +431,9 @@ def cache_latents(args: argparse.Namespace) -> None:
     setup_logging(args, reset=True)
     train_util.prepare_dataset_args(args, True)
 
+    # Just force to true, caching to disk is the only valid approach
+    args.cache_latents_to_disk = True
+
     assert args.cache_latents_to_disk, "cache_latents_to_disk must be True"
 
     if args.seed is not None:
@@ -437,6 +446,8 @@ def cache_latents(args: argparse.Namespace) -> None:
     if len(train_dataset_group) == 0:
         logger.error("No images were loaded from the dataset. Please check your dataset_config.")
         return
+
+    logger.info(f"train_dataset_group={train_dataset_group}")
 
     # prepare accelerator and VAE
     logger.info("prepare accelerator")
