@@ -15,6 +15,7 @@ init_ipex()
 
 from library import flux_models, flux_train_utils, flux_utils, sd3_train_utils, sd3_utils, strategy_base, strategy_sd3, train_util
 import train_network
+from library import utils
 from library.utils import setup_logging
 
 setup_logging()
