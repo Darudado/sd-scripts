@@ -52,7 +52,7 @@ def build_dataset_group(args, tokenizers):
         train_dataset_group, _ = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     else:
         # fallback for arbitrary dataset classes
-        train_dataset_group, _ = train_util.load_arbitrary_dataset(args, tokenizers)
+        train_dataset_group = train_util.load_arbitrary_dataset(args, tokenizers)
 
     train_dataset_group.verify_bucket_reso_steps(32)
     return train_dataset_group
