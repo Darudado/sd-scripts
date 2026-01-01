@@ -256,6 +256,7 @@ class NetworkTrainer:
             t_enc.to(accelerator.device, dtype=weight_dtype)
 
     def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, text_masks, batch, weight_dtype, **kwargs):
+        noisy_latents = noisy_latents.to(weight_dtype)
         noise_pred = unet(noisy_latents, timesteps, text_conds[0], text_masks).sample
         return noise_pred
 
@@ -317,7 +318,6 @@ class NetworkTrainer:
             args, noise_scheduler, latents, fixed_timesteps=fixed_timesteps, is_train=is_train, pixel_counts=pixel_counts
         )
 
-
         # ensure the hidden state will require grad
         if is_train and args.gradient_checkpointing:
             for x in noisy_latents:
@@ -338,6 +338,10 @@ class NetworkTrainer:
                 batch,
                 weight_dtype,
             )
+
+        # Upcast for grokking
+        latents = latents.to(torch.float64)
+        noise = noise.to(torch.float64)
 
         if getattr(args, "flow_model", False):
             target = noise - latents

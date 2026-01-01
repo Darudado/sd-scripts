@@ -898,6 +898,10 @@ def train(args):
                 with accelerator.autocast():
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding, encoder_attention_mask=masks_reshaped[1])
 
+                # Upcast for grokking
+                latents = latents.to(torch.float64)
+                noise = noise.to(torch.float64)
+
                 if args.flow_model:
                     target = noise - latents
                 elif args.v_parameterization:
@@ -905,7 +909,7 @@ def train(args):
                 else:
                     target = noise
 
-                # Cast to float64 (Double Precision) for Grokking
+                # Upcast for grokking
                 noise_pred = noise_pred.to(dtype=torch.float64)
                 target = target.to(dtype=torch.float64)
 
