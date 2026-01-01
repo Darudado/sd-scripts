@@ -6627,12 +6627,9 @@ def soft_welsch_loss(predictions:torch.Tensor,
     return loss
 
 # Inspired by Grokking at the Edge of Numerical Stability (https://arxiv.org/abs/2501.04697)
-def stable_mse_loss(predictions, targets, reduction="mean", eps=1e-37):
+def stable_mse_loss(predictions, targets, reduction="mean"):
     differences = predictions.to(torch.float64) - targets.to(torch.float64)
     squared_differences = differences ** 2
-
-    # Add eps to address underflows due to squaring
-    squared_differences = squared_differences.add(eps)
 
     if reduction == "mean":
         loss = torch.mean(squared_differences)
@@ -6666,7 +6663,7 @@ def stable_log_cosh_loss(predictions, targets, reduction='mean'):
     return loss
     
 def stable_msle_loss(predictions, targets, reduction='mean'):
-    msle = torch.square(torch.log(targets + 1) - torch.log(predictions + 1))
+    msle = torch.square(torch.log(targets.to(torch.float64) + 1.0) - torch.log(predictions.to(torch.float64) + 1.0))
 
     if reduction == "mean":
         loss = torch.mean(msle)
@@ -6680,7 +6677,7 @@ def stable_msle_loss(predictions, targets, reduction='mean'):
 
 def x_sigmoid_loss(predictions, targets, reduction="mean"):
     # Compute at float64
-    differences = predictions - targets
+    differences = predictions.to(torch.float64) - targets.to(torch.float64)
     sigmoid_differences = 2 * differences * torch.sigmoid(differences) - differences
     if reduction == "mean":
         loss = torch.mean(sigmoid_differences)
@@ -6692,7 +6689,7 @@ def x_sigmoid_loss(predictions, targets, reduction="mean"):
         raise ValueError(f"Unsupported reduction type: {reduction}")
     return loss
 
-def stable_pseudo_huber_loss(predictions, targets, delta=1.0, reduction="mean", eps: float = 1e-37):
+def stable_pseudo_huber_loss(predictions, targets, delta=1.0, reduction="mean"):
     """
     Compute the Pseudo-Huber loss between true values and predictions.
 
@@ -6712,7 +6709,7 @@ def stable_pseudo_huber_loss(predictions, targets, delta=1.0, reduction="mean", 
     differences = predictions.to(torch.float64) - targets.to(torch.float64)
 
     # Compute the loss
-    loss = delta**2 * (torch.sqrt(1 + (differences / delta)**2 + eps) - 1)
+    loss = delta**2 * (torch.sqrt(1 + (differences / delta)**2) - 1)
     
     # Apply the specified reduction method
     if reduction == "mean":
@@ -6729,14 +6726,10 @@ def scaled_quadratic_loss(
     predictions: torch.Tensor,
     targets: torch.Tensor,
     delta: float = 1.0,
-    reduction: str = 'mean',
-    eps: float = 1e-37,
+    reduction: str = 'mean'
 ) -> torch.Tensor:
     r = predictions.to(torch.float64) - targets.to(torch.float64)
     loss = (r / delta)**2
-
-    # Add eps to address underflows due to squaring
-    loss = loss.add(eps)
     
     if reduction == "mean":
         loss = torch.mean(loss)
@@ -6752,7 +6745,7 @@ def standard_deviation_loss(
         predictions: torch.Tensor,
         targets: torch.Tensor,
         reduction: str = 'mean',
-        eps: float = 1e-30) -> torch.Tensor:
+        eps: float = 1e-100) -> torch.Tensor:
     """
     Calculate standard deviation loss between predicted and true values.
     
@@ -6766,7 +6759,7 @@ def standard_deviation_loss(
         torch.Tensor: The standard deviation loss
     """
     n = predictions.size(0)
-    squared_diff = (predictions - targets) ** 2
+    squared_diff = (predictions.to(torch.float64) - targets.to(torch.float64)) ** 2
     mean_squared_diff = torch.sum(squared_diff) / n
     mean_squared_diff_sqrt = torch.sqrt(mean_squared_diff + eps)
 
@@ -6784,8 +6777,7 @@ def smooth_l2_log_loss(
      predictions: torch.Tensor,
      targets: torch.Tensor,
      delta: float = 1.0,
-     reduction: str = 'mean',
-     eps=1e-37
+     reduction: str = 'mean'
  ) -> torch.Tensor:
     """
     Functional version of the smooth l2->log loss.
@@ -6800,9 +6792,8 @@ def smooth_l2_log_loss(
         Loss tensor of shape () if reduction is 'mean' or 'sum',
         or same shape as inputs if reduction is 'none'
     """
-    r = predictions - targets
+    r = predictions.to(torch.float64) - targets.to(torch.float64)
     delta_squared = delta ** 2
-    delta_squared = delta_squared + eps
     loss = 0.5 * delta_squared * torch.log1p(r ** 2 / delta_squared)
 
     if reduction == "mean":
@@ -6816,7 +6807,7 @@ def smooth_l2_log_loss(
     return loss
  
 
-def stable_smooth_l1_loss(predictions, targets, reduction: str = 'mean', beta=1.0, eps=1e-37):
+def stable_smooth_l1_loss(predictions, targets, reduction: str = 'mean', beta=1.0):
     """
     Custom implementation of Smooth L1 Loss
     
@@ -6833,9 +6824,6 @@ def stable_smooth_l1_loss(predictions, targets, reduction: str = 'mean', beta=1.
     
     # Where diff < beta, use quadratic form
     quadratic = 0.5 * diff.pow(2) / beta
-
-    # Add eps to address underflows due to squaring
-    loss = quadratic.add(eps)
     
     # Where diff >= beta, use linear form
     linear = diff - 0.5 * beta
@@ -6855,12 +6843,12 @@ def stable_smooth_l1_loss(predictions, targets, reduction: str = 'mean', beta=1.
     return loss
 
 
-def stable_huber_loss(predictions, targets, reduction: str = 'mean', delta=1.0, eps=1e-37):
+def stable_huber_loss(predictions, targets, reduction: str = 'mean', delta=1.0):
     diff = torch.abs(predictions.to(torch.float64) - targets.to(torch.float64))
     abs_error = torch.abs(diff)
     
     # For small errors (≤ delta): use squared error (L2)
-    quadratic = 0.5 * diff.pow(2) + eps
+    quadratic = 0.5 * diff.pow(2)
     
     # For large errors (> delta): use modified absolute error (L1)
     linear = delta * (abs_error - 0.5 * delta)
@@ -6879,11 +6867,9 @@ def stable_huber_loss(predictions, targets, reduction: str = 'mean', delta=1.0, 
         raise ValueError(f"Unsupported reduction type: {reduction}")
     return loss
 
-def stable_l1_loss(predictions, targets, reduction: str = 'mean', eps=1e-37):
+def stable_l1_loss(predictions, targets, reduction: str = 'mean'):
     loss = torch.abs(predictions.to(torch.float64) - targets.to(torch.float64))
 
-    loss = loss.add(eps)
-    
     # Return loss
     if reduction == "mean":
         loss = torch.mean(loss)
@@ -6901,12 +6887,8 @@ def conditional_loss(
     loss_type: str, 
     reduction: str,
     huber_c: Optional[torch.Tensor] = None,
-    eps: float = None,
     scale: float = 1.0,
 ):
-    if eps is None or eps <= 0.0:
-        eps = torch.finfo(torch.float32).tiny
-
     model_pred = model_pred.to(torch.float64)
     target = target.to(torch.float64)
 
@@ -6916,37 +6898,37 @@ def conditional_loss(
         huber_c_reshaped = huber_c
 
     if loss_type == "l2":
-        loss = stable_mse_loss(model_pred, target, reduction="none", eps=eps)
+        loss = stable_mse_loss(model_pred, target, reduction="none")
     elif loss_type == "l1":
-        loss = stable_l1_loss(model_pred, target, reduction="none", eps=eps)
+        loss = stable_l1_loss(model_pred, target, reduction="none")
     elif loss_type == "standard_pseudo_huber":
-        loss = stable_pseudo_huber_loss(model_pred, target, delta=huber_c_reshaped, reduction="none", eps=eps)
+        loss = stable_pseudo_huber_loss(model_pred, target, delta=huber_c_reshaped, reduction="none")
     elif loss_type == "standard_huber":
-        loss = stable_huber_loss(model_pred, target, reduction="none", delta=huber_c_reshaped, eps=eps)
+        loss = stable_huber_loss(model_pred, target, reduction="none", delta=huber_c_reshaped)
     elif loss_type == "standard_smooth_l1":
-        loss = stable_smooth_l1_loss(model_pred, target, reduction="none", beta=huber_c_reshaped, eps=eps)
+        loss = stable_smooth_l1_loss(model_pred, target, reduction="none", beta=huber_c_reshaped)
     elif loss_type == "huber":
-        loss = 2 * huber_c_reshaped * (torch.sqrt(((model_pred - target)**2 + eps) + huber_c_reshaped**2) - huber_c_reshaped)
+        loss = 2 * huber_c_reshaped * (torch.sqrt(((model_pred - target)**2) + huber_c_reshaped**2) - huber_c_reshaped)
     elif loss_type == "smooth_l1":
-        loss = 2 * (torch.sqrt(((model_pred - target)**2 + eps) + huber_c_reshaped**2) - huber_c_reshaped)
+        loss = 2 * (torch.sqrt(((model_pred - target)**2) + huber_c_reshaped**2) - huber_c_reshaped)
     elif loss_type == "x_sigmoid":
-        loss = x_sigmoid_loss(model_pred, target, reduction="none").add(eps)
+        loss = x_sigmoid_loss(model_pred, target, reduction="none")
     elif loss_type == "log_cosh":
-        loss = stable_log_cosh_loss(model_pred, target, reduction="none").add(eps)
+        loss = stable_log_cosh_loss(model_pred, target, reduction="none")
     elif loss_type == "squared_logarithmic":
-        loss = stable_msle_loss(model_pred, target, reduction="none").add(eps)
+        loss = stable_msle_loss(model_pred, target, reduction="none")
     elif loss_type == "soft_welsch":
         loss = soft_welsch_loss(model_pred, target, reduction="none", delta=huber_c_reshaped, scale=scale)
     elif loss_type == "scaled_quadratic":
-        loss = scaled_quadratic_loss(model_pred, target, reduction="none", delta=huber_c_reshaped, eps=eps)
+        loss = scaled_quadratic_loss(model_pred, target, reduction="none", delta=huber_c_reshaped)
     elif loss_type == "standard_deviation_loss":
-        loss = standard_deviation_loss(model_pred, target, reduction="none", eps=eps)
+        loss = standard_deviation_loss(model_pred, target, reduction="none")
     elif loss_type == "psnr_loss":
-        loss = kornia.losses.psnr_loss(model_pred, target, 1.0).add(eps)
+        loss = kornia.losses.psnr_loss(model_pred, target, 1.0)
     elif loss_type == "geman_mcclure_loss":
-        loss = kornia.losses.geman_mcclure_loss(model_pred, target).add(eps)
+        loss = kornia.losses.geman_mcclure_loss(model_pred, target)
     elif loss_type == "smooth_l2_log":
-        loss = smooth_l2_log_loss(model_pred, target, reduction="none", delta=huber_c_reshaped, eps=eps)
+        loss = smooth_l2_log_loss(model_pred, target, reduction="none", delta=huber_c_reshaped)
     else:
         raise NotImplementedError(f"Unsupported Loss Type: {loss_type}")
     

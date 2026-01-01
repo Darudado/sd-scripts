@@ -16,8 +16,8 @@ def normalize(x: torch.Tensor, dim=None, eps=1e-4, dtype=torch.float32) -> torch
 class FourierFeatureExtractor(torch.nn.Module):
     def __init__(self, num_channels, bandwidth=1, dtype=torch.float32):
         super().__init__()
-        self.register_buffer('freqs', 2 * np.pi * torch.randn(num_channels) * bandwidth)
-        self.register_buffer('phases', 2 * np.pi * torch.rand(num_channels))
+        self.register_buffer('freqs', 2 * np.pi * torch.randn(num_channels, dtype=dtype) * bandwidth)
+        self.register_buffer('phases', 2 * np.pi * torch.rand(num_channels, dtype=dtype))
         self.dtype=dtype
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -31,7 +31,7 @@ class NormalizedLinearLayer(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel=(), dtype=torch.float32):
         super().__init__()
         self.out_channels = out_channels
-        self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, *kernel))
+        self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, *kernel, dtype=dtype))
         self.dtype=dtype
 
     def forward(self, x: torch.Tensor, gain=1) -> torch.Tensor:

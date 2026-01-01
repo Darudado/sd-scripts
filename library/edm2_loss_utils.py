@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 def prepare_edm2_loss_weighting(args, noise_scheduler, accelerator):
     if args.edm2_loss_weighting:
+        handle_conflicting_configuration(args)
         values = args.edm2_loss_weighting_optimizer.split(".")
         optimizer_module = importlib.import_module(".".join(values[:-1]))
         case_sensitive_optimizer_type = values[-1]

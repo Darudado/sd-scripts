@@ -905,6 +905,10 @@ def train(args):
                 else:
                     target = noise
 
+                # Cast to float64 (Double Precision) for Grokking
+                noise_pred = noise_pred.to(dtype=torch.float64)
+                target = target.to(dtype=torch.float64)
+
                 huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
                 if (
                     args.min_snr_gamma
@@ -914,7 +918,7 @@ def train(args):
                     or args.masked_loss
                 ):
                     # do not mean over batch dimension for snr weight or scale v-pred loss
-                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, scale=float(args.loss_scale))
+                    loss = train_util.conditional_loss(noise_pred, target, args.loss_type, "none", huber_c, scale=float(args.loss_scale))
                     if args.contrastive_flow_matching and latents.size(0) > 1:
                         negative_latents = latents.roll(1, 0)
                         negative_noise = noise.roll(1, 0)
@@ -923,8 +927,12 @@ def train(args):
                                 target_negative = negative_noise - negative_latents
                             else:
                                 target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
+
+                        # Cast to float64 (Double Precision) for Grokking
+                        target_negative = target_negative.to(dtype=torch.float64)
+
                         loss_contrastive = torch.nn.functional.mse_loss(
-                            noise_pred.float(), target_negative.float(), reduction="none"
+                            noise_pred, target_negative, reduction="none"
                         )
                         loss = loss - float(args.cfm_lambda) * loss_contrastive
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
@@ -942,7 +950,7 @@ def train(args):
 
                     loss = loss.mean()
                 else:
-                    per_pixel_loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "mean", huber_c, scale=float(args.loss_scale))
+                    per_pixel_loss = train_util.conditional_loss(noise_pred, target, args.loss_type, "mean", huber_c, scale=float(args.loss_scale))
                     if args.contrastive_flow_matching and latents.size(0) > 1:
                         negative_latents = latents.roll(1, 0)
                         negative_noise = noise.roll(1, 0)
@@ -951,8 +959,12 @@ def train(args):
                                 target_negative = negative_noise - negative_latents
                             else:
                                 target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
+
+                        # Cast to float64 (Double Precision) for Grokking
+                        target_negative = target_negative.to(dtype=torch.float64)
+
                         loss_contrastive = torch.nn.functional.mse_loss(
-                            noise_pred.float(), target_negative.float(), reduction="none"
+                            noise_pred, target_negative, reduction="none"
                         )
                         per_pixel_loss = per_pixel_loss - float(args.cfm_lambda) * loss_contrastive
                     loss = per_pixel_loss.mean()

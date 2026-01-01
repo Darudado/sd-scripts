@@ -525,12 +525,16 @@ class NetworkTrainer:
             is_train=is_train,
         )
 
+        # Cast to float64 (Double Precision) for Grokking
+        noise_pred = noise_pred.to(dtype=torch.float64)
+        target = target.to(dtype=torch.float64)
+
         if is_train:
             if args.differential_guidance:
                 target = noise_pred + (float(args.differential_guidance_scale) * (target - noise_pred))
 
             huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-            loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, scale=float(args.loss_scale))
+            loss = train_util.conditional_loss(noise_pred, target, args.loss_type, "none", huber_c, scale=float(args.loss_scale))
             if weighting is not None:
                 loss = loss * weighting
 
@@ -542,14 +546,18 @@ class NetworkTrainer:
                         target_negative = negative_noise - negative_latents
                     else:
                         target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
+                
+                # Handle cast for CFM
+                target_negative = target_negative.to(dtype=torch.float64)
+                
                 loss_contrastive = torch.nn.functional.mse_loss(
-                    noise_pred.float(), target_negative.float(), reduction="none"
+                    noise_pred, target_negative, reduction="none"
                 )
                 loss = loss - float(args.cfm_lambda) * loss_contrastive
             if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                 loss = apply_masked_loss(loss, batch)
         else:
-                loss = train_util.conditional_loss(noise_pred.float(), target.float(), "l2", "none", None)
+                loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
         loss = loss.mean([1, 2, 3])
 
         if is_train:
@@ -685,7 +693,11 @@ class NetworkTrainer:
                     is_train=False,
                 )
 
-                loss = train_util.conditional_loss(noise_pred.float(), target.float(), "l2", "none", None)
+                # Cast to float64 (Double Precision) for Grokking
+                noise_pred = noise_pred.to(dtype=torch.float64)
+                target = target.to(dtype=torch.float64)
+
+                loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
                 loss = loss.mean([1, 2, 3])
                 loss = loss.mean()
                 total_loss += loss
