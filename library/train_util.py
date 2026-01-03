@@ -442,6 +442,7 @@ class BaseSubset:
         token_warmup_min: int,
         token_warmup_step: Union[float, int],
         custom_attributes: Optional[Dict[str, Any]] = None,
+        protected_tags_file: Optional[str] = None,
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
@@ -470,6 +471,7 @@ class BaseSubset:
         self.token_warmup_step = token_warmup_step  # N（N<1ならN*max_train_steps）ステップ目でタグの数が最大になる
 
         self.custom_attributes = custom_attributes if custom_attributes is not None else {}
+        self.protected_tags_file = protected_tags_file
 
         self.img_count = 0
 
@@ -509,6 +511,7 @@ class DreamBoothSubset(BaseSubset):
         token_warmup_min,
         token_warmup_step,
         custom_attributes: Optional[Dict[str, Any]] = None,
+        protected_tags_file: Optional[str] = None,
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
@@ -538,6 +541,7 @@ class DreamBoothSubset(BaseSubset):
             token_warmup_min,
             token_warmup_step,
             custom_attributes=custom_attributes,
+            protected_tags_file=protected_tags_file,
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
@@ -583,6 +587,7 @@ class FineTuningSubset(BaseSubset):
         token_warmup_min,
         token_warmup_step,
         custom_attributes: Optional[Dict[str, Any]] = None,
+        protected_tags_file: Optional[str] = None,
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
@@ -612,6 +617,7 @@ class FineTuningSubset(BaseSubset):
             token_warmup_min,
             token_warmup_step,
             custom_attributes=custom_attributes,
+            protected_tags_file=protected_tags_file,
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
@@ -652,6 +658,7 @@ class ControlNetSubset(BaseSubset):
         token_warmup_min,
         token_warmup_step,
         custom_attributes: Optional[Dict[str, Any]] = None,
+        protected_tags_file: Optional[str] = None,
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
@@ -681,6 +688,7 @@ class ControlNetSubset(BaseSubset):
             token_warmup_min,
             token_warmup_step,
             custom_attributes=custom_attributes,
+            protected_tags_file=protected_tags_file,
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
@@ -925,13 +933,34 @@ class BaseDataset(torch.utils.data.Dataset):
                     )
                     flex_tokens = flex_tokens[:tokens_len]
 
-                if not hasattr(self, "_protected_tags"):
-                    self._protected_tags = set()
-                    if hasattr(self, "protected_tags_file") and self.protected_tags_file and os.path.exists(self.protected_tags_file):
-                        logger.info(f"Loading protected tags from {self.protected_tags_file}")
+                logger.warning("Processing protected tags")
+                if not hasattr(subset, "_protected_tags"):
+                    logger.warning("INSIDE PROTECTED TAGS")
+                    subset._protected_tags = set()
+                    
+                    # subset-specific first
+                    if hasattr(subset, "protected_tags_file") and subset.protected_tags_file:
+                        logger.warning("INSIDE PROTECTED TAGS 2")
+
+                        protected_file = subset.protected_tags_file
+                        if os.path.exists(protected_file):
+                            logger.info(f"[Subset '{subset.image_dir}'] Loading protected tags from: {protected_file}")
+                            with open(protected_file, "r", encoding="utf-8") as f:
+                                subset._protected_tags = {line.strip().lower() for line in f if line. strip()}
+                            logger.info(f"[Subset '{subset.image_dir}'] Loaded {len(subset._protected_tags)} protected tags")
+                            # DEBUG: log first few tags
+                            if len(subset._protected_tags) > 0:
+                                sample_tags = sorted(list(subset._protected_tags))[:5]
+                                logger.info(f"[Subset '{subset.image_dir}'] Sample protected tags: {sample_tags}")
+                        else:
+                            logger.warning(f"[Subset '{subset.image_dir}'] Protected tags file not found: {protected_file}")
+                    # fallback to global protected tags file if no subset-specific file
+                    elif hasattr(self, "protected_tags_file") and self.protected_tags_file and os.path.exists(self.protected_tags_file):
+                        logger.info(f"[Subset '{subset.image_dir}'] Using global protected tags from: {self.protected_tags_file}")
                         with open(self.protected_tags_file, "r", encoding="utf-8") as f:
-                            self._protected_tags = {line.strip().lower() for line in f if line.strip()}
-                        logger.info(f"Loaded {len(self._protected_tags)} protected tags.")
+                            subset._protected_tags = {line.strip().lower() for line in f if line.strip()}
+                        logger.info(f"[Subset '{subset.image_dir}'] Loaded {len(subset._protected_tags)} protected tags (global)")
+                logger.warning("end processing protected tags")
 
                 log_tag_dropout = self.log_caption_tag_dropout and subset.caption_tag_dropout_rate > 0
 
@@ -942,7 +971,8 @@ class BaseDataset(torch.utils.data.Dataset):
                     protected_tokens = []
                     dropped_tokens = []
                     for token in tokens:
-                        is_protected = token.lower() in self._protected_tags
+                        # subset-specific protected tags
+                        is_protected = token.lower() in subset._protected_tags
                         if is_protected or random.random() >= subset.caption_tag_dropout_rate:
                             kept.append(token)
                             if record_details and is_protected:
@@ -2565,6 +2595,7 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_suffix,
                 subset.token_warmup_min,
                 subset.token_warmup_step,
+                protected_tags_file=subset.protected_tags_file,
                 resize_interpolation=subset.resize_interpolation,
             )
             db_subsets.append(db_subset)
