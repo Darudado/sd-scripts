@@ -1001,7 +1001,6 @@ def train(args):
 
                 if args.edm2_loss_weighting:
                     loss, loss_scaled = edm2_model(loss, timesteps)
-                    edm2_loss = loss.detach()
                     loss_scaled = loss_scaled.mean() # for logging
                 else:
                     loss_scaled = None
