@@ -933,34 +933,30 @@ class BaseDataset(torch.utils.data.Dataset):
                     )
                     flex_tokens = flex_tokens[:tokens_len]
 
-                logger.warning("Processing protected tags")
                 if not hasattr(subset, "_protected_tags"):
-                    logger.warning("INSIDE PROTECTED TAGS")
                     subset._protected_tags = set()
-                    
+
                     # subset-specific first
                     if hasattr(subset, "protected_tags_file") and subset.protected_tags_file:
-                        logger.warning("INSIDE PROTECTED TAGS 2")
 
                         protected_file = subset.protected_tags_file
                         if os.path.exists(protected_file):
                             logger.info(f"[Subset '{subset.image_dir}'] Loading protected tags from: {protected_file}")
                             with open(protected_file, "r", encoding="utf-8") as f:
                                 subset._protected_tags = {line.strip().lower() for line in f if line. strip()}
+
                             logger.info(f"[Subset '{subset.image_dir}'] Loaded {len(subset._protected_tags)} protected tags")
-                            # DEBUG: log first few tags
-                            if len(subset._protected_tags) > 0:
-                                sample_tags = sorted(list(subset._protected_tags))[:5]
-                                logger.info(f"[Subset '{subset.image_dir}'] Sample protected tags: {sample_tags}")
+                            if self.log_caption_tag_dropout and len(subset._protected_tags) > 0:
+                                logger.info(f"[Subset '{subset.image_dir}'] Protected tags: {subset._protected_tags}")
                         else:
                             logger.warning(f"[Subset '{subset.image_dir}'] Protected tags file not found: {protected_file}")
+
                     # fallback to global protected tags file if no subset-specific file
                     elif hasattr(self, "protected_tags_file") and self.protected_tags_file and os.path.exists(self.protected_tags_file):
                         logger.info(f"[Subset '{subset.image_dir}'] Using global protected tags from: {self.protected_tags_file}")
                         with open(self.protected_tags_file, "r", encoding="utf-8") as f:
                             subset._protected_tags = {line.strip().lower() for line in f if line.strip()}
                         logger.info(f"[Subset '{subset.image_dir}'] Loaded {len(subset._protected_tags)} protected tags (global)")
-                logger.warning("end processing protected tags")
 
                 log_tag_dropout = self.log_caption_tag_dropout and subset.caption_tag_dropout_rate > 0
 
