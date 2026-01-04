@@ -1010,7 +1010,7 @@ def train(args):
 
                 accelerator.backward(loss)
 
-                if args.use_ramtorch or args.use_ramtorch_network:
+                if args.use_ramtorch:
                     torch.cuda.synchronize()
 
                 edm2_loss = loss
