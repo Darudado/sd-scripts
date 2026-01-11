@@ -6,6 +6,10 @@ import os
 from multiprocessing import Value
 from typing import List
 import toml
+import itertools
+import ast
+import random
+import numpy as np
 
 from tqdm import tqdm
 
@@ -161,6 +165,42 @@ def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
         block_index += 1
 
     train_util.append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names)
+
+
+def switch_rng_state(val_seed: int, accelerator) -> tuple[torch.ByteTensor, torch.ByteTensor | None, tuple]:
+    cpu_rng_state = torch.get_rng_state()
+    python_rng_state = random.getstate()
+    numpy_rng_state = np.random.get_state()
+    if accelerator.device.type == "cuda":
+        gpu_rng_state = torch.cuda.get_rng_state()
+    elif accelerator.device.type == "xpu":
+        gpu_rng_state = torch.xpu.get_rng_state()
+    elif accelerator.device.type == "mps":
+        gpu_rng_state = torch.cuda.get_rng_state()
+    else:
+        gpu_rng_state = None
+
+    random.seed(val_seed)
+    np.random.seed(val_seed)
+    torch.manual_seed(val_seed)
+    if accelerator.device.type == "cuda":
+        torch.cuda.manual_seed_all(val_seed)
+
+    return (cpu_rng_state, gpu_rng_state, python_rng_state, numpy_rng_state)
+
+
+def restore_rng_state(rng_states: tuple[torch.ByteTensor, torch.ByteTensor | None, tuple], accelerator):
+    cpu_rng_state, gpu_rng_state, python_rng_state, numpy_rng_state = rng_states
+    torch.set_rng_state(cpu_rng_state)
+    random.setstate(python_rng_state)
+    np.random.set_state(numpy_rng_state)
+    if gpu_rng_state is not None:
+        if accelerator.device.type == "cuda":
+            torch.cuda.set_rng_state(gpu_rng_state)
+        elif accelerator.device.type == "xpu":
+            torch.xpu.set_rng_state(gpu_rng_state)
+        elif accelerator.device.type == "mps":
+            torch.cuda.set_rng_state(gpu_rng_state)
 
 
 def train(args):
@@ -340,9 +380,13 @@ def train(args):
     collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
 
     train_dataset_group.verify_bucket_reso_steps(32)
+    if val_dataset_group is not None:
+        val_dataset_group.verify_bucket_reso_steps(32)
 
     if args.debug_dataset:
         train_util.debug_dataset(train_dataset_group, True)
+        if val_dataset_group is not None:
+            train_util.debug_dataset(val_dataset_group, True)
         return
     if len(train_dataset_group) == 0:
         logger.error(
@@ -354,11 +398,19 @@ def train(args):
         assert (
             train_dataset_group.is_latent_cacheable()
         ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
+        if val_dataset_group is not None:
+            assert (
+                val_dataset_group.is_latent_cacheable()
+            ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
 
     if args.cache_text_encoder_outputs:
         assert (
             train_dataset_group.is_text_encoder_output_cacheable()
         ), "when caching text encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used / text encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません"
+        if val_dataset_group is not None:
+            assert (
+                val_dataset_group.is_text_encoder_output_cacheable()
+            ), "when caching text encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used / text encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません"
 
     # acceleratorを準備する
     logger.info("prepare accelerator")
@@ -442,6 +494,8 @@ def train(args):
         vae.eval()
 
         train_dataset_group.new_cache_latents(vae, accelerator)
+        if val_dataset_group is not None:
+            val_dataset_group.new_cache_latents(vae, accelerator)
 
         vae.to("cpu")
         clean_memory_on_device(accelerator.device)
@@ -498,6 +552,8 @@ def train(args):
             text_encoder2.to(accelerator.device)
             with accelerator.autocast():
                 train_dataset_group.new_cache_text_encoder_outputs([text_encoder1, text_encoder2], accelerator)
+                if val_dataset_group is not None:
+                    val_dataset_group.new_cache_text_encoder_outputs([text_encoder1, text_encoder2], accelerator)
 
         accelerator.wait_for_everyone()
 
@@ -594,6 +650,8 @@ def train(args):
     # strategies are set here because they cannot be referenced in another process. Copy them with the dataset
     # some strategies can be None
     train_dataset_group.set_current_strategies()
+    if val_dataset_group is not None:
+        val_dataset_group.set_current_strategies()
 
     # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
@@ -605,6 +663,20 @@ def train(args):
         num_workers=n_workers,
         persistent_workers=args.persistent_data_loader_workers,
     )
+
+    if val_dataset_group is not None:
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset_group,
+            shuffle=False,
+            batch_size=1,
+            collate_fn=collator,
+            num_workers=n_workers,
+            persistent_workers=args.persistent_data_loader_workers,
+        )
+        val_dataloader = accelerator.prepare(val_dataloader)
+        cyclic_val_dataloader = itertools.cycle(val_dataloader)
+    else:
+        val_dataloader, cyclic_val_dataloader = None, None
 
     # 学習ステップ数を計算する
     if args.max_train_epochs is not None:
@@ -807,10 +879,149 @@ def train(args):
         accelerator.log({}, step=0)
 
     loss_recorder = train_util.LossRecorder()
+    val_loss_recorder = train_util.LossRecorder()
 
     if args.edm2_loss_weighting:
         loss_scaled_recorder = train_util.LossRecorder()
         loss_edm2_recorder = train_util.LossRecorder()
+
+    def calculate_val_loss(epoch_step):
+        if not train_util.calculate_val_loss_check(args, global_step, epoch_step, val_dataloader, train_dataloader):
+            return None, None, {}
+
+        rng_states = switch_rng_state(int(args.validation_seed) if args.validation_seed else 23, accelerator)
+
+        timesteps_list = ast.literal_eval(args.validation_timesteps)
+
+        accelerator.print("")
+        accelerator.print("Validating バリデーション処理...")
+        total_loss = 0.0
+
+        # set eval
+        for m in training_models:
+            m.eval()
+        
+        with torch.no_grad():
+            validation_steps = min(int(args.max_validation_steps), len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
+            val_dataloader_seed = random.randint(global_step, 0x7FFFFFFF)
+            val_dataloader_state = random.Random(val_dataloader_seed).getstate()
+            for val_step in tqdm(range(validation_steps), desc='Validation Steps'):
+                val_original_state = random.getstate()
+                random.setstate(val_dataloader_state)
+                batch = next(cyclic_val_dataloader)
+                val_dataloader_state = random.getstate()
+                random.setstate(val_original_state)
+                
+                # Validation batch processing (simplified from train loop)
+                if "latents" in batch and batch["latents"] is not None:
+                    latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
+                else:
+                    latents = vae.encode(batch["images"].to(vae_dtype)).latent_dist.sample().to(weight_dtype)
+                    if torch.any(torch.isnan(latents)):
+                        latents = torch.nan_to_num(latents, 0, out=latents)
+                if args.vae_shift_factor != 0.0:
+                    latents = latents - args.vae_shift_factor
+                latents = latents * args.vae_scale_factor
+
+                text_encoder_conds = []
+                masks_reshaped = []
+                text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+                if text_encoder_outputs_list is not None:
+                    text_encoder_conds = text_encoder_outputs_list
+                    masks_reshaped = text_encoder_outputs_list[3:]
+
+                if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None:
+                    with accelerator.autocast():
+                        if args.weighted_captions:
+                            input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                            encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
+                                tokenize_strategy,
+                                [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
+                                input_ids_list,
+                                weights_list,
+                            )
+                        else:
+                            input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
+                            masks = [mask.to(accelerator.device) for mask in batch["attn_mask_list"]]
+                            encoded_text_encoder_conds, masks_reshaped = text_encoding_strategy.encode_tokens(
+                                tokenize_strategy,
+                                [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
+                                input_ids,
+                                attn_masks=masks,
+                            )
+                        if args.full_fp16:
+                            encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+
+                    if len(text_encoder_conds) == 0:
+                        text_encoder_conds = encoded_text_encoder_conds
+                    else:
+                        for i in range(len(encoded_text_encoder_conds)):
+                            if encoded_text_encoder_conds[i] is not None:
+                                text_encoder_conds[i] = encoded_text_encoder_conds[i]
+
+                orig_size = batch["original_sizes_hw"]
+                crop_size = batch["crop_top_lefts"]
+                target_size = batch["target_sizes_hw"]
+                embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+
+                encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoder_conds
+                vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+                text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+
+                batch_size = latents.shape[0]
+                
+                # Loop through validation timesteps
+                for fixed_timestep in timesteps_list:
+                    timesteps = torch.full((batch_size,), fixed_timestep, dtype=torch.long, device=latents.device)
+                    
+                    noise, noisy_latents, _ = train_util.get_noise_noisy_latents_and_timesteps(
+                        args, noise_scheduler, latents, fixed_timesteps=timesteps, is_train=False
+                    )
+                    
+                    noisy_latents = noisy_latents.to(weight_dtype)
+
+                    with accelerator.autocast():
+                        noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding, encoder_attention_mask=masks_reshaped[1])
+
+                    latents = latents.to(torch.float64)
+                    noise = noise.to(torch.float64)
+                    
+                    if args.flow_model:
+                        target = noise - latents
+                    elif args.v_parameterization:
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        target = noise
+
+                    noise_pred = noise_pred.to(dtype=torch.float64)
+                    target = target.to(dtype=torch.float64)
+
+                    loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
+                    loss = loss.mean()
+                    total_loss += loss.item()
+
+        current_val_loss = total_loss / (validation_steps * len(timesteps_list))
+        val_loss_recorder.add(current_val_loss)
+        average_val_loss = val_loss_recorder.average
+        
+        restore_rng_state(rng_states, accelerator)
+        
+        # restore train mode
+        for m in training_models:
+            m.train()
+            
+        return current_val_loss, average_val_loss, {"loss/current_val_loss": current_val_loss, "loss/average_val_loss": average_val_loss}
+
+    current_val_loss, average_val_loss, val_logs = calculate_val_loss(0)
+    if current_val_loss is not None:
+        if len(accelerator.trackers) > 0:
+            accelerator.log(val_logs, step=0)
+
+    # Initialize loss accumulators for logging
+    current_global_step_loss = 0.0
+    current_global_step_loss_scaled = 0.0
+    current_global_step_loss_edm2 = 0.0
+    accumulation_counter = 0
 
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -821,6 +1032,7 @@ def train(args):
 
         for step, batch in enumerate(train_dataloader):
             current_step.value = global_step
+            accumulation_counter += 1
 
             if args.fused_optimizer_groups:
                 optimizer_hooked_count = {i: 0 for i in range(len(optimizers))}  # reset counter for each step
@@ -1055,6 +1267,9 @@ def train(args):
                     unet,
                 )
 
+                # Validation during steps
+                current_val_loss, average_val_loss, val_logs = calculate_val_loss(step)
+
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     accelerator.wait_for_everyone()
@@ -1095,18 +1310,24 @@ def train(args):
                 if plot_edm2_loss_weighting_check(args, global_step):
                     plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
 
-            current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
+            current_global_step_loss += loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
 
             if args.edm2_loss_weighting:
-                current_loss_scaled = loss_scaled.detach().item()
-                current_loss_edm2 = edm2_loss.detach().item()
+                current_global_step_loss_scaled += loss_scaled.detach().item()
+                current_global_step_loss_edm2 += edm2_loss.detach().item()
 
-            if len(accelerator.trackers) > 0:
-                logs = {"loss": current_loss}
+            if accelerator.sync_gradients:
+                avg_loss = current_global_step_loss / accumulation_counter
+                logs = {"loss": avg_loss}
+                
+                if current_val_loss is not None:
+                    logs.update(val_logs)
 
                 if args.edm2_loss_weighting:
-                    logs["loss/scaled"] = current_loss_scaled
-                    logs["loss/edm2"] = current_loss_edm2
+                    avg_loss_scaled = current_global_step_loss_scaled / accumulation_counter
+                    avg_loss_edm2 = current_global_step_loss_edm2 / accumulation_counter
+                    logs["loss/scaled"] = avg_loss_scaled
+                    logs["loss/edm2"] = avg_loss_edm2
                     logs["lr/edm2"] = edm2_lr_scheduler.get_last_lr()[0]
 
                 if block_lrs is None:
@@ -1115,12 +1336,22 @@ def train(args):
                     append_block_lr_to_logs(block_lrs, logs, lr_scheduler, args.optimizer_type)  # U-Net is included in block_lrs
 
                 accelerator.log(logs, step=global_step)
+                
+                # Recorders
+                loss_recorder.add(epoch=epoch, step=step, loss=avg_loss)
+                if args.edm2_loss_weighting:
+                    loss_scaled_recorder.add(epoch=epoch, step=step, loss=avg_loss_scaled)
+                    loss_edm2_recorder.add(epoch=epoch, step=step, loss=avg_loss_edm2)
+                
+                # Reset accumulators
+                current_global_step_loss = 0.0
+                if args.edm2_loss_weighting:
+                    current_global_step_loss_scaled = 0.0
+                    current_global_step_loss_edm2 = 0.0
+                accumulation_counter = 0
 
-            loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-
-            if args.edm2_loss_weighting:
-                loss_scaled_recorder.add(epoch=epoch, step=step, loss=current_loss_scaled)
-                loss_edm2_recorder.add(epoch=epoch, step=step, loss=current_loss_edm2)
+            # Reset val logs for next steps
+            current_val_loss, average_val_loss, val_logs = None, None, {}
 
             avr_loss: float = loss_recorder.moving_average
             logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
@@ -1511,6 +1742,44 @@ def setup_parser() -> argparse.ArgumentParser:
         "--edm2_loss_weighting_importance_weighting_safety_override",
         action="store_true",
         help="At your own risk, you may set this to true to ALLOW stacking debiased loss and/or typical min snr gamma with EDM2 using importance weighting.",
+    )
+
+    parser.add_argument(
+        "--validation_seed",
+        type=int,
+        default=None,
+        help="Validation seed for shuffling validation dataset, training `--seed` used otherwise / 検証データセットをシャッフルするための検証シード、それ以外の場合はトレーニング `--seed` を使用する",
+    )
+    parser.add_argument(
+        "--validation_split",
+        type=float,
+        default=0.0,
+        help="Split for validation images out of the training dataset / 学習画像から検証画像に分割する割合",
+    )
+    parser.add_argument(
+        "--validate_every_n_steps",
+        type=int,
+        default=None,
+        help="Run validation on validation dataset every N steps. By default, validation will only occur every epoch if a validation dataset is available / 検証データセットの検証をNステップごとに実行します。デフォルトでは、検証データセットが利用可能な場合にのみ、検証はエポックごとに実行されます",
+    )
+    parser.add_argument(
+        "--validate_every_n_epochs",
+        type=int,
+        default=None,
+        help="Run validation dataset every N epochs. By default, validation will run every epoch if a validation dataset is available / 検証データセットをNエポックごとに実行します。デフォルトでは、検証データセットが利用可能な場合、検証はエポックごとに実行されます",
+    )
+    parser.add_argument(
+        "--max_validation_steps",
+        type=int,
+        default=None,
+        help="Max number of validation dataset items processed. By default, validation will run the entire validation dataset / 処理される検証データセット項目の最大数。デフォルトでは、検証は検証データセット全体を実行します",
+    )
+
+    parser.add_argument(
+        "--validation_timesteps",
+        type=str,
+        default=r"[50, 350, 500, 650, 950]",
+        help="A list of timesteps to use for each validation step."
     )
 
     return parser
