@@ -878,12 +878,12 @@ def train(args):
         # log empty object to commit the sample images to wandb
         accelerator.log({}, step=0)
 
-    loss_recorder = train_util.LossRecorder()
-    val_loss_recorder = train_util.LossRecorder()
+    loss_recorder = train_util.EMARecorder()
+    val_loss_recorder = train_util.EMARecorder()
 
     if args.edm2_loss_weighting:
-        loss_scaled_recorder = train_util.LossRecorder()
-        loss_edm2_recorder = train_util.LossRecorder()
+        loss_scaled_recorder = train_util.EMARecorder()
+        loss_edm2_recorder = train_util.EMARecorder()
 
     def calculate_val_loss(epoch_step):
         if not train_util.calculate_val_loss_check(args, global_step, epoch_step, val_dataloader, train_dataloader):
@@ -1338,10 +1338,10 @@ def train(args):
                 accelerator.log(logs, step=global_step)
                 
                 # Recorders
-                loss_recorder.add(epoch=epoch, step=step, loss=avg_loss)
+                loss_recorder.add(avg_loss)
                 if args.edm2_loss_weighting:
-                    loss_scaled_recorder.add(epoch=epoch, step=step, loss=avg_loss_scaled)
-                    loss_edm2_recorder.add(epoch=epoch, step=step, loss=avg_loss_edm2)
+                    loss_scaled_recorder.add(avg_loss_scaled)
+                    loss_edm2_recorder.add(avg_loss_edm2)
                 
                 # Reset accumulators
                 current_global_step_loss = 0.0
@@ -1353,7 +1353,7 @@ def train(args):
             # Reset val logs for next steps
             current_val_loss, average_val_loss, val_logs = None, None, {}
 
-            avr_loss: float = loss_recorder.moving_average
+            avr_loss: float = loss_recorder.average
             logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
@@ -1361,7 +1361,7 @@ def train(args):
                 break
 
         if len(accelerator.trackers) > 0:
-            logs = {"loss/epoch": loss_recorder.moving_average}
+            logs = {"loss/epoch": loss_recorder.average}
             accelerator.log(logs, step=epoch + 1)
 
         accelerator.wait_for_everyone()

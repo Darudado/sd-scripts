@@ -6628,8 +6628,8 @@ def calculate_val_loss_check(args, global_step, epoch_step, val_dataloader, trai
         return False
 
     if global_step != 0 and global_step < args.max_train_steps:
-        if args.validation_every_n_step is not None:
-            if global_step % int(args.validation_every_n_step) != 0:
+        if args.validate_every_n_steps is not None:
+            if global_step % int(args.validate_every_n_steps) != 0:
                 return False
         else:
             if epoch_step != len(train_dataloader) - 1:
