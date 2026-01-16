@@ -1168,7 +1168,7 @@ def train(args):
                             noise_pred, target_negative, reduction="none"
                         )
                         # Store CFM component for logging (before applying lambda)
-                        loss_cfm = loss_contrastive.mean([1, 2, 3]).mean().detach()
+                        #loss_cfm = loss_contrastive.mean([1, 2, 3]).mean().detach()
                         loss = loss - float(args.cfm_lambda) * loss_contrastive
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
