@@ -543,20 +543,23 @@ class NetworkTrainer:
                 loss = loss * weighting
 
             if args.contrastive_flow_matching and latents.size(0) > 1:
-                negative_latents = latents.roll(1, 0)
-                negative_noise = noise.roll(1, 0)
+                # CRITICAL FIX: Add .detach() to prevent gradients flowing through negative samples
+                negative_latents = latents.roll(1, 0).detach()
+                negative_noise = noise.roll(1, 0).detach()
                 with torch.no_grad():
                     if getattr(args, "flow_model", False):
                         target_negative = negative_noise - negative_latents
                     else:
                         target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
-                
+
                 # Handle cast for CFM
                 target_negative = target_negative.to(dtype=torch.float64)
-                
+
                 loss_contrastive = torch.nn.functional.mse_loss(
                     noise_pred, target_negative, reduction="none"
                 )
+                # Store CFM component for logging (before applying lambda)
+                #loss_cfm = loss_contrastive.mean([1, 2, 3]).mean().detach()
                 loss = loss - float(args.cfm_lambda) * loss_contrastive
             if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                 loss = apply_masked_loss(loss, batch)
