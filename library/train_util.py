@@ -30,7 +30,7 @@ import inspect
 import types
 from collections import deque
 from typing import Deque
-from library.mse_laplacian_pyramid_loss_2d import mse_pyramid_loss_2d
+from library.laplace_mse_loss import mse_pyramid_loss_2d_non_reduced
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -6958,7 +6958,7 @@ def conditional_loss(
     elif loss_type == "smooth_l2_log":
         loss = smooth_l2_log_loss(model_pred, target, reduction="none", delta=huber_c_reshaped)
     elif loss_type == "mse_pyramid_2d":
-        loss = mse_pyramid_loss_2d(model_pred, target, levels=5)
+        loss = mse_pyramid_loss_2d_non_reduced(model_pred, target, levels=5)
     else:
         raise NotImplementedError(f"Unsupported Loss Type: {loss_type}")
     
