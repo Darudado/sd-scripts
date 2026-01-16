@@ -30,6 +30,7 @@ import inspect
 import types
 from collections import deque
 from typing import Deque
+from library.mse_laplacian_pyramid_loss_2d import mse_pyramid_loss_2d
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -6641,7 +6642,7 @@ def soft_welsch_loss(predictions:torch.Tensor,
                     reduction: str = "mean", 
                     scale: float = 1.0, 
                     delta: float = 1.0):
-    differences = predictions - targets
+    differences = predictions.to(torch.float64) - targets.to(torch.float64)
     loss = torch.arcsinh(4 * (scale * differences**2) / delta) * delta / 4
     if reduction == "mean":
         loss = torch.mean(loss)
@@ -6669,7 +6670,7 @@ def stable_mse_loss(predictions, targets, reduction="mean"):
     return loss
 
 def stable_log_cosh_loss(predictions, targets, reduction='mean'):
-    diff = predictions - targets
+    diff = predictions.to(torch.float64) - targets.to(torch.float64)
     # For x >= 0
     pos_mask = diff >= 0
     # Compute log(cosh(x)) for positive x
@@ -6956,6 +6957,8 @@ def conditional_loss(
         loss = kornia.losses.geman_mcclure_loss(model_pred, target)
     elif loss_type == "smooth_l2_log":
         loss = smooth_l2_log_loss(model_pred, target, reduction="none", delta=huber_c_reshaped)
+    elif loss_type == "mse_pyramid_2d":
+        loss = mse_pyramid_loss_2d(model_pred, target, levels=5)
     else:
         raise NotImplementedError(f"Unsupported Loss Type: {loss_type}")
     
