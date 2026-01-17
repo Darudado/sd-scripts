@@ -8,6 +8,21 @@ def gaussian_kernel_2d(size=5, sigma=1.0, channels=1, device=None):
     kernel = kernel / kernel.sum()
     return kernel.view(1, 1, size, size).repeat(channels, 1, 1, 1)
 
+def conv2d_fp64_compat(input_tensor, weight, padding="same", groups=1):
+    """
+    Executes Conv2d in fp32 (to satisfy backend constraints) but accepts
+    and returns fp64 to maintain pipeline consistency.
+    """
+    # 1. Downcast inputs to float32
+    inp_f32 = input_tensor.to(torch.float32)
+    w_f32 = weight.to(torch.float32)
+    
+    # 2. Perform Convolution
+    out_f32 = F.conv2d(inp_f32, w_f32, padding=padding, groups=groups)
+    
+    # 3. Upcast immediately back to float64
+    return out_f32.to(torch.float64)
+
 def mse_pyramid_loss_2d_non_reduced(pred, target, levels=5):
     """
     Calculates a multi-scale MSE loss and returns the full spatial loss map.
@@ -56,8 +71,8 @@ def mse_pyramid_loss_2d_non_reduced(pred, target, levels=5):
             break
             
         # Blur
-        blurred_pred = F.conv2d(working_pred, weight=kernel, padding="same", groups=c)
-        blurred_target = F.conv2d(working_target, weight=kernel, padding="same", groups=c)
+        blurred_pred = conv2d_fp64_compat(working_pred, weight=kernel, padding="same", groups=c)
+        blurred_target = conv2d_fp64_compat(working_target, weight=kernel, padding="same", groups=c)
         
         # High-freq component
         hf_pred = working_pred - blurred_pred
