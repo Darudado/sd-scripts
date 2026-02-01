@@ -1231,10 +1231,20 @@ def train(args):
                 edm2_loss = loss
                 loss = pre_scaling_loss
 
+                # Sync EDM2 gradients explicitly across GPUs (for DDP and DeepSpeed compatibility)
+                # Must happen before any gradient clipping
+                if args.edm2_loss_weighting and accelerator.sync_gradients:
+                    for param in edm2_model.parameters():
+                        if param.grad is not None:
+                            param.grad = accelerator.reduce(param.grad, reduction="mean")
+
                 if not (args.fused_backward_pass or args.fused_optimizer_groups):
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                         params_to_clip = []
                         for m in training_models:
+                            # Skip EDM2 model - it has its own gradient clipping with potentially different norm
+                            if args.edm2_loss_weighting and m is edm2_model:
+                                continue
                             params_to_clip.extend(m.parameters())
                         accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
@@ -1249,6 +1259,14 @@ def train(args):
                             lr_schedulers[i].step()
 
                 if args.edm2_loss_weighting:
+                    # Apply gradient clipping for EDM2 (with separate grad norm if specified)
+                    if accelerator.sync_gradients:
+                        edm2_grad_norm = (args.edm2_loss_weighting_max_grad_norm
+                                         if args.edm2_loss_weighting_max_grad_norm is not None
+                                         else args.max_grad_norm)
+                        if edm2_grad_norm != 0.0:
+                            edm2_params = list(accelerator.unwrap_model(edm2_model).parameters())
+                            accelerator.clip_grad_norm_(edm2_params, edm2_grad_norm)
                     edm2_optimizer.step()
                     edm2_lr_scheduler.step()
                     edm2_optimizer.zero_grad(set_to_none=True)
@@ -1745,6 +1763,13 @@ def setup_parser() -> argparse.ArgumentParser:
         "--edm2_loss_weighting_importance_weighting_safety_override",
         action="store_true",
         help="At your own risk, you may set this to true to ALLOW stacking debiased loss and/or typical min snr gamma with EDM2 using importance weighting.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_max_grad_norm",
+        type=float,
+        default=None,
+        help="Maximum gradient norm for EDM2 loss weighting model. If not specified, uses --max_grad_norm value. Set to 0 to disable clipping for EDM2. / EDM2損失重み付けモデルの最大勾配ノルム。指定しない場合は--max_grad_normの値を使用。0に設定するとEDM2のクリッピングを無効化。"
     )
 
     parser.add_argument(

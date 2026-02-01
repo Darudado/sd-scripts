@@ -265,6 +265,14 @@ class NetworkTrainer:
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
 
+    def all_reduce_edm2_model(self, accelerator, edm2_model):
+        """Manually synchronize EDM2 model gradients across GPUs."""
+        if edm2_model is None:
+            return
+        for param in edm2_model.parameters():
+            if param.grad is not None:
+                param.grad = accelerator.reduce(param.grad, reduction="mean")
+
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizers[0], text_encoder, unet)
 
@@ -1915,6 +1923,17 @@ class NetworkTrainer:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                        # Sync and clip EDM2 gradients
+                        if args.edm2_loss_weighting:
+                            self.all_reduce_edm2_model(accelerator, edm2_model)
+                            # Use edm2-specific grad norm if provided, otherwise use max_grad_norm
+                            edm2_grad_norm = (args.edm2_loss_weighting_max_grad_norm
+                                             if args.edm2_loss_weighting_max_grad_norm is not None
+                                             else args.max_grad_norm)
+                            if edm2_grad_norm != 0.0:
+                                edm2_params = list(accelerator.unwrap_model(edm2_model).parameters())
+                                accelerator.clip_grad_norm_(edm2_params, edm2_grad_norm)
+
                         #if hasattr(network, "update_grad_norms"):
                         #    network.update_grad_norms()
                         #if hasattr(network, "update_norms"):
@@ -2022,8 +2041,6 @@ class NetworkTrainer:
                                             remove_loss_weights_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no, "_edm2_loss_weights")
                                             remove_model(remove_loss_weights_ckpt_name)
 
-                            if plot_edm2_loss_weighting_check(args, global_step):
-                                plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
                             optimizer_train_fn()
                             accelerator.unwrap_model(network).train()
                             if args.gradient_checkpointing:
@@ -2032,6 +2049,10 @@ class NetworkTrainer:
                                     accelerator.unwrap_model(t_enc).train()
                     else:
                         current_val_loss, average_val_loss, val_logs = None, None, None
+
+                    # EDM2 graph generation - moved outside the sample/val/save conditional
+                    if plot_edm2_loss_weighting_check(args, global_step):
+                        plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
 
                 current_global_step_loss += loss.detach().item()
                 if args.edm2_loss_weighting:
@@ -2498,6 +2519,13 @@ def setup_parser() -> argparse.ArgumentParser:
         "--edm2_loss_weighting_importance_weighting_safety_override",
         action="store_true",
         help="At your own risk, you may set this to true to ALLOW stacking debiased loss and/or typical min snr gamma with EDM2 using importance weighting.",
+    )
+
+    parser.add_argument(
+        "--edm2_loss_weighting_max_grad_norm",
+        type=float,
+        default=None,
+        help="Maximum gradient norm for EDM2 loss weighting model. If not specified, uses --max_grad_norm value. Set to 0 to disable clipping for EDM2. / EDM2損失重み付けモデルの最大勾配ノルム。指定しない場合は--max_grad_normの値を使用。0に設定するとEDM2のクリッピングを無効化。"
     )
 
     parser.add_argument(

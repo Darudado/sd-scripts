@@ -51,7 +51,7 @@ def prepare_edm2_loss_weighting(args, noise_scheduler, accelerator):
                     else:
                         return 1 / math.sqrt(max(current_step / max(constant_steps + warmup_steps, 1), 1)**decay_scaling)
                 return torch.optim.lr_scheduler.LambdaLR(optimizer=wrap_optimizer, lr_lambda=lr_lambda)
-            
+
             edm2_lr_scheduler = InverseSqrt(
                 edm2_optimizer,
                 warmup_steps=args.max_train_steps * float(args.edm2_loss_weighting_lr_scheduler_warmup_percent) if args.edm2_loss_weighting_lr_scheduler_warmup_percent is not None else 0.05,
@@ -61,9 +61,19 @@ def prepare_edm2_loss_weighting(args, noise_scheduler, accelerator):
         else:
             edm2_lr_scheduler = train_util.get_dummy_scheduler(edm2_optimizer)
 
-        edm2_lr_scheduler = accelerator.prepare(edm2_lr_scheduler)
-            
-        edm2_model, edm2_optimizer = accelerator.prepare(edm2_model, edm2_optimizer)
+        # Handle DeepSpeed differently: don't use accelerator.prepare() at all
+        # When DeepSpeed is active, prepare() converts models to bf16 and wraps them
+        # in ways that break gradient flow for separate models like EDM2
+        is_deepspeed = getattr(args, 'deepspeed', False)
+        if is_deepspeed:
+            logger.info("DeepSpeed detected: keeping EDM2 as standalone PyTorch model (float32)")
+            # Just move to device, keep as float32 for stable gradient computation
+            edm2_model = edm2_model.to(accelerator.device)
+            edm2_model.train()
+            # Keep optimizer and scheduler as regular PyTorch objects
+        else:
+            edm2_lr_scheduler = accelerator.prepare(edm2_lr_scheduler)
+            edm2_model, edm2_optimizer = accelerator.prepare(edm2_model, edm2_optimizer)
     else:
         edm2_optimizer = None
         edm2_lr_scheduler = None
@@ -94,17 +104,20 @@ def plot_edm2_loss_weighting(args, step: int, model, num_timesteps: int = 1000, 
     """
     Plot the edm2 loss weighting across timesteps using the learned parameters.
 
-    :param model: The edm2 model instance (after training).
+    :param model: The edm2 model instance (after training). Can be DDP-wrapped.
     :param num_timesteps: Total number of timesteps to plot.
     :param device: Device to run computations on.
     """
+    # Unwrap DDP model if necessary
+    unwrapped_model = model.module if hasattr(model, 'module') else model
+
     with torch.inference_mode():
-        model.train(False)
+        unwrapped_model.train(False)
         timesteps = torch.arange(0, 1000, device=device, dtype=torch.long)
-        learnedweights = model._forward(timesteps).cpu().numpy()
-        lambdas = model.lambda_weights.cpu().numpy()
+        learnedweights = unwrapped_model._forward(timesteps).cpu().numpy()
+        lambdas = unwrapped_model.lambda_weights.cpu().numpy()
         learnedweights = lambdas/np.exp(learnedweights)
-        model.train(True)
+        unwrapped_model.train(True)
 
         # Plot the dynamic loss weights over time
         plt.figure(figsize=(10, 6))
