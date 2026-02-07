@@ -2011,8 +2011,8 @@ class NetworkTrainer:
                                                                                                         weight_dtype, 
                                                                                                         accelerator, 
                                                                                                         args, 
-                                                                                                        batch,
                                                                                                         current_epoch.value,
+                                                                                                        batch,
                                                                                                         train_text_encoder)
                             else:
                                 current_val_loss, average_val_loss, val_logs = None, None, {}
