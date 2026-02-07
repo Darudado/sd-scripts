@@ -469,7 +469,14 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
 
 
 def get_noisy_model_input_and_timesteps(
-    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype, fixed_timesteps=None, is_train=True
+    args, 
+    noise_scheduler, 
+    latents: torch.Tensor, 
+    noise: torch.Tensor, 
+    device, 
+    dtype, 
+    fixed_timesteps=None, 
+    is_train=True
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bsz, _, h, w = latents.shape
     assert bsz > 0, "Batch size not large enough"

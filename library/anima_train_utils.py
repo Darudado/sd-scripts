@@ -151,6 +151,8 @@ def get_noisy_model_input_and_timesteps(
     noise: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    fixed_timesteps=None, 
+    is_train=True
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate noisy model input and timesteps for rectified flow training.
 
@@ -173,31 +175,34 @@ def get_noisy_model_input_and_timesteps(
     sigmoid_scale = getattr(args, 'sigmoid_scale', 1.0)
     shift = getattr(args, 'discrete_flow_shift', 1.0)
 
-    if timestep_sample_method == 'logit_normal':
-        dist = torch.distributions.normal.Normal(0, 1)
-    elif timestep_sample_method == 'uniform':
-        dist = torch.distributions.uniform.Uniform(0, 1)
+    if fixed_timesteps is not None:
+        t = fixed_timesteps
     else:
-        raise NotImplementedError(f"Unknown timestep_sample_method: {timestep_sample_method}")
+        if timestep_sample_method == 'logit_normal':
+            dist = torch.distributions.normal.Normal(0, 1)
+        elif timestep_sample_method == 'uniform':
+            dist = torch.distributions.uniform.Uniform(0, 1)
+        else:
+            raise NotImplementedError(f"Unknown timestep_sample_method: {timestep_sample_method}")
 
-    t = dist.sample((bs,)).to(device)
+        t = dist.sample((bs,)).to(device)
 
-    if timestep_sample_method == 'logit_normal':
-        t = t * sigmoid_scale
-        t = torch.sigmoid(t)
+        if timestep_sample_method == 'logit_normal':
+            t = t * sigmoid_scale
+            t = torch.sigmoid(t)
 
-    # Apply shift
-    if shift is not None and shift != 1.0:
-        t = (t * shift) / (1 + (shift - 1) * t)
+        # Apply shift
+        if shift is not None and shift != 1.0:
+            t = (t * shift) / (1 + (shift - 1) * t)
 
-    # Clamp to avoid exact 0 or 1
-    t = t.clamp(1e-5, 1.0 - 1e-5)
+        # Clamp to avoid exact 0 or 1
+        t = t.clamp(1e-5, 1.0 - 1e-5)
 
     # Create noisy input: (1 - t) * latents + t * noise
     t_expanded = t.view(-1, *([1] * (latents.ndim - 1)))
 
     ip_noise_gamma = getattr(args, 'ip_noise_gamma', None)
-    if ip_noise_gamma:
+    if is_train and ip_noise_gamma:
         xi = torch.randn_like(latents, device=latents.device, dtype=dtype)
         if getattr(args, 'ip_noise_gamma_random_strength', False):
             ip_noise_gamma = torch.rand(1, device=latents.device, dtype=dtype) * ip_noise_gamma

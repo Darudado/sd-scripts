@@ -13,6 +13,7 @@ init_ipex()
 from library import anima_models, anima_train_utils, anima_utils, strategy_anima, strategy_base, train_util
 import train_network
 from library.utils import setup_logging
+from library.ramtorch_util import apply_ramtorch_to_module
 
 setup_logging()
 import logging
@@ -138,6 +139,15 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self.vae, vae_mean, vae_std, self.vae_scale = anima_utils.load_anima_vae(
             args.vae_path, dtype=weight_dtype, device="cpu"
         )
+
+        if args.use_ramtorch:
+            logger.info("Applying RamTorch to Anima model.")
+
+            #TODO: parameters disappear after applying ramtorch
+            #dit = apply_ramtorch_to_module(dit, "dit", accelerator.device, weight_dtype)
+
+            if not args.cache_text_encoder_outputs:
+                self.qwen3_text_encoder = apply_ramtorch_to_module(self.qwen3_text_encoder, "qwen3_text_encoder", accelerator.device, weight_dtype)
 
         # Return format: (model_type, text_encoders, vae, unet)
         return "anima", [self.qwen3_text_encoder], self.vae, dit
@@ -299,6 +309,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
+        fixed_timesteps=None,
         is_train=True,
     ):
         # Sample noise
@@ -306,11 +317,17 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = anima_train_utils.get_noisy_model_input_and_timesteps(
-            args, latents, noise, accelerator.device, weight_dtype
+            args, 
+            latents, 
+            noise, 
+            accelerator.device, 
+            weight_dtype, 
+            fixed_timesteps=fixed_timesteps, 
+            is_train=is_train,
         )
 
         # Gradient checkpointing support
-        if args.gradient_checkpointing:
+        if is_train and args.gradient_checkpointing:
             noisy_model_input.requires_grad_(True)
             for t in text_encoder_conds:
                 if t is not None and t.dtype.is_floating_point:
@@ -350,6 +367,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 t5_attn_mask=t5_attn_mask,
             )
 
+        # Upcast for grokking
+        latents = latents.to(torch.float64)
+        noise = noise.to(torch.float64)
+
         # Rectified flow target: noise - latents
         target = noise - latents
 
@@ -386,10 +407,23 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return model_pred, target, timesteps, weighting
 
     def process_batch(
-        self, batch, text_encoders, unet, network, vae, noise_scheduler,
-        vae_dtype, weight_dtype, accelerator, args,
-        text_encoding_strategy, tokenize_strategy,
-        is_train=True, train_text_encoder=True, train_unet=True,
+        self, 
+        batch, 
+        text_encoders, 
+        unet, 
+        network, 
+        vae, 
+        noise_scheduler,
+        vae_dtype, 
+        weight_dtype, 
+        accelerator, 
+        args,
+        text_encoding_strategy, 
+        tokenize_strategy,
+        is_train=True, 
+        train_text_encoder=True, 
+        train_unet=True,
+        edm2_model=None,
     ) -> torch.Tensor:
         """Override base process_batch for 5D video latents (B, C, T, H, W).
 
@@ -450,25 +484,44 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             text_encoder_conds, unet, network, weight_dtype, train_unet, is_train=is_train,
         )
 
-        huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+        # Cast to float64 (Double Precision) for Grokking
+        noise_pred = noise_pred.to(dtype=torch.float64)
+        target = target.to(dtype=torch.float64)
 
-        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-            loss = apply_masked_loss(loss, batch)
+        if is_train:
+            huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
+            loss = train_util.conditional_loss(noise_pred, target, args.loss_type, "none", huber_c)
+
+            if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                loss = apply_masked_loss(loss, batch)
+        else:
+            loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
 
         # Reduce all non-batch dims: (B, C, T, H, W) -> (B,) for 5D, (B, C, H, W) -> (B,) for 4D
         reduce_dims = list(range(1, loss.ndim))
         loss = loss.mean(reduce_dims)
 
-        # Apply weighting after reducing to (B,)
-        if weighting is not None:
-            loss = loss * weighting
+        if is_train:
+             # Apply weighting after reducing to (B,)
+            if weighting is not None:
+                loss = loss * weighting
+            loss_weights = batch["loss_weights"]
+            loss = loss * loss_weights
+            loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
-        loss_weights = batch["loss_weights"]
-        loss = loss * loss_weights
+        if is_train and args.loss_multiplier:
+            loss.mul_(float(args.loss_multiplier) if args.loss_multiplier is not None else 1.0)
 
-        loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
-        return loss.mean()
+        # For logging
+        pre_scaling_loss = loss.mean()
+
+        if is_train and args.edm2_loss_weighting:
+            loss, loss_scaled = edm2_model(loss, timesteps)
+            loss_scaled = loss_scaled.mean()
+        else:
+            loss_scaled = None
+
+        return loss.mean(), pre_scaling_loss, loss_scaled
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         return loss
