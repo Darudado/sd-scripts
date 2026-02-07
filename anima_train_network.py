@@ -305,6 +305,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         latents,
         batch,
         text_encoder_conds,
+        text_encoder_masks,
         unet,
         network,
         weight_dtype,
@@ -404,7 +405,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def process_batch(
         self, 
@@ -479,9 +480,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                     if encoded_text_encoder_conds[i] is not None:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
-        noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
+        noise_pred, target, timesteps, weighting, _ = self.get_noise_pred_and_target(
             args, accelerator, noise_scheduler, latents, batch,
-            text_encoder_conds, unet, network, weight_dtype, train_unet, is_train=is_train,
+            text_encoder_conds, None, unet, network, weight_dtype, train_unet, is_train=is_train,
         )
 
         # Cast to float64 (Double Precision) for Grokking
