@@ -143,8 +143,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if args.use_ramtorch:
             logger.info("Applying RamTorch to Anima model.")
 
-            #TODO: parameters disappear after applying ramtorch
-            #dit = apply_ramtorch_to_module(dit, "dit", accelerator.device, weight_dtype)
+            dit = apply_ramtorch_to_module(dit, "dit", accelerator.device, weight_dtype)
 
             if not args.cache_text_encoder_outputs:
                 self.qwen3_text_encoder = apply_ramtorch_to_module(self.qwen3_text_encoder, "qwen3_text_encoder", accelerator.device, weight_dtype)
