@@ -17,8 +17,11 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
+import random
+import numpy as np
 from accelerate.utils import set_seed
-from library import deepspeed_utils, anima_models, anima_train_utils, anima_utils, strategy_base, strategy_anima, sai_model_spec
+from library import deepspeed_utils, anima_models, anima_train_utils, anima_utils, strategy_base, strategy_anima, sai_model_spec, model_util
+from library.ramtorch_util import apply_ramtorch_to_module
 
 import library.train_util as train_util
 
@@ -42,6 +45,7 @@ def train(args):
     train_util.verify_training_args(args)
     train_util.prepare_dataset_args(args, True)
     deepspeed_utils.prepare_deepspeed_args(args)
+    train_util.set_torch_cuda_reduced_precision(args)
     setup_logging(args, reset=True)
 
     # backward compatibility
@@ -87,7 +91,7 @@ def train(args):
     use_dreambooth_method = args.in_json is None
 
     if args.seed is not None:
-        set_seed(args.seed)
+        train_util.args_set_seed(args)
 
     # prepare caching strategy: must be set before preparing dataset
     if args.cache_latents:
@@ -139,6 +143,19 @@ def train(args):
     else:
         train_dataset_group = train_util.load_arbitrary_dataset(args)
         val_dataset_group = None
+
+    if args.protected_tags_file:
+        logger.info(f"Injecting protected_tags_file into datasets: {args.protected_tags_file}")
+        for ds in train_dataset_group.datasets:
+            ds.protected_tags_file = args.protected_tags_file
+    if args.log_caption_tag_dropout:
+        logger.info("Enabling caption tag dropout logging for datasets...")
+        for ds in train_dataset_group.datasets:
+            ds.log_caption_tag_dropout = True
+    if args.log_caption_dropout:
+        logger.info("Enabling caption dropout logging for datasets...")
+        for ds in train_dataset_group.datasets:
+            ds.log_caption_dropout = True
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
@@ -282,6 +299,12 @@ def train(args):
     # Load VAE and cache latents
     logger.info("Loading Anima VAE...")
     vae, vae_mean, vae_std, vae_scale = anima_utils.load_anima_vae(args.vae_path, dtype=vae_dtype, device="cpu")
+
+    if args.vae_reflection_padding:
+        vae = model_util.use_reflection_padding(vae)
+
+    if args.use_ramtorch_vae:
+        vae = apply_ramtorch_to_module(vae, "vae", accelerator.device, vae_dtype)
 
     if cache_latents:
         vae.to(accelerator.device, dtype=weight_dtype)
@@ -848,6 +871,33 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
     sai_model_spec.add_model_spec_arguments(parser)
+
+    parser.add_argument(
+        "--protected_tags_file",
+        type=str,
+        default=None,
+        help="Path to file containing protected tags that should not be dropped or shuffled",
+    )
+    parser.add_argument(
+        "--log_caption_tag_dropout",
+        action="store_true",
+        help="Log which tags are dropped during caption tag dropout",
+    )
+    parser.add_argument(
+        "--log_caption_dropout",
+        action="store_true",
+        help="Log if caption is dropped during caption dropout",
+    )
+    parser.add_argument(
+        "--vae_reflection_padding",
+        action="store_true",
+        help="Use reflection padding for VAE to reduce artifacts at tile boundaries",
+    )
+    parser.add_argument(
+        "--use_ramtorch_vae",
+        action="store_true",
+        help="Use RamTorch to offload VAE to CPU/RAM when not in use",
+    )
 
     parser.add_argument(
         "--blockwise_fused_optimizers",
