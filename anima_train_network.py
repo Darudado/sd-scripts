@@ -134,10 +134,12 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
             dit.enable_block_swap(args.blocks_to_swap, accelerator.device)
 
+        vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
+        
         # Load VAE
         logger.info("Loading Anima VAE...")
         self.vae, vae_mean, vae_std, self.vae_scale = anima_utils.load_anima_vae(
-            args.vae_path, dtype=weight_dtype, device="cpu"
+            args.vae_path, dtype=vae_dtype, device="cpu"
         )
 
         if args.use_ramtorch:

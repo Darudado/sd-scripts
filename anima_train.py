@@ -277,9 +277,11 @@ def train(args):
         qwen3_text_encoder = None
         clean_memory_on_device(accelerator.device)
 
+    vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
+
     # Load VAE and cache latents
     logger.info("Loading Anima VAE...")
-    vae, vae_mean, vae_std, vae_scale = anima_utils.load_anima_vae(args.vae_path, dtype=weight_dtype, device="cpu")
+    vae, vae_mean, vae_std, vae_scale = anima_utils.load_anima_vae(args.vae_path, dtype=vae_dtype, device="cpu")
 
     if cache_latents:
         vae.to(accelerator.device, dtype=weight_dtype)
