@@ -540,6 +540,17 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs
 
+    def cast_text_encoder(self, args):
+        return False  # do not cast to other dtype
+
+    def prepare_text_encoder_grad_ckpt_workaround(self, index, text_encoder):
+        # do not support text encoder training for Anima
+        pass
+
+    def prepare_text_encoder_fp8(self, index, text_encoder, te_weight_dtype, weight_dtype):
+        # fp8 text encoder for Anima is not supported currently
+        pass
+
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
     ) -> torch.nn.Module:
