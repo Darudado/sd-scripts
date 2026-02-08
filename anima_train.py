@@ -718,6 +718,10 @@ def train(args):
                         t5_attn_mask=t5_attn_mask,
                     )
 
+                # Upcast for grokking
+                latents = latents.to(torch.float64)
+                noise = noise.to(torch.float64)
+
                 # Compute loss (rectified flow: target = noise - latents)
                 target = noise - latents
 
@@ -726,10 +730,13 @@ def train(args):
                     weighting_scheme=args.weighting_scheme, sigmas=sigmas
                 )
 
+                # Upcast for grokking
+                model_pred = model_pred.to(dtype=torch.float64)
+
                 # Loss
                 huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, None)
                 loss = train_util.conditional_loss(
-                    model_pred.float(), target.float(), args.loss_type, "none", huber_c
+                    model_pred, target, args.loss_type, "none", huber_c
                 )
                 if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                     loss = apply_masked_loss(loss, batch)
