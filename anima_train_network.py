@@ -603,4 +603,10 @@ if __name__ == "__main__":
     args = train_util.read_config_from_file(args, parser)
 
     trainer = AnimaNetworkTrainer()
+
+    # Automatically switch to Anima-specific LoRA module if generic one is provided
+    if args.network_module == "networks.lora":
+        print("Override network module: networks.lora -> networks.lora_anima")
+        args.network_module = "networks.lora_anima"
+
     trainer.train(args)
