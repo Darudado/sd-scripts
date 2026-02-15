@@ -89,7 +89,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         qwen3_text_encoder.eval()
 
         if args.use_ramtorch and not args.cache_text_encoder_outputs:
-            self.qwen3_text_encoder = apply_ramtorch_to_module(self.qwen3_text_encoder, "qwen3_text_encoder", accelerator.device, weight_dtype)
+            qwen3_text_encoder= apply_ramtorch_to_module(qwen3_text_encoder, "qwen3_text_encoder", accelerator.device, weight_dtype)
 
         # Load VAE
         logger.info("Loading Anima VAE...")
