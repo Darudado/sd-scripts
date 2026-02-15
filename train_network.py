@@ -573,7 +573,7 @@ class NetworkTrainer:
                 loss = apply_masked_loss(loss, batch)
         else:
                 loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
-        loss = loss.mean([1, 2, 3])
+        loss = loss.mean(dim=list(range(1, loss.ndim)))  # mean over all dims except batch
 
         if is_train:
             loss_weights = batch["loss_weights"]  # 各sampleごとのweight
@@ -713,7 +713,7 @@ class NetworkTrainer:
                 target = target.to(dtype=torch.float64)
 
                 loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
-                loss = loss.mean([1, 2, 3])
+                loss = loss.mean(dim=list(range(1, loss.ndim)))  # mean over all dims except batch
                 loss = loss.mean()
                 total_loss += loss
 

@@ -190,13 +190,16 @@ def split_train_val(
         return paths[split_index:], sizes[split_index:]
 
 class ImageInfo:
-    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, is_val: bool, absolute_path: str) -> None:
+    def __init__(
+        self, image_key: str, num_repeats: int, caption: str, is_reg: bool, is_val: bool, absolute_path: str, caption_dropout_rate: float = 0.0
+    ) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
         self.caption: str = caption
         self.is_reg: bool = is_reg
         self.is_val: bool = is_val
         self.absolute_path: str = absolute_path
+        self.caption_dropout_rate: float = caption_dropout_rate
         self.image_size: Tuple[int, int] = None
         self.resized_size: Tuple[int, int] = None
         self.bucket_reso: Tuple[int, int] = None
@@ -209,7 +212,7 @@ class ImageInfo:
         )
         self.cond_img_path: Optional[str] = None
         self.image: Optional[Image.Image] = None  # optional, original PIL Image
-        self.text_encoder_outputs_npz: Optional[str] = None  # set in cache_text_encoder_outputs
+        self.text_encoder_outputs_npz: Optional[str] = None  # filename. set in cache_text_encoder_outputs
 
         # new
         self.text_encoder_outputs: Optional[List[torch.Tensor]] = None
@@ -1180,11 +1183,11 @@ class BaseDataset(torch.utils.data.Dataset):
     def is_latent_cacheable(self):
         return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
 
-    def is_text_encoder_output_cacheable(self):
+    def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False):
         return all(
             [
                 not (
-                    subset.caption_dropout_rate > 0
+                    subset.caption_dropout_rate > 0 and not cache_supports_dropout
                     or subset.shuffle_caption
                     or subset.token_warmup_step > 0
                     or subset.caption_tag_dropout_rate > 0
@@ -2258,7 +2261,7 @@ class DreamBoothDataset(BaseDataset):
                 num_train_images += num_repeats * len(img_paths)
 
             for img_path, caption, size in zip(img_paths, captions, sizes):
-                info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, subset.is_val, img_path)
+                info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, subset.is_val, img_path, subset.caption_dropout_rate)
                 info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 )
@@ -2467,7 +2470,7 @@ class FineTuningDataset(BaseDataset):
                 if caption is None:
                     caption = ""
 
-                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path)
+                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path, subset.caption_dropout_rate)
                 image_info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 )
@@ -2797,8 +2800,8 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def is_latent_cacheable(self) -> bool:
         return all([dataset.is_latent_cacheable() for dataset in self.datasets])
 
-    def is_text_encoder_output_cacheable(self) -> bool:
-        return all([dataset.is_text_encoder_output_cacheable() for dataset in self.datasets])
+    def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False) -> bool:
+        return all([dataset.is_text_encoder_output_cacheable(cache_supports_dropout) for dataset in self.datasets])
 
     def set_current_strategies(self):
         for dataset in self.datasets:
@@ -3720,6 +3723,7 @@ def get_sai_model_spec_dataclass(
     flux: str = None,
     lumina: str = None,
     hunyuan_image: str = None,
+    anima: str = None,
     optional_metadata: dict[str, str] | None = None,
 ) -> sai_model_spec.ModelSpecMetadata:
     """
@@ -3751,7 +3755,8 @@ def get_sai_model_spec_dataclass(
         model_config["lumina"] = lumina
     if hunyuan_image is not None:
         model_config["hunyuan_image"] = hunyuan_image
-
+    if anima is not None:
+        model_config["anima"] = anima
     # Use the dataclass function directly
     return sai_model_spec.build_metadata_dataclass(
         state_dict,
@@ -6878,7 +6883,7 @@ def conditional_loss(
     target = target.to(torch.float64)
 
     if huber_c is not None and huber_c.numel() > 1:
-        huber_c_reshaped = huber_c.view(*huber_c.shape[:1], *([1] * (model_pred.dim() - 1)))
+        huber_c_reshaped = huber_c.view(-1, *([1] * (model_pred.ndim - 1)))
     else:
         huber_c_reshaped = huber_c
 

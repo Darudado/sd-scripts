@@ -478,7 +478,7 @@ def get_noisy_model_input_and_timesteps(
     fixed_timesteps=None, 
     is_train=True
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    bsz, _, h, w = latents.shape
+    bsz, h, w = latents.shape[0], latents.shape[-2], latents.shape[-1]
     assert bsz > 0, "Batch size not large enough"
     num_timesteps = noise_scheduler.config.num_train_timesteps
 
@@ -523,7 +523,7 @@ def get_noisy_model_input_and_timesteps(
         sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
 
     # Broadcast sigmas to latent shape
-    sigmas = sigmas.view(-1, 1, 1, 1)
+    sigmas = sigmas.view(-1, 1, 1, 1) if latents.ndim == 4 else sigmas.view(-1, 1, 1, 1, 1)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
