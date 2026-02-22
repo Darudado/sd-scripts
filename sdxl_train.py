@@ -1173,12 +1173,6 @@ def train(args):
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
 
-                    if args.edm2_loss_weighting:
-                        edm2_loss = loss
-                        loss, loss_scaled = edm2_model(loss, timesteps)
-                        loss_scaled = loss_scaled.mean() # for logging
-                    else:
-                        loss_scaled = None
 
                     loss = loss.mean([1, 2, 3])
 
@@ -1212,11 +1206,12 @@ def train(args):
 
                 loss = loss.mean()
 
-                pre_scaling_loss = loss.detach() # for logging
+                pre_scaling_loss = loss.detach()  # for logging (pre-EDM2 scale)
+                edm2_loss_pre_scale = pre_scaling_loss  # capture before EDM2 for logging
 
                 if args.edm2_loss_weighting:
                     loss, loss_scaled = edm2_model(loss, timesteps)
-                    loss_scaled = loss_scaled.mean() # for logging
+                    loss_scaled = loss_scaled.mean()  # for logging
                 else:
                     loss_scaled = None
 
@@ -1228,7 +1223,7 @@ def train(args):
                 if args.use_ramtorch:
                     torch.cuda.synchronize()
 
-                edm2_loss = loss
+                edm2_loss = edm2_loss_pre_scale  # pre-scale loss for EDM2 logging
                 loss = pre_scaling_loss
 
                 # Sync EDM2 gradients explicitly across GPUs (for DDP and DeepSpeed compatibility)
@@ -1239,14 +1234,27 @@ def train(args):
                             param.grad = accelerator.reduce(param.grad, reduction="mean")
 
                 if not (args.fused_backward_pass or args.fused_optimizer_groups):
-                    if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                        params_to_clip = []
-                        for m in training_models:
-                            # Skip EDM2 model - it has its own gradient clipping with potentially different norm
-                            if args.edm2_loss_weighting and m is edm2_model:
-                                continue
-                            params_to_clip.extend(m.parameters())
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    if accelerator.sync_gradients:
+                        if args.max_grad_norm != 0.0 or args.edm2_loss_weighting:
+                            accelerator.unscale_gradients()
+
+                        if args.max_grad_norm != 0.0:
+                            params_to_clip = []
+                            for m in training_models:
+                                # Skip EDM2 model - it has its own gradient clipping with potentially different norm
+                                if args.edm2_loss_weighting and m is edm2_model:
+                                    continue
+                                params_to_clip.extend(m.parameters())
+                            torch.nn.utils.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        if args.edm2_loss_weighting:
+                            # Apply gradient clipping for EDM2 (with separate grad norm if specified)
+                            edm2_grad_norm = (args.edm2_loss_weighting_max_grad_norm
+                                             if args.edm2_loss_weighting_max_grad_norm is not None
+                                             else args.max_grad_norm)
+                            if edm2_grad_norm != 0.0:
+                                edm2_params = list(accelerator.unwrap_model(edm2_model).parameters())
+                                torch.nn.utils.clip_grad_norm_(edm2_params, edm2_grad_norm)
 
                     optimizer.step()
                     lr_scheduler.step()
@@ -1259,14 +1267,6 @@ def train(args):
                             lr_schedulers[i].step()
 
                 if args.edm2_loss_weighting:
-                    # Apply gradient clipping for EDM2 (with separate grad norm if specified)
-                    if accelerator.sync_gradients:
-                        edm2_grad_norm = (args.edm2_loss_weighting_max_grad_norm
-                                         if args.edm2_loss_weighting_max_grad_norm is not None
-                                         else args.max_grad_norm)
-                        if edm2_grad_norm != 0.0:
-                            edm2_params = list(accelerator.unwrap_model(edm2_model).parameters())
-                            accelerator.clip_grad_norm_(edm2_params, edm2_grad_norm)
                     edm2_optimizer.step()
                     edm2_lr_scheduler.step()
                     edm2_optimizer.zero_grad(set_to_none=True)

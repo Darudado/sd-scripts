@@ -92,7 +92,7 @@ class NetworkTrainer:
             logs["loss/current_scaled"] = current_loss_scaled
             logs["loss/average_scaled"] = average_loss_scaled
 
-        if current_loss_scaled is not None:
+        if current_loss_edm2 is not None:
             logs["loss/current_edm2"] = current_loss_edm2
             logs["loss/average_edm2"] = average_loss_edm2
 
@@ -1917,20 +1917,26 @@ class NetworkTrainer:
 
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
-                        if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                         # Sync and clip EDM2 gradients
                         if args.edm2_loss_weighting:
                             self.all_reduce_edm2_model(accelerator, edm2_model)
+
+                        if args.max_grad_norm != 0.0 or args.edm2_loss_weighting:
+                            accelerator.unscale_gradients()
+
+                        if args.max_grad_norm != 0.0:
+                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                            torch.nn.utils.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        if args.edm2_loss_weighting:
                             # Use edm2-specific grad norm if provided, otherwise use max_grad_norm
                             edm2_grad_norm = (args.edm2_loss_weighting_max_grad_norm
                                              if args.edm2_loss_weighting_max_grad_norm is not None
                                              else args.max_grad_norm)
                             if edm2_grad_norm != 0.0:
                                 edm2_params = list(accelerator.unwrap_model(edm2_model).parameters())
-                                accelerator.clip_grad_norm_(edm2_params, edm2_grad_norm)
+                                torch.nn.utils.clip_grad_norm_(edm2_params, edm2_grad_norm)
 
                         #if hasattr(network, "update_grad_norms"):
                         #    network.update_grad_norms()
