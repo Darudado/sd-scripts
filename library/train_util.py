@@ -6483,10 +6483,10 @@ def get_noise_noisy_latents_and_timesteps(
         timesteps = fixed_timesteps
         if flow_model_enabled:
             # We need to recover sigmas (float 0.0 to 1.0) from the discrete timesteps
-            timestep_max = noise_scheduler.config.num_train_timesteps - 1
-            sigmas = timesteps.float() / timestep_max
+            timestep_max = noise_scheduler.config.num_train_timesteps
+            sigmas = timesteps.float() / (timestep_max - 1)
     elif flow_model_enabled:
-        timestep_max = noise_scheduler.config.num_train_timesteps - 1
+        timestep_max = noise_scheduler.config.num_train_timesteps
         distribution = getattr(args, "flow_timestep_distribution", "logit_normal")
         if distribution == "logit_normal":
             logits = torch.normal(
@@ -6524,7 +6524,7 @@ def get_noise_noisy_latents_and_timesteps(
             t_ref = sigmas
             sigmas = ratios * t_ref / (1 + (ratios - 1) * t_ref)
 
-        timesteps = torch.clamp((sigmas * timestep_max).long(), 0, timestep_max)
+        timesteps = torch.clamp((sigmas * timestep_max).long(), 0, timestep_max - 1)
     elif args.timestep_distribution == "logit_normal":
         logits = torch.normal(
             mean=float(args.logit_normal_mean),
