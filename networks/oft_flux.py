@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 import re
 from library.utils import setup_logging
-from lora import transfer_ramtensor_to_device
+from networks.ramtorch_utils import transfer_ramtensor_to_device
 
 setup_logging()
 import logging

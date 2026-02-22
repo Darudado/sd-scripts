@@ -27,6 +27,7 @@ except ImportError:
     logger.error("Failed to import ramtorch, please check ramtorch is installed correctly into the venv.")
     CPUBouncingLinear = type(None)
 
+from networks.ramtorch_utils import transfer_ramtensor_to_device
 
 class LoRAModule(torch.nn.Module):
     """
@@ -117,11 +118,27 @@ class LoRAModule(torch.nn.Module):
             self.lora_up.to(torch.cuda.current_device())
             self.lora_down.to(torch.cuda.current_device())
             self.org_module.cpu()
+            self._org_module_ref = [self.org_module]
         
         del self.org_module
 
+    def _ramtorch_org_forward(self, x):
+        """Forward pass for RamTorch modules that avoids BouncingLinearFn.apply()."""
+        org_module = self._org_module_ref[0]
+        weight = transfer_ramtensor_to_device(org_module.weight, x.device)
+        bias = None
+        if org_module.bias is not None:
+            bias = transfer_ramtensor_to_device(org_module.bias, x.device)
+        with torch.no_grad():
+            org_out = torch.nn.functional.linear(x, weight.data, bias.data if bias is not None else None)
+        return org_out
+
     def forward(self, x):
-        org_forwarded = self.org_forward(x)
+        # Use optimized path for RamTorch to avoid saving CPU weights in autograd
+        if getattr(self, 'is_ramtorch_org', False) and hasattr(self, '_org_module_ref'):
+            org_forwarded = self._ramtorch_org_forward(x)
+        else:
+            org_forwarded = self.org_forward(x)
 
         # module dropout
         if self.module_dropout is not None and self.training:

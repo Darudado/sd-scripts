@@ -27,85 +27,7 @@ except ImportError:
 
 RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
 
-class AsyncTensorStreamer:
-    def __init__(self, device):
-        self.device = device
-        self.transfer_stream = torch.cuda.Stream(device=device)
-        
-        # RING BUFFER SETTINGS
-        # Size 3 is safe: [Weight_Layer_N, Bias_Layer_N, Weight_Layer_N+1]
-        # This prevents overwriting the weight currently being computed if the 
-        # next layer starts transferring immediately.
-        self.num_buffers = 3 
-        self.idx = 0
-        
-        # We store (buffer, event) pairs. 
-        # buffer: Holds the Tensor memory on GPU
-        # event: Records when the Compute Stream is DONE using this buffer
-        self.buffers = [None] * self.num_buffers
-        self.compute_done_events = [torch.cuda.Event() for _ in range(self.num_buffers)]
-
-    def transfer(self, tensor_cpu: torch.Tensor):
-        # 1. Pin Memory (Crucial for Async)
-        if not tensor_cpu.is_pinned():
-            tensor_cpu = tensor_cpu.pin_memory()
-
-        # 2. Select the next slot in the Ring Buffer
-        slot_idx = self.idx
-        self.idx = (self.idx + 1) % self.num_buffers
-        
-        ready_event = self.compute_done_events[slot_idx]
-        
-        # 3. SYNC: Wait for the PREVIOUS Compute cycle to finish with this specific slot
-        # We cannot overwrite this slot if the GPU is still doing Math on the data previously stored here.
-        # (For the first run, the event is unrecorded, so this is a no-op).
-        self.transfer_stream.wait_event(ready_event)
-
-        with torch.cuda.stream(self.transfer_stream):
-            with torch.no_grad():
-                # 4. TRANSFER / ALLOCATE
-                # We use .to() which uses PyTorch's Caching Allocator. 
-                # If self.buffers[slot_idx] existed, it goes back to the pool.
-                # We don't manually hold .new_empty() anymore to allow dynamic resizing 
-                # if layers have different shapes.
-                gpu_tensor = tensor_cpu.to(self.device, non_blocking=True)
-                
-                # Keep a reference in our ring buffer list so Python doesn't GC it 
-                # before the stream operation completes.
-                self.buffers[slot_idx] = gpu_tensor
-            
-            # Record that transfer is finished
-            transfer_finished_event = torch.cuda.Event()
-            transfer_finished_event.record()
-
-        # 5. SYNC: Tell the Compute Stream (Current Stream) to wait for transfer
-        torch.cuda.current_stream().wait_event(transfer_finished_event)
-        
-        # 6. Mark usage
-        # Record an event on the Compute Stream. 
-        # The NEXT time we try to write to 'slot_idx', we will wait for this event.
-        ready_event.record()
-        
-        return self.buffers[slot_idx]
-
-# Global registry for multi-gpu support
-_STREAMERS = {}
-
-def transfer_ramtensor_to_device(tensor_cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """
-    Args:
-        tensor_id: Used for debugging/logging, but no longer used for memory allocation keys.
-    """
-    if not getattr(tensor_cpu, 'is_ramtorch', False):
-        return tensor_cpu.to(device, non_blocking=True)
-    
-    if device.type == 'cpu':
-        return tensor_cpu
-
-    if device not in _STREAMERS:
-        _STREAMERS[device] = AsyncTensorStreamer(device)
-    
-    return _STREAMERS[device].transfer(tensor_cpu)
+from networks.ramtorch_utils import transfer_ramtensor_to_device  # noqa: E402
 
 class LoRAModule(torch.nn.Module):
     """
@@ -182,11 +104,41 @@ class LoRAModule(torch.nn.Module):
             self.lora_up.to(torch.cuda.current_device())
             self.lora_down.to(torch.cuda.current_device())
             self.org_module.cpu()
+            # Keep a weak-ish reference to the org module so we can access its
+            # weight/bias directly without going through BouncingLinearFn
+            self._org_module_ref = [self.org_module]
         
         del self.org_module
 
+    def _ramtorch_org_forward(self, x):
+        """Forward pass for RamTorch modules that avoids BouncingLinearFn.apply().
+        
+        Instead of calling org_forward (which triggers BouncingLinearFn and saves
+        the full CPU weight tensor in the autograd graph via ctx.save_for_backward),
+        we manually transfer the weight to GPU and call F.linear directly.
+        
+        This prevents the autograd graph from holding references to ALL CPU weight
+        tensors simultaneously during backward, which was causing excessive system
+        memory usage.
+        """
+        org_module = self._org_module_ref[0]
+        weight = transfer_ramtensor_to_device(org_module.weight, x.device)
+        bias = None
+        if org_module.bias is not None:
+            bias = transfer_ramtensor_to_device(org_module.bias, x.device)
+        
+        # Use .data to prevent the large original weight from entering autograd.
+        # The LoRA parameters (lora_up/lora_down) still have gradients tracked normally.
+        with torch.no_grad():
+            org_out = torch.nn.functional.linear(x, weight.data, bias.data if bias is not None else None)
+        return org_out
+
     def forward(self, x):
-        org_forwarded = self.org_forward(x)
+        # Use optimized path for RamTorch to avoid saving CPU weights in autograd
+        if getattr(self, 'is_ramtorch_org', False) and hasattr(self, '_org_module_ref'):
+            org_forwarded = self._ramtorch_org_forward(x)
+        else:
+            org_forwarded = self.org_forward(x)
 
         # module dropout
         if self.module_dropout is not None and self.training:
