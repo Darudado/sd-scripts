@@ -27,8 +27,6 @@ except ImportError:
 
 RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
 
-from networks.ramtorch_utils import transfer_ramtensor_to_device  # noqa: E402
-
 class LoRAModule(torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -110,35 +108,9 @@ class LoRAModule(torch.nn.Module):
         
         del self.org_module
 
-    def _ramtorch_org_forward(self, x):
-        """Forward pass for RamTorch modules that avoids BouncingLinearFn.apply().
-        
-        Instead of calling org_forward (which triggers BouncingLinearFn and saves
-        the full CPU weight tensor in the autograd graph via ctx.save_for_backward),
-        we manually transfer the weight to GPU and call F.linear directly.
-        
-        This prevents the autograd graph from holding references to ALL CPU weight
-        tensors simultaneously during backward, which was causing excessive system
-        memory usage.
-        """
-        org_module = self._org_module_ref[0]
-        weight = transfer_ramtensor_to_device(org_module.weight, x.device)
-        bias = None
-        if org_module.bias is not None:
-            bias = transfer_ramtensor_to_device(org_module.bias, x.device)
-        
-        # Use .data to prevent the large original weight from entering autograd.
-        # The LoRA parameters (lora_up/lora_down) still have gradients tracked normally.
-        with torch.no_grad():
-            org_out = torch.nn.functional.linear(x, weight.data, bias.data if bias is not None else None)
-        return org_out
 
     def forward(self, x):
-        # Use optimized path for RamTorch to avoid saving CPU weights in autograd
-        if getattr(self, 'is_ramtorch_org', False) and hasattr(self, '_org_module_ref'):
-            org_forwarded = self._ramtorch_org_forward(x)
-        else:
-            org_forwarded = self.org_forward(x)
+        org_forwarded = self.org_forward(x)
 
         # module dropout
         if self.module_dropout is not None and self.training:
