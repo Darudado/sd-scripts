@@ -112,6 +112,7 @@ class BaseDatasetParams:
     validation_seed: Optional[int] = None
     validation_split: float = 0.0
     resize_interpolation: Optional[str] = None
+    multires_training: bool = False
 
 @dataclass
 class DreamBoothDatasetParams(BaseDatasetParams):
@@ -251,6 +252,7 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "network_multiplier": float,
         "resize_interpolation": str,
+        "multires_training": bool,
     }
 
     # options handled by argparse but not handled by user config
@@ -560,6 +562,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                   max_bucket_reso: {dataset.max_bucket_reso}
                   bucket_reso_steps: {dataset.bucket_reso_steps}
                   bucket_no_upscale: {dataset.bucket_no_upscale}
+                  multires_training: {dataset.multires_training}
                 \n"""), "  ")
             else:
                 info += "\n"

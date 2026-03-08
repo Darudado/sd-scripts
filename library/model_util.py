@@ -1333,7 +1333,7 @@ def use_reflection_padding(vae):
 # endregion
 
 
-def make_bucket_resolutions(max_reso, min_size=256, max_size=1024, divisible=64):
+def make_bucket_resolutions(max_reso, min_size=256, max_size=1024, divisible=64, multires_training=False):
     max_width, max_height = max_reso
     max_area = max_width * max_height
 
@@ -1344,18 +1344,19 @@ def make_bucket_resolutions(max_reso, min_size=256, max_size=1024, divisible=64)
 
     width = min_size
     while width <= max_size:
-        height = min(max_size, int((max_area // width) // divisible) * divisible)
-        if height >= min_size:
-            resos.add((width, height))
-            resos.add((height, width))
-
-        # # make additional resos
-        # if width >= height and width - divisible >= min_size:
-        #   resos.add((width - divisible, height))
-        #   resos.add((height, width - divisible))
-        # if height >= width and height - divisible >= min_size:
-        #   resos.add((width, height - divisible))
-        #   resos.add((height - divisible, width))
+        max_h = min(max_size, int((max_area // width) // divisible) * divisible)
+        
+        if not multires_training:
+            height = max_h
+            if height >= min_size:
+                resos.add((width, height))
+                resos.add((height, width))
+        else:
+            height = min_size
+            while height <= max_h:
+                resos.add((width, height))
+                resos.add((height, width))
+                height += divisible
 
         width += divisible
 

@@ -226,7 +226,8 @@ class ImageInfo:
 
 
 class BucketManager:
-    def __init__(self, no_upscale, max_reso, min_size, max_size, reso_steps) -> None:
+    def __init__(self, no_upscale, max_reso, min_size, max_size, reso_steps, multires_training=False) -> None:
+        self.multires_training = multires_training
         if max_size is not None:
             if max_reso is not None:
                 assert max_size >= max_reso[0], "the max_size should be larger than the width of max_reso"
@@ -274,7 +275,7 @@ class BucketManager:
         self.reso_to_id = sorted_reso_to_id
 
     def make_buckets(self):
-        resos = model_util.make_bucket_resolutions(self.max_reso, self.min_size, self.max_size, self.reso_steps)
+        resos = model_util.make_bucket_resolutions(self.max_reso, self.min_size, self.max_size, self.reso_steps, self.multires_training)
         self.set_predefined_resos(resos)
 
     def set_predefined_resos(self, resos):
@@ -304,9 +305,19 @@ class BucketManager:
             if reso in self.predefined_resos_set:
                 pass
             else:
-                ar_errors = self.predefined_aspect_ratios - aspect_ratio
-                predefined_bucket_id = np.abs(ar_errors).argmin()  # 当該解像度以外でaspect ratio errorが最も少ないもの
-                reso = self.predefined_resos[predefined_bucket_id]
+                ar_errors = np.abs(self.predefined_aspect_ratios - aspect_ratio)
+                if getattr(self, "multires_training", False):
+                    min_ar_error = ar_errors.min()
+                    # filter out the closest aspect ratios
+                    closest_indices = np.where(ar_errors <= min_ar_error + 1e-4)[0]
+                    # from these, find the one with the closest area
+                    target_area = image_width * image_height
+                    areas = np.array([self.predefined_resos[i][0] * self.predefined_resos[i][1] for i in closest_indices])
+                    best_index = closest_indices[np.abs(areas - target_area).argmin()]
+                    reso = self.predefined_resos[best_index]
+                else:
+                    predefined_bucket_id = ar_errors.argmin()  # 当該解像度以外でaspect ratio errorが最も少ないもの
+                    reso = self.predefined_resos[predefined_bucket_id]
 
             ar_reso = reso[0] / reso[1]
             if aspect_ratio > ar_reso:  # 横が長い→縦を合わせる
@@ -1118,6 +1129,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     self.min_bucket_reso,
                     self.max_bucket_reso,
                     self.bucket_reso_steps,
+                    getattr(self, "multires_training", False),
                 )
                 if not self.bucket_no_upscale:
                     self.bucket_manager.make_buckets()
@@ -2023,6 +2035,7 @@ class DreamBoothDataset(BaseDataset):
         max_bucket_reso: int,
         bucket_reso_steps: int,
         bucket_no_upscale: bool,
+        multires_training: bool,
         prior_loss_weight: float,
         debug_dataset: bool,
         validation_split: float,
@@ -2050,11 +2063,13 @@ class DreamBoothDataset(BaseDataset):
             self.max_bucket_reso = max_bucket_reso
             self.bucket_reso_steps = bucket_reso_steps
             self.bucket_no_upscale = bucket_no_upscale
+            self.multires_training = multires_training
         else:
             self.min_bucket_reso = None
             self.max_bucket_reso = None
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
+            self.multires_training = False
 
         def read_caption(img_path, caption_extension, enable_wildcard):
             # captionの候補ファイル名を作る
@@ -2333,6 +2348,7 @@ class FineTuningDataset(BaseDataset):
         max_bucket_reso: int,
         bucket_reso_steps: int,
         bucket_no_upscale: bool,
+        multires_training: bool,
         debug_dataset: bool,
         validation_seed: int,
         validation_split: float,
@@ -2353,11 +2369,13 @@ class FineTuningDataset(BaseDataset):
             self.max_bucket_reso = max_bucket_reso
             self.bucket_reso_steps = bucket_reso_steps
             self.bucket_no_upscale = bucket_no_upscale
+            self.multires_training = multires_training
         else:
             self.min_bucket_reso = None
             self.max_bucket_reso = None
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
+            self.multires_training = False
 
         self.num_train_images = 0
         self.num_reg_images = 0
@@ -2522,6 +2540,7 @@ class ControlNetDataset(BaseDataset):
         max_bucket_reso: int,
         bucket_reso_steps: int,
         bucket_no_upscale: bool,
+        multires_training: bool,
         debug_dataset: bool,
         validation_split: float,
         validation_seed: Optional[int],
@@ -2577,6 +2596,7 @@ class ControlNetDataset(BaseDataset):
             max_bucket_reso,
             bucket_reso_steps,
             bucket_no_upscale,
+            multires_training,
             1.0,
             debug_dataset,
             validation_split,
@@ -4820,6 +4840,11 @@ def add_dataset_arguments(
         "--bucket_no_upscale",
         action="store_true",
         help="make bucket for each image without upscaling / 画像を拡大せずbucketを作成します",
+    )
+    parser.add_argument(
+        "--multires_training",
+        action="store_true",
+        help="make buckets for all resolutions down to minimum resolution for multires training",
     )
     parser.add_argument(
         "--resize_interpolation",

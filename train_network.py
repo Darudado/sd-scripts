@@ -1623,6 +1623,7 @@ class NetworkTrainer:
                     "ss_shuffle_caption": bool(args.shuffle_caption),
                     "ss_enable_bucket": bool(dataset.enable_bucket),
                     "ss_bucket_no_upscale": bool(dataset.bucket_no_upscale),
+                    "ss_multires_training": bool(getattr(dataset, "multires_training", False)),
                     "ss_min_bucket_reso": dataset.min_bucket_reso,
                     "ss_max_bucket_reso": dataset.max_bucket_reso,
                     "ss_keep_tokens": args.keep_tokens,
