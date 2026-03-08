@@ -338,19 +338,28 @@ class BucketManager:
                 # logger.info(b_width_in_hr, b_height_rounded, ar_height_rounded)
 
                 if abs(ar_width_rounded - aspect_ratio) < abs(ar_height_rounded - aspect_ratio):
-                    resized_size = (b_width_rounded, int(b_width_rounded / aspect_ratio + 0.5))
+                    calc_size = (b_width_rounded, int(b_width_rounded / aspect_ratio + 0.5))
                 else:
-                    resized_size = (int(b_height_rounded * aspect_ratio + 0.5), b_height_rounded)
-                # logger.info(resized_size)
+                    calc_size = (int(b_height_rounded * aspect_ratio + 0.5), b_height_rounded)
+                # logger.info(calc_size)
             else:
-                resized_size = (image_width, image_height)  # リサイズは不要
+                calc_size = (image_width, image_height)  # リサイズは不要
 
             # 画像のサイズ未満をbucketのサイズとする（paddingせずにcroppingする）
-            bucket_width = resized_size[0] - resized_size[0] % self.reso_steps
-            bucket_height = resized_size[1] - resized_size[1] % self.reso_steps
-            # logger.info(f"use arbitrary {image_width}, {image_height}, {resized_size}, {bucket_width}, {bucket_height}")
+            bucket_width = calc_size[0] - calc_size[0] % self.reso_steps
+            bucket_height = calc_size[1] - calc_size[1] % self.reso_steps
+            # logger.info(f"use arbitrary {image_width}, {image_height}, {calc_size}, {bucket_width}, {bucket_height}")
 
             reso = (bucket_width, bucket_height)
+
+            # smoothly downscale the image to fit the bucket size 
+            if bucket_width > 0 and bucket_height > 0:
+                scale_w = bucket_width / image_width
+                scale_h = bucket_height / image_height
+                scale = max(scale_w, scale_h)
+                resized_size = (int(image_width * scale + 0.5), int(image_height * scale + 0.5))
+            else:
+                resized_size = calc_size
 
         self.add_if_new_reso(reso)
 
