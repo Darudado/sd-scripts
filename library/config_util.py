@@ -63,6 +63,9 @@ class BaseSubsetParams:
     secondary_separator: Optional[str] = None
     enable_wildcard: bool = False
     color_aug: bool = False
+    gamma_aug: bool = False
+    gamma_aug_range: Optional[Tuple[float, float]] = None
+    gamma_aug_rate: float = 0.5
     flip_aug: bool = False
     face_crop_aug_range: Optional[Tuple[float, float]] = None
     random_crop: bool = False
@@ -187,6 +190,9 @@ class ConfigSanitizer:
     # subset schema
     SUBSET_ASCENDABLE_SCHEMA = {
         "color_aug": bool,
+        "gamma_aug": bool,
+        "gamma_aug_range": functools.partial(__validate_and_convert_twodim.__func__, float),
+        "gamma_aug_rate": Any(float, int),
         "face_crop_aug_range": functools.partial(__validate_and_convert_twodim.__func__, float),
         "flip_aug": bool,
         "num_repeats": int,
@@ -502,6 +508,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                 # Set values for consistency
                 subset_blueprint.params.num_repeats = 1
                 subset_blueprint.params.color_aug = False
+                subset_blueprint.params.gamma_aug = False
                 subset_blueprint.params.flip_aug = False
                 subset_blueprint.params.random_crop = False
                 subset_blueprint.params.random_crop_padding_percent = 0.0
@@ -523,6 +530,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     # Set values for consistency
                     subset_blueprint_params_copy.num_repeats = 1
                     subset_blueprint_params_copy.color_aug = False
+                    subset_blueprint_params_copy.gamma_aug = False
                     subset_blueprint_params_copy.flip_aug = False
                     subset_blueprint_params_copy.random_crop = False
                     subset_blueprint_params_copy.random_crop_padding_percent = 0.0
@@ -582,6 +590,9 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     caption_prefix: {subset.caption_prefix}
                     caption_suffix: {subset.caption_suffix}
                     color_aug: {subset.color_aug}
+                    gamma_aug: {subset.gamma_aug}
+                    gamma_aug_range: {subset.gamma_aug_range}
+                    gamma_aug_rate: {subset.gamma_aug_rate}
                     flip_aug: {subset.flip_aug}
                     face_crop_aug_range: {subset.face_crop_aug_range}
                     random_crop: {subset.random_crop}

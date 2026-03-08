@@ -410,35 +410,32 @@ class AugHelper:
     def __init__(self):
         pass
 
-    def color_aug(self, image: np.ndarray):
-        # self.color_aug_method = albu.OneOf(
-        #     [
-        #         albu.HueSaturationValue(8, 0, 0, p=0.5),
-        #         albu.RandomGamma((95, 105), p=0.5),
-        #     ],
-        #     p=0.33,
-        # )
-        hue_shift_limit = 8
+    def get_augmentor(self, use_color_aug: bool, use_gamma_aug: bool, gamma_aug_range: Optional[Tuple[float, float]], gamma_aug_rate: float):
+        def augmentor(image: np.ndarray, **kwargs):
+            if use_color_aug:
+                hue_shift_limit = 8
+                if random.random() <= 0.33:
+                    if random.random() > 0.5:
+                        hsv_img = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+                        hue_shift = random.uniform(-hue_shift_limit, hue_shift_limit)
+                        if hue_shift < 0:
+                            hue_shift = 180 + hue_shift
+                        hsv_img[:, :, 0] = (hsv_img[:, :, 0] + hue_shift) % 180
+                        image = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2BGR)
+                    else:
+                        gamma = random.uniform(0.95, 1.05)
+                        image = np.clip(image**gamma, 0, 255).astype(np.uint8)
+            
+            if use_gamma_aug and gamma_aug_range is not None:
+                if random.random() <= gamma_aug_rate:
+                    gamma = random.uniform(gamma_aug_range[0], gamma_aug_range[1])
+                    image = np.clip(image**gamma, 0, 255).astype(np.uint8)
 
-        # remove dependency to albumentations
-        if random.random() <= 0.33:
-            if random.random() > 0.5:
-                # hue shift
-                hsv_img = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-                hue_shift = random.uniform(-hue_shift_limit, hue_shift_limit)
-                if hue_shift < 0:
-                    hue_shift = 180 + hue_shift
-                hsv_img[:, :, 0] = (hsv_img[:, :, 0] + hue_shift) % 180
-                image = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2BGR)
-            else:
-                # random gamma
-                gamma = random.uniform(0.95, 1.05)
-                image = np.clip(image**gamma, 0, 255).astype(np.uint8)
+            return {"image": image}
 
-        return {"image": image}
-
-    def get_augmentor(self, use_color_aug: bool):  # -> Optional[Callable[[np.ndarray], Dict[str, np.ndarray]]]:
-        return self.color_aug if use_color_aug else None
+        if use_color_aug or use_gamma_aug:
+            return augmentor
+        return None
 
 
 class BaseSubset:
@@ -454,6 +451,9 @@ class BaseSubset:
         secondary_separator: Optional[str],
         enable_wildcard: bool,
         color_aug: bool,
+        gamma_aug: bool,
+        gamma_aug_range: Optional[Tuple[float, float]],
+        gamma_aug_rate: float,
         flip_aug: bool,
         face_crop_aug_range: Optional[Tuple[float, float]],
         random_crop: bool,
@@ -481,6 +481,9 @@ class BaseSubset:
         self.secondary_separator = secondary_separator
         self.enable_wildcard = enable_wildcard
         self.color_aug = color_aug
+        self.gamma_aug = gamma_aug
+        self.gamma_aug_range = gamma_aug_range
+        self.gamma_aug_rate = gamma_aug_rate
         self.flip_aug = flip_aug
         self.face_crop_aug_range = face_crop_aug_range
         self.random_crop = random_crop
@@ -523,6 +526,9 @@ class DreamBoothSubset(BaseSubset):
         secondary_separator,
         enable_wildcard,
         color_aug,
+        gamma_aug,
+        gamma_aug_range,
+        gamma_aug_rate,
         flip_aug,
         face_crop_aug_range,
         random_crop,
@@ -553,6 +559,9 @@ class DreamBoothSubset(BaseSubset):
             secondary_separator,
             enable_wildcard,
             color_aug,
+            gamma_aug,
+            gamma_aug_range,
+            gamma_aug_rate,
             flip_aug,
             face_crop_aug_range,
             random_crop,
@@ -599,6 +608,9 @@ class FineTuningSubset(BaseSubset):
         secondary_separator,
         enable_wildcard,
         color_aug,
+        gamma_aug,
+        gamma_aug_range,
+        gamma_aug_rate,
         flip_aug,
         face_crop_aug_range,
         random_crop,
@@ -629,6 +641,9 @@ class FineTuningSubset(BaseSubset):
             secondary_separator,
             enable_wildcard,
             color_aug,
+            gamma_aug,
+            gamma_aug_range,
+            gamma_aug_rate,
             flip_aug,
             face_crop_aug_range,
             random_crop,
@@ -670,6 +685,9 @@ class ControlNetSubset(BaseSubset):
         secondary_separator,
         enable_wildcard,
         color_aug,
+        gamma_aug,
+        gamma_aug_range,
+        gamma_aug_rate,
         flip_aug,
         face_crop_aug_range,
         random_crop,
@@ -700,6 +718,9 @@ class ControlNetSubset(BaseSubset):
             secondary_separator,
             enable_wildcard,
             color_aug,
+            gamma_aug,
+            gamma_aug_range,
+            gamma_aug_rate,
             flip_aug,
             face_crop_aug_range,
             random_crop,
@@ -1202,7 +1223,7 @@ class BaseDataset(torch.utils.data.Dataset):
         )
 
     def is_latent_cacheable(self):
-        return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
+        return all([not subset.color_aug and not subset.gamma_aug and not subset.random_crop for subset in self.subsets])
 
     def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False):
         return all(
@@ -1761,7 +1782,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     crop_ltrb = (0, 0, 0, 0)
 
                 # augmentation
-                aug = self.aug_helper.get_augmentor(subset.color_aug)
+                aug = self.aug_helper.get_augmentor(subset.color_aug, subset.gamma_aug, subset.gamma_aug_range, subset.gamma_aug_rate)
                 if aug is not None:
                     # augment RGB channels only
                     img_rgb = img[:, :, :3]
@@ -4768,6 +4789,21 @@ def add_dataset_arguments(
         "--color_aug", action="store_true", help="enable weak color augmentation / 学習時に色合いのaugmentationを有効にする"
     )
     parser.add_argument(
+        "--gamma_aug", action="store_true", help="enable gamma augmentation / 学習時にガンマのaugmentationを有効にする"
+    )
+    parser.add_argument(
+        "--gamma_aug_range",
+        type=str,
+        default="0.95,1.05",
+        help="gamma augmentation range (e.g. 0.9,1.1) / 学習時にガンマのaugmentationを有効にするときの範囲を指定する（例：0.9,1.1）",
+    )
+    parser.add_argument(
+        "--gamma_aug_rate",
+        type=float,
+        default=0.5,
+        help="gamma augmentation probability/rate (0.0 to 1.0) / ガンマのaugmentationの確率（0.0 から 1.0）",
+    )
+    parser.add_argument(
         "--flip_aug", action="store_true", help="enable horizontal flip augmentation / 学習時に左右反転のaugmentationを有効にする"
     )
     parser.add_argument(
@@ -5732,18 +5768,28 @@ def prepare_dataset_args(args: argparse.Namespace, support_metadata: bool):
             len(args.resolution) == 2
         ), f"resolution must be 'size' or 'width,height' / resolution（解像度）は'サイズ'または'幅','高さ'で指定してください: {args.resolution}"
 
-    if args.face_crop_aug_range is not None:
-        args.face_crop_aug_range = tuple([float(r) for r in args.face_crop_aug_range.split(",")])
+    if getattr(args, "face_crop_aug_range", None) is not None:
+        if isinstance(args.face_crop_aug_range, str):
+            args.face_crop_aug_range = tuple([float(r) for r in args.face_crop_aug_range.split(",")])
         assert (
             len(args.face_crop_aug_range) == 2 and args.face_crop_aug_range[0] <= args.face_crop_aug_range[1]
         ), f"face_crop_aug_range must be two floats / face_crop_aug_rangeは'下限,上限'で指定してください: {args.face_crop_aug_range}"
     else:
         args.face_crop_aug_range = None
 
+    if getattr(args, "gamma_aug_range", None) is not None:
+        if isinstance(args.gamma_aug_range, str):
+            args.gamma_aug_range = tuple([float(r) for r in args.gamma_aug_range.split(",")])
+        assert (
+            len(args.gamma_aug_range) == 2 and args.gamma_aug_range[0] <= args.gamma_aug_range[1]
+        ), f"gamma_aug_range must be two floats / gamma_aug_rangeは'下限,上限'で指定してください: {args.gamma_aug_range}"
+    else:
+        args.gamma_aug_range = None
+
     if support_metadata:
-        if args.in_json is not None and (args.color_aug or args.random_crop):
+        if args.in_json is not None and (args.color_aug or args.random_crop or getattr(args, "gamma_aug", False)):
             logger.warning(
-                f"latents in npz is ignored when color_aug or random_crop is True / color_augまたはrandom_cropを有効にした場合、npzファイルのlatentsは無視されます"
+                f"latents in npz is ignored when color_aug or gamma_aug or random_crop is True / color_augまたはgamma_augかrandom_cropを有効にした場合、npzファイルのlatentsは無視されます"
             )
 
 
