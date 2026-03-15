@@ -459,7 +459,12 @@ class NetworkTrainer:
 
         self.tlora_enabled = True
         self.tlora_max_rank = int(network_dim) if network_dim is not None else 4
-        self.tlora_min_rank = int(net_kwargs.get("tlora_min_rank", 1))
+        tlora_min_rank = net_kwargs.get("tlora_min_rank", None)
+        if tlora_min_rank is None:
+            self.tlora_min_rank = int(math.ceil(self.tlora_max_rank * 0.5))
+        else:
+            self.tlora_min_rank = int(tlora_min_rank)
+        self.tlora_min_rank = max(0, min(self.tlora_min_rank, self.tlora_max_rank))
         self.tlora_mask_alpha = float(net_kwargs.get("tlora_mask_alpha", 1.0))
         self.tlora_max_timestep = noise_scheduler.config.num_train_timesteps
         logger.info(
