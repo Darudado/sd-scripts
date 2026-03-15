@@ -273,6 +273,9 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 if t is not None and t.dtype.is_floating_point:
                     t.requires_grad_(True)
 
+        # Set T-LoRA timestep mask before the forward pass
+        self.apply_tlora_mask(timesteps)
+
         # Unpack Gemma2 outputs
         gemma2_hidden_states, input_ids, gemma2_attn_mask = text_encoder_conds
 
@@ -293,6 +296,9 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
             gemma2_attn_mask=gemma2_attn_mask,
             timesteps=timesteps,
         )
+
+        # Clear T-LoRA mask after the forward pass
+        self.clear_tlora_mask_if_needed()
 
         # apply model prediction type
         model_pred, weighting = lumina_train_util.apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas)

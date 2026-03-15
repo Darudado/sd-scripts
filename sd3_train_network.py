@@ -356,6 +356,9 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
                 if t is not None and t.dtype.is_floating_point:
                     t.requires_grad_(True)
 
+        # Set T-LoRA timestep mask before the forward pass
+        self.apply_tlora_mask(timesteps)
+
         # Predict the noise residual
         lg_out, t5_out, lg_pooled, l_attn_mask, g_attn_mask, t5_attn_mask = text_encoder_conds
         text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
@@ -370,6 +373,9 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         with torch.set_grad_enabled(is_train), accelerator.autocast():
             # TODO support attention mask
             model_pred = unet(noisy_model_input, timesteps, context=context, y=lg_pooled)
+
+        # Clear T-LoRA mask after the forward pass
+        self.clear_tlora_mask_if_needed()
 
         # Follow: Section 5 of https://arxiv.org/abs/2206.00364.
         # Preconditioning of the model outputs.

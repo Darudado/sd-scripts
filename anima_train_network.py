@@ -293,6 +293,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             fixed_timesteps=fixed_timesteps, 
             is_train=is_train,
         )
+        # Set T-LoRA timestep mask before timestep scaling (mask expects [0, max_timestep] range)
+        self.apply_tlora_mask(timesteps)
+
         timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
 
         # Gradient checkpointing support
@@ -330,6 +333,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 source_attention_mask=attn_mask,
             )
         model_pred = model_pred.squeeze(2)  # 5D to 4D, [B, C, 1, H, W] -> [B, C, H, W]
+
+        # Clear T-LoRA mask after the forward pass
+        self.clear_tlora_mask_if_needed()
 
         # Upcast for grokking
         latents = latents.to(torch.float64)

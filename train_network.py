@@ -52,6 +52,13 @@ from library.custom_train_functions import (
 )
 from library.utils import setup_logging, add_logging_arguments
 
+# T-LoRA timestep-dependent rank masking support
+try:
+    from lycoris.modules.tlora import set_timestep_mask, clear_timestep_mask, compute_timestep_mask
+    TLORA_AVAILABLE = True
+except ImportError:
+    TLORA_AVAILABLE = False
+
 setup_logging()
 import logging
 
@@ -63,6 +70,13 @@ class NetworkTrainer:
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
         self.latent_shift = 0.0
+
+        # T-LoRA timestep-dependent rank masking config
+        self.tlora_enabled = False
+        self.tlora_max_rank = 0
+        self.tlora_min_rank = 1
+        self.tlora_mask_alpha = 1.0
+        self.tlora_max_timestep = 1000
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -333,6 +347,9 @@ class NetworkTrainer:
             for t in text_encoder_conds:
                 t.requires_grad_(True)
 
+        # Set T-LoRA timestep mask before the forward pass
+        self.apply_tlora_mask(timesteps)
+
         # Predict the noise residual
         with torch.set_grad_enabled(is_train), accelerator.autocast():
             noise_pred = self.call_unet(
@@ -346,6 +363,9 @@ class NetworkTrainer:
                 batch,
                 weight_dtype,
             )
+
+        # Clear T-LoRA mask after the forward pass
+        self.clear_tlora_mask_if_needed()
 
         # Upcast for grokking
         latents = latents.to(torch.float64)
@@ -423,6 +443,60 @@ class NetworkTrainer:
 
     def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
         pass
+
+    def setup_tlora_masking(self, net_kwargs, network_dim, noise_scheduler):
+        """
+        Initialize T-LoRA timestep masking if the algo is tlora.
+
+        Reads tlora_min_rank and tlora_mask_alpha from network_args.
+        Must be called after the network is created.
+        """
+        if not TLORA_AVAILABLE:
+            return
+        algo = (net_kwargs.get("algo", "lora") or "lora").lower()
+        if algo != "tlora":
+            return
+
+        self.tlora_enabled = True
+        self.tlora_max_rank = int(network_dim) if network_dim is not None else 4
+        self.tlora_min_rank = int(net_kwargs.get("tlora_min_rank", 1))
+        self.tlora_mask_alpha = float(net_kwargs.get("tlora_mask_alpha", 1.0))
+        self.tlora_max_timestep = noise_scheduler.config.num_train_timesteps
+        logger.info(
+            f"T-LoRA masking enabled: max_rank={self.tlora_max_rank}, "
+            f"min_rank={self.tlora_min_rank}, mask_alpha={self.tlora_mask_alpha}, "
+            f"max_timestep={self.tlora_max_timestep}"
+        )
+
+    def apply_tlora_mask(self, timesteps: torch.Tensor):
+        """
+        Compute and set the T-LoRA timestep mask for the current batch.
+
+        The original T-LoRA paper uses timesteps[0] (first sample in batch).
+        Here we use the max timestep, which is more conservative for multi-sample
+        batches (fewest active ranks = highest noise level in batch).
+        For batch_size=1 (common in LoRA training), both are equivalent.
+        """
+        if not self.tlora_enabled:
+            return
+
+        # Use the max timestep in the batch to determine the mask
+        # Original T-LoRA uses timesteps[0]; max() is safer for larger batches
+        max_t = int(timesteps.max().item())
+        mask = compute_timestep_mask(
+            timestep=max_t,
+            max_timestep=self.tlora_max_timestep,
+            max_rank=self.tlora_max_rank,
+            min_rank=self.tlora_min_rank,
+            alpha=self.tlora_mask_alpha,
+        )
+        set_timestep_mask(mask)
+
+    def clear_tlora_mask_if_needed(self):
+        """Clear the T-LoRA mask after the forward pass."""
+        if not self.tlora_enabled:
+            return
+        clear_timestep_mask()
 
     # endregion
 
@@ -1715,6 +1789,9 @@ class NetworkTrainer:
         global_step = resumed_step
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
+
+        # Initialize T-LoRA timestep masking if applicable
+        self.setup_tlora_masking(net_kwargs, args.network_dim, noise_scheduler)
 
         edm2_model, edm2_optimizer, edm2_lr_scheduler = prepare_edm2_loss_weighting(args, noise_scheduler, accelerator)
 

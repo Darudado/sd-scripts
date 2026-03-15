@@ -564,6 +564,9 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
                 if t is not None and t.dtype.is_floating_point:
                     t.requires_grad_(True)
 
+        # Set T-LoRA timestep mask before the forward pass
+        self.apply_tlora_mask(timesteps)
+
         # Predict the noise residual
         # ocr_mask is for inference only, so it is not used here
         vlm_embed, vlm_mask, byt5_embed, byt5_mask, ocr_mask = text_encoder_conds
@@ -577,6 +580,9 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
             model_pred = unet(
                 noisy_model_input, timesteps, vlm_embed, vlm_mask, byt5_embed, byt5_mask  # , self.rotary_pos_emb_cache
             )
+
+        # Clear T-LoRA mask after the forward pass
+        self.clear_tlora_mask_if_needed()
 
         # apply model prediction type
         model_pred, weighting = flux_train_utils.apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas)

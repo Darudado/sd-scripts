@@ -369,6 +369,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             if mod_vectors is not None:
                 mod_vectors.requires_grad_(True)
 
+        # Set T-LoRA timestep mask before the forward pass
+        self.apply_tlora_mask(timesteps)
+
         # Predict the noise residual
         l_pooled, t5_out, txt_ids, t5_attn_mask = text_encoder_conds
         if not args.apply_t5_attn_mask:
@@ -402,6 +405,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             t5_attn_mask=t5_attn_mask,
             mod_vectors=mod_vectors,
         )
+
+        # Clear T-LoRA mask after the forward pass
+        self.clear_tlora_mask_if_needed()
 
         # unpack latents
         model_pred = flux_utils.unpack_latents(model_pred, packed_latent_height, packed_latent_width)
