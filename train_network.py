@@ -54,7 +54,7 @@ from library.utils import setup_logging, add_logging_arguments
 
 # T-LoRA timestep-dependent rank masking support
 try:
-    from lycoris.modules.tlora import set_timestep_mask, clear_timestep_mask, compute_timestep_mask
+    from lycoris.modules.tlora import set_timestep_mask, clear_timestep_mask, compute_timestep_mask, compute_timestep_mask_batch
     TLORA_AVAILABLE = True
 except ImportError:
     TLORA_AVAILABLE = False
@@ -451,11 +451,13 @@ class NetworkTrainer:
         Reads tlora_min_rank and tlora_mask_alpha from network_args.
         Must be called after the network is created.
         """
-        if not TLORA_AVAILABLE:
-            return
         algo = (net_kwargs.get("algo", "lora") or "lora").lower()
         if algo != "tlora":
             return
+        if not TLORA_AVAILABLE:
+            logger.warning("T-LoRA requested but lyco_tlora is not available. Skipping T-LoRA setup.")
+            return
+
 
         self.tlora_enabled = True
         self.tlora_max_rank = int(network_dim) if network_dim is not None else 4
@@ -477,24 +479,33 @@ class NetworkTrainer:
         """
         Compute and set the T-LoRA timestep mask for the current batch.
 
-        The original T-LoRA paper uses timesteps[0] (first sample in batch).
-        Here we use the max timestep, which is more conservative for multi-sample
-        batches (fewest active ranks = highest noise level in batch).
-        For batch_size=1 (common in LoRA training), both are equivalent.
+        Computes a per-sample mask so each sample in the batch gets a rank
+        mask matching its own noise level, avoiding the bias of a single
+        shared mask (e.g. max timestep penalizing low-noise samples).
+        For batch_size=1 (common in LoRA training), this is equivalent to
+        computing a single mask.
         """
         if not self.tlora_enabled:
             return
 
-        # Use the max timestep in the batch to determine the mask
-        # Original T-LoRA uses timesteps[0]; max() is safer for larger batches
-        max_t = int(timesteps.max().item())
-        mask = compute_timestep_mask(
-            timestep=max_t,
-            max_timestep=self.tlora_max_timestep,
-            max_rank=self.tlora_max_rank,
-            min_rank=self.tlora_min_rank,
-            alpha=self.tlora_mask_alpha,
-        )
+        if timesteps.numel() == 1:
+            # Fast path for batch_size=1: avoid tensor ops
+            mask = compute_timestep_mask(
+                timestep=int(timesteps.item()),
+                max_timestep=self.tlora_max_timestep,
+                max_rank=self.tlora_max_rank,
+                min_rank=self.tlora_min_rank,
+                alpha=self.tlora_mask_alpha,
+            )
+        else:
+            # Per-sample masks: shape (B, max_rank)
+            mask = compute_timestep_mask_batch(
+                timesteps=timesteps,
+                max_timestep=self.tlora_max_timestep,
+                max_rank=self.tlora_max_rank,
+                min_rank=self.tlora_min_rank,
+                alpha=self.tlora_mask_alpha,
+            )
         set_timestep_mask(mask)
 
     def clear_tlora_mask_if_needed(self):
