@@ -522,8 +522,8 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
             else:
                 if (float(dataset_blueprint.params.validation_split) > 0.0 
                 and not (getattr(subset_blueprint.params,'is_val', False) or 
-                subset_blueprint.params == ControlNetSubsetParams or 
-                subset_blueprint.params.is_reg)):
+                isinstance(subset_blueprint.params, ControlNetSubsetParams) or 
+                getattr(subset_blueprint.params, 'is_reg', False))):
 
                     subset_blueprint_params_copy = copy.deepcopy(subset_blueprint.params)
 
