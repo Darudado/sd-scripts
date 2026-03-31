@@ -28,6 +28,47 @@ FP8_OPTIMIZATION_TARGET_KEYS = ["blocks", ""]
 # ".embed." excludes Embedding in LLMAdapter
 FP8_OPTIMIZATION_EXCLUDE_KEYS = ["_embedder", "norm", "adaln", "final_layer", ".embed."]
 
+def apply_fp16_patch(model):
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        device_type = "xpu"
+
+    def make_autocast(dtype, func):
+        @torch.autocast(device_type, dtype=dtype)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        return wrapper
+
+    blocks = getattr(model, "blocks", [])
+    if not blocks and hasattr(model, "transformer_blocks"):
+        blocks = model.transformer_blocks
+
+    index = 0
+    for block in blocks:
+
+        if index > 1:
+            # if hasattr(block, 'adaln_modulation_self_attn'):
+            #     block.adaln_modulation_self_attn.forward = make_autocast(torch.float16, block.adaln_modulation_self_attn.forward)
+            # if hasattr(block, 'adaln_modulation_cross_attn'):
+            #     block.adaln_modulation_cross_attn.forward = make_autocast(torch.float16, block.adaln_modulation_cross_attn.forward)
+            # if hasattr(block, 'adaln_modulation_mlp'):
+            #     block.adaln_modulation_mlp.forward = make_autocast(torch.float16, block.adaln_modulation_mlp.forward)
+
+            if hasattr(block, 'self_attn'):
+                block.self_attn.forward = make_autocast(torch.float16, block.self_attn.forward)
+            if hasattr(block, 'cross_attn'):
+                block.cross_attn.forward = make_autocast(torch.float16, block.cross_attn.forward)
+            if hasattr(block, 'mlp'):
+                block.mlp.forward = make_autocast(torch.float16, block.mlp.forward)
+
+        block.forward = make_autocast(torch.float32, block.forward)
+
+        index += 1
+
+    torch.set_float32_matmul_precision("high")
+    if hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_fp16_accumulation = True
+    logger.info("[anima fp16 patch] patch applied to Anima model")
 
 def load_anima_model(
     device: Union[str, torch.device],
@@ -125,6 +166,9 @@ def load_anima_model(
             logger.info(f"Moving weights to {loading_device}")
             for key in sd.keys():
                 sd[key] = sd[key].to(loading_device)
+
+    if weight_dtype == torch.float16:
+        apply_fp16_patch(model)
 
     missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
     if missing:
