@@ -167,7 +167,7 @@ def load_anima_model(
             for key in sd.keys():
                 sd[key] = sd[key].to(loading_device)
 
-    if weight_dtype == torch.float16:
+    if dit_weight_dtype == torch.float16:
         apply_fp16_patch(model)
 
     missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
