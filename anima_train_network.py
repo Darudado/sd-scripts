@@ -35,6 +35,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.sample_prompts_te_outputs = None
+        self._ot_logged = False    # fires a one-time first-batch OT log
+        self._cfm_logged = False   # fires a one-time first-batch CFM log
 
     def assert_extra_args(
         self,
@@ -42,6 +44,17 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
         val_dataset_group: Optional[train_util.DatasetGroup],
     ):
+        # --- Flow matching feature ---
+        if getattr(args, "flow_use_ot", False):
+            logger.info("[Anima] Cosine Optimal Transport (OT): ENABLED -- noise vectors will be batch-reassigned each step.")
+
+        if getattr(args, "contrastive_flow_matching", False):
+            logger.info(
+                f"[Anima] Contrastive Flow Matching (\u0394FM): ENABLED -- "
+                f"cfm_lambda={getattr(args, 'cfm_lambda', 0.05)}. "
+                "A negative contrastive loss term will be subtracted from the main loss each step."
+            )
+
         if args.fp8_base or args.fp8_base_unet:
             logger.warning("fp8_base and fp8_base_unet are not supported. / fp8_baseとfp8_base_unetはサポートされていません。")
             args.fp8_base = False
@@ -282,6 +295,20 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             latents = latents.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
         noise = torch.randn_like(latents)
 
+        if getattr(args, "flow_use_ot", False) and latents.size(0) > 1:
+            with torch.no_grad():
+                b_size = latents.size(0)
+                lat_flat = latents.view(b_size, -1)
+                noise_flat = noise.view(b_size, -1)
+                _, (_, col_indices) = train_util.cosine_optimal_transport(lat_flat, noise_flat)
+                noise = noise[col_indices.squeeze(0)]
+            if not self._ot_logged:
+                logger.info(
+                    f"[Anima OT] First batch: noise reordered by cosine OT. "
+                    f"New noise assignment indices: {col_indices.squeeze(0).tolist()}"
+                )
+                self._ot_logged = True
+
         # Get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, 
@@ -386,6 +413,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             # Add the caption dropout rates back to the list for validation dataset (which is re-used batch items)
             batch["text_encoder_outputs_list"] = text_encoder_outputs_list + [caption_dropout_rates]
 
+        if is_train and not self._cfm_logged and getattr(args, "contrastive_flow_matching", False):
+            logger.info(
+                f"[Anima CFM] First batch: Contrastive Flow Matching is active. "
+                f"Negative rolled targets will be computed and subtracted with lambda={getattr(args, 'cfm_lambda', 0.05)}."
+            )
+            self._cfm_logged = True
+
         return super().process_batch(
             batch,
             text_encoders,
@@ -463,6 +497,8 @@ def setup_parser() -> argparse.ArgumentParser:
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
     )
+    # Anima-specific default: lower cfm_lambda than the SDXL default of 0.05
+    parser.set_defaults(cfm_lambda=0.02)
     return parser
 
 
@@ -480,6 +516,10 @@ if __name__ == "__main__":
 
     if args.attn_mode == "sdpa":
         args.attn_mode = "torch"  # backward compatibility
+
+    # Anima is a Rectified Flow model. Use a private flag to bypass the CFM guard
+    # in train_network.py WITHOUT triggering the generic "Using Rectified Flow" log block.
+    args._anima_model = True
 
     trainer = AnimaNetworkTrainer()
     trainer.train(args)

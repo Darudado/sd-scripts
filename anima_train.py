@@ -431,6 +431,11 @@ def train(args):
     accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
     accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
+    if getattr(args, "flow_use_ot", False):
+        accelerator.print("  Using cosine optimal transport pairing for Rectified Flow batches.")
+    if getattr(args, "contrastive_flow_matching", False):
+        accelerator.print(f"  Contrastive Flow Matching (\u0394FM) enabled (lambda: {args.cfm_lambda})")
+
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
     global_step = 0
 
@@ -543,6 +548,14 @@ def train(args):
                 # Noise and timesteps
                 noise = torch.randn_like(latents)
 
+                if getattr(args, "flow_use_ot", False) and latents.size(0) > 1:
+                    with torch.no_grad():
+                        b_size = latents.size(0)
+                        lat_flat = latents.view(b_size, -1)
+                        noise_flat = noise.view(b_size, -1)
+                        _, (_, col_indices) = train_util.cosine_optimal_transport(lat_flat, noise_flat)
+                        noise = noise[col_indices.squeeze(0)]
+
                 # Get noisy model input and timesteps
                 noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
                     args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
@@ -590,15 +603,28 @@ def train(args):
                 # Upcast for grokking
                 model_pred = model_pred.to(dtype=torch.float64)
 
-                # Loss
+                # Loss (keep float64 throughout, matching the float64 upcasts above)
                 huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, None)
-                loss = train_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
-                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                    loss = apply_masked_loss(loss, batch)
-                loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
+                loss = train_util.conditional_loss(model_pred, target, args.loss_type, "none", huber_c)
 
                 if weighting is not None:
                     loss = loss * weighting
+
+                if getattr(args, "contrastive_flow_matching", False) and latents.size(0) > 1:
+                    # CRITICAL: .detach() prevents gradients flowing through negative samples
+                    negative_latents = latents.roll(1, 0).detach()
+                    negative_noise = noise.roll(1, 0).detach()
+                    with torch.no_grad():
+                        target_negative = (negative_noise - negative_latents).to(dtype=torch.float64)
+
+                    loss_contrastive = torch.nn.functional.mse_loss(
+                        model_pred, target_negative, reduction="none"
+                    )
+                    loss = loss - float(args.cfm_lambda) * loss_contrastive
+
+                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                    loss = apply_masked_loss(loss, batch)
+                loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
 
                 loss_weights = batch["loss_weights"]
                 loss = loss * loss_weights
@@ -762,6 +788,22 @@ def setup_parser() -> argparse.ArgumentParser:
         "--skip_latents_validity_check",
         action="store_true",
         help="[Deprecated] use 'skip_cache_check' instead",
+    )
+    parser.add_argument(
+        "--flow_use_ot",
+        action="store_true",
+        help="pair latents and noise with cosine optimal transport when using Rectified Flow",
+    )
+    parser.add_argument(
+        "--contrastive_flow_matching",
+        action="store_true",
+        help="Enable Contrastive Flow Matching (\u0394FM) objective.",
+    )
+    parser.add_argument(
+        "--cfm_lambda",
+        type=float,
+        default=0.05,
+        help="Lambda weight for the contrastive term in \u0394FM loss.",
     )
 
     return parser

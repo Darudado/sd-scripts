@@ -628,7 +628,7 @@ class NetworkTrainer:
                 negative_latents = latents.roll(1, 0).detach()
                 negative_noise = noise.roll(1, 0).detach()
                 with torch.no_grad():
-                    if getattr(args, "flow_model", False):
+                    if getattr(args, "flow_model", False) or getattr(args, "_anima_model", False):
                         target_negative = negative_noise - negative_latents
                     else:
                         target_negative = noise_scheduler.get_velocity(negative_latents, negative_noise, timesteps)
@@ -954,7 +954,7 @@ class NetworkTrainer:
                         f"Rectified Flow timestep shift uses base pixels={args.flow_uniform_base_pixels}."
                     )
 
-        if args.contrastive_flow_matching and not (args.v_parameterization or getattr(args, "flow_model", False)):
+        if args.contrastive_flow_matching and not (args.v_parameterization or getattr(args, "flow_model", False) or getattr(args, "_anima_model", False)):
             raise ValueError("`--contrastive_flow_matching` requires either v-parameterization or Rectified Flow.")
 
         if getattr(args, "vae_custom_scale", None) is not None:
