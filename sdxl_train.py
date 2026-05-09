@@ -896,6 +896,7 @@ def train(args):
         accelerator.print("")
         accelerator.print("Validating バリデーション処理...")
         total_loss = 0.0
+        total_samples = 0
 
         # set eval
         for m in training_models:
@@ -911,6 +912,16 @@ def train(args):
                 batch = next(cyclic_val_dataloader)
                 val_dataloader_state = random.getstate()
                 random.setstate(val_original_state)
+
+                # Determine current batch size for proper weighted averaging
+                if "latents" in batch and batch["latents"] is not None:
+                    current_batch_size = batch["latents"].shape[0]
+                elif "images" in batch:
+                    current_batch_size = batch["images"].shape[0]
+                elif "captions" in batch:
+                    current_batch_size = len(batch["captions"])
+                else:
+                    current_batch_size = 1
                 
                 # Validation batch processing (simplified from train loop)
                 if "latents" in batch and batch["latents"] is not None:
@@ -998,9 +1009,11 @@ def train(args):
 
                     loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
                     loss = loss.mean()
-                    total_loss += loss.item()
+                    total_loss += loss.item() * current_batch_size
 
-        current_val_loss = total_loss / (validation_steps * len(timesteps_list))
+                total_samples += current_batch_size
+
+        current_val_loss = total_loss / (total_samples * len(timesteps_list)) if total_samples > 0 else 0.0
         val_loss_recorder.add(current_val_loss)
         average_val_loss = val_loss_recorder.average
         

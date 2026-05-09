@@ -871,6 +871,7 @@ class NetworkTrainer:
         accelerator.print("") 
         accelerator.print("Validating バリデーション処理...")
         total_loss = 0.0
+        total_samples = 0
         with torch.no_grad():
             validation_steps = min(int(args.max_validation_steps), len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
             val_dataloader_seed = random.randint(global_step, 0x7FFFFFFF)
@@ -881,12 +882,24 @@ class NetworkTrainer:
                 batch = next(cyclic_val_dataloader)
                 val_dataloader_state = random.getstate()
                 random.setstate(val_original_state)
-                loss = self.process_val_batch(batch, text_encoders, unet, network, vae, noise_scheduler, vae_dtype, 
-                                              weight_dtype, accelerator, args, text_encoding_strategy, tokenize_strategy, 
+
+                # Determine current batch size for proper weighted averaging
+                if "latents" in batch and batch["latents"] is not None:
+                    current_batch_size = batch["latents"].shape[0]
+                elif "images" in batch:
+                    current_batch_size = batch["images"].shape[0]
+                elif "captions" in batch:
+                    current_batch_size = len(batch["captions"])
+                else:
+                    current_batch_size = 1
+
+                loss = self.process_val_batch(batch, text_encoders, unet, network, vae, noise_scheduler, vae_dtype,
+                                              weight_dtype, accelerator, args, text_encoding_strategy, tokenize_strategy,
                                               train_text_encoder=train_text_encoder,
                                               timesteps_list=timesteps_list)
-                total_loss += loss.detach().item()
-            current_val_loss = total_loss / validation_steps
+                total_loss += loss.detach().item() * current_batch_size
+                total_samples += current_batch_size
+            current_val_loss = total_loss / total_samples if total_samples > 0 else 0.0
             val_loss_recorder.add(current_val_loss)   
                      
         average_val_loss: float = val_loss_recorder.average
