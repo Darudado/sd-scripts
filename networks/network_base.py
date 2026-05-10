@@ -261,7 +261,7 @@ class AdditionalNetwork(torch.nn.Module):
 
         # Create modules for UNet/DiT
         target_modules = list(arch_config.unet_target_modules)
-        if modules_dim is not None or conv_lora_dim is not None:
+        if modules_dim is not None or (conv_lora_dim is not None and conv_lora_dim != 0):
             target_modules.extend(arch_config.unet_conv_target_modules)
         if train_llm_adapter and arch_config.adapter_target_modules:
             target_modules.extend(arch_config.adapter_target_modules)

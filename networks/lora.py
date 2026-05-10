@@ -458,7 +458,10 @@ def create_network(
     conv_alpha = kwargs.get("conv_alpha", None)
     if conv_dim is not None:
         conv_dim = int(conv_dim)
-        if conv_alpha is None:
+        if conv_dim == 0:
+            conv_dim = None
+            conv_alpha = None
+        elif conv_alpha is None:
             conv_alpha = 1.0
         else:
             conv_alpha = float(conv_alpha)
@@ -958,7 +961,7 @@ class LoRANetwork(torch.nn.Module):
             logger.info(
                 f"neuron dropout: p={self.dropout}, rank dropout: p={self.rank_dropout}, module dropout: p={self.module_dropout}"
             )
-            if self.conv_lora_dim is not None:
+            if self.conv_lora_dim is not None and self.conv_lora_dim != 0:
                 logger.info(
                     f"apply LoRA to Conv2d with kernel size (3,3). dim (rank): {self.conv_lora_dim}, alpha: {self.conv_alpha}"
                 )
@@ -1061,7 +1064,7 @@ class LoRANetwork(torch.nn.Module):
 
         # extend U-Net target modules if conv2d 3x3 is enabled, or load from weights
         target_modules = LoRANetwork.UNET_TARGET_REPLACE_MODULE
-        if modules_dim is not None or self.conv_lora_dim is not None or conv_block_dims is not None:
+        if modules_dim is not None or (self.conv_lora_dim is not None and self.conv_lora_dim != 0) or conv_block_dims is not None:
             target_modules += LoRANetwork.UNET_TARGET_REPLACE_MODULE_CONV2D_3X3
 
         self.unet_loras, skipped_un = create_modules(True, None, unet, target_modules)
