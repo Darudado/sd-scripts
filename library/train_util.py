@@ -5687,7 +5687,10 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
         for arg in args.lr_scheduler_args:
             key, value = arg.split("=")
-            value = ast.literal_eval(value)
+            try:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                pass  # keep as plain string
 
             # TODO temp fix for warmup and first cycle steps pending UI changes
             if key == 'first_cycle_max_steps' and float(args.validation_split) > 0.0:
