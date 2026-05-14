@@ -1,8 +1,12 @@
 # Anima LoRA training script
 
 import argparse
-from typing import Any, Optional, Union
+import os
+import random
+import sys
+from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
@@ -15,6 +19,7 @@ from library import (
     anima_train_utils,
     anima_utils,
     flux_train_utils,
+    patch_utils,
     qwen_image_autoencoder_kl,
     sd3_train_utils,
     strategy_anima,
@@ -37,6 +42,15 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self.sample_prompts_te_outputs = None
         self._ot_logged = False    # fires a one-time first-batch OT log
         self._cfm_logged = False   # fires a one-time first-batch CFM log
+
+        # Patch training state
+        self._patch_image_paths: List[str] = []
+        self._patch_dataset_dirs: List[str] = []
+        self._patch_pools: Dict[int, List[str]] = {}  # size -> shuffled list of .npz paths
+        self._patch_accumulator: float = 0.0
+        self._patch_step_count: int = 0
+        self._current_fixed_timesteps: Optional[torch.Tensor] = None
+        self._cached_patch_te_outputs: Optional[list] = None
 
     def assert_extra_args(
         self,
@@ -92,6 +106,30 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group.verify_bucket_reso_steps(16)  # WanVAE spatial downscale = 8 and patch size = 2
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(16)
+
+        # --- Patch training setup ---
+        if getattr(args, "enable_patch_training", False):
+            assert args.patch_caption_trigger, (
+                "--patch_caption_trigger is required when --enable_patch_training is set"
+            )
+            # Collect image paths and dataset directories from loaded datasets
+            seen_dirs = set()
+            for dataset in train_dataset_group.datasets:
+                for info in dataset.image_data.values():
+                    self._patch_image_paths.append(info.absolute_path)
+                    parent = os.path.dirname(info.absolute_path)
+                    if parent not in seen_dirs:
+                        seen_dirs.add(parent)
+                        self._patch_dataset_dirs.append(parent)
+
+            logger.info(
+                f"[Patch Training] ENABLED: ratio={args.patch_ratio}, "
+                f"size={args.patch_min_size}-{args.patch_max_size}, "
+                f"timesteps={args.patch_min_timestep}-{args.patch_max_timestep}, "
+                f"trigger='{args.patch_caption_trigger}', "
+                f"images={len(self._patch_image_paths)}, "
+                f"dirs={len(self._patch_dataset_dirs)}"
+            )
 
     def load_target_model(self, args, weight_dtype, accelerator):
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
@@ -191,6 +229,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def cache_text_encoder_outputs_if_needed(
         self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
     ):
+        # --- Patch latent caching (while VAE is fresh from normal latent caching) ---
+        if getattr(args, "enable_patch_training", False) and self._patch_image_paths:
+            self._cache_patch_latents(args, vae, weight_dtype, accelerator, dataset)
+
         if args.cache_text_encoder_outputs:
             if not args.lowram:
                 # We cannot move DiT to CPU because of block swap, so only move VAE
@@ -205,7 +247,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             with accelerator.autocast():
                 dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
 
-            # cache sample prompts
+            # Cache sample prompts
             if args.sample_prompts is not None:
                 logger.info(f"cache Text Encoder outputs for sample prompts: {args.sample_prompts}")
 
@@ -224,6 +266,18 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                                     tokenize_strategy, text_encoders, tokens_and_masks
                                 )
                 self.sample_prompts_te_outputs = sample_prompts_te_outputs
+
+            # Cache patch trigger caption TE outputs if patch training is enabled
+            if getattr(args, "enable_patch_training", False) and args.patch_caption_trigger:
+                logger.info(f"[Patch Training] Caching TE outputs for trigger: '{args.patch_caption_trigger}'")
+                tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+                text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+                with accelerator.autocast(), torch.no_grad():
+                    tokens_and_masks = tokenize_strategy.tokenize(args.patch_caption_trigger)
+                    self._cached_patch_te_outputs = text_encoding_strategy.encode_tokens(
+                        tokenize_strategy, text_encoders, tokens_and_masks
+                    )
+                logger.info(f"[Patch Training] Cached TE outputs: {len(self._cached_patch_te_outputs)} tensors")
 
             accelerator.wait_for_everyone()
 
@@ -288,6 +342,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         fixed_timesteps=None,
         is_train=True,
     ):
+        # Consume patch timesteps if set by _build_patch_batch
+        if self._current_fixed_timesteps is not None:
+            fixed_timesteps = self._current_fixed_timesteps
+            self._current_fixed_timesteps = None
         anima: anima_models.Anima = unet
 
         # Sample noise
@@ -397,21 +455,40 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_unet=True,
         edm2_model=None,
     ) -> torch.Tensor:
-        """Override base process_batch for caption dropout with cached text encoder outputs."""
+        """Override base process_batch for caption dropout with cached text encoder outputs.
+
+        When patch training is enabled, this method also handles patch step
+        scheduling: on selected steps, the normal batch is replaced with a
+        synthetic batch built from pre-cached patch latents.
+        """
+
+        # --- Patch step decision ---
+        if is_train and getattr(args, "enable_patch_training", False) and self._patch_pools:
+            self._patch_accumulator += args.patch_ratio
+            if self._patch_accumulator >= 1.0:
+                self._patch_accumulator -= 1.0
+                patch_batch = self._build_patch_batch(
+                    batch, args, accelerator, text_encoders,
+                    text_encoding_strategy, tokenize_strategy, weight_dtype,
+                )
+                if patch_batch is not None:
+                    batch = patch_batch
 
         # Text encoder conditions
         text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
         anima_text_encoding_strategy: strategy_anima.AnimaTextEncodingStrategy = text_encoding_strategy
         if text_encoder_outputs_list is not None:
-            caption_dropout_rates = text_encoder_outputs_list[-1]
-            text_encoder_outputs_list = text_encoder_outputs_list[:-1]
+            # Skip caption dropout processing for patch batches (no dropout rates)
+            if not batch.get("_is_patch_batch", False):
+                caption_dropout_rates = text_encoder_outputs_list[-1]
+                text_encoder_outputs_list = text_encoder_outputs_list[:-1]
 
-            # Apply caption dropout to cached outputs
-            text_encoder_outputs_list = anima_text_encoding_strategy.drop_cached_text_encoder_outputs(
-                *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
-            )
-            # Add the caption dropout rates back to the list for validation dataset (which is re-used batch items)
-            batch["text_encoder_outputs_list"] = text_encoder_outputs_list + [caption_dropout_rates]
+                # Apply caption dropout to cached outputs
+                text_encoder_outputs_list = anima_text_encoding_strategy.drop_cached_text_encoder_outputs(
+                    *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
+                )
+                # Add the caption dropout rates back to the list for validation dataset (which is re-used batch items)
+                batch["text_encoder_outputs_list"] = text_encoder_outputs_list + [caption_dropout_rates]
 
         if is_train and not self._cfm_logged and getattr(args, "contrastive_flow_matching", False):
             logger.info(
@@ -485,6 +562,178 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             # prepare for next forward: because backward pass is not called, we need to prepare it here
             accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
+    # -----------------------------------------------------------------------
+    # Patch Training: Caching & Batch Building
+    # -----------------------------------------------------------------------
+
+    def _cache_patch_latents(self, args, vae, weight_dtype, accelerator, dataset_group):
+        """Pre-generate patch images, VAE-encode, and save to disk.
+
+        Called during the latent caching phase while the VAE is still on GPU
+        (or can be cheaply moved there).  Patches are stored as .npz files in
+        ``{dataset_dir}/patches/{size}x{size}/`` alongside .png previews.
+        """
+        # Determine maximum batch size from the dataset group config
+        batch_size = args.train_batch_size
+        if getattr(dataset_group, "datasets", None):
+            max_ds_batch = max([getattr(d, "batch_size", 1) for d in dataset_group.datasets])
+            batch_size = max(batch_size, max_ds_batch)
+        
+        # Actually generate an extra 10% just to be extremely safe against rounding and exhaustion issues
+        num_patch_steps = int(args.max_train_steps * args.patch_ratio)
+        target = int(num_patch_steps * batch_size * 1.1)
+
+        logger.info(
+            f"[Patch Cache] Need {num_patch_steps} patch steps * {batch_size} batch = {target} patches (including 10% buffer)"
+        )
+
+        # Bring VAE to GPU for encoding
+        vae_dtype = (torch.float32 if args.no_half_vae else weight_dtype)
+        org_device = vae.device
+        vae.to(accelerator.device, dtype=vae_dtype)
+        vae.requires_grad_(False)
+        vae.eval()
+
+        # Regenerate: clean existing patches
+        if getattr(args, "patch_regenerate", False):
+            for ddir in self._patch_dataset_dirs:
+                patches_root = os.path.join(ddir, "patches")
+                if os.path.isdir(patches_root):
+                    import shutil
+                    logger.info(f"[Patch Cache] Regenerating — removing {patches_root}")
+                    shutil.rmtree(patches_root)
+
+        self._patch_pools = patch_utils.generate_and_cache_patches(
+            image_paths=self._patch_image_paths,
+            dataset_dirs=self._patch_dataset_dirs,
+            target_count=target,
+            min_size=args.patch_min_size,
+            max_size=args.patch_max_size,
+            variance_threshold=args.patch_variance_threshold,
+            max_retries=args.patch_max_retries,
+            feather_px=args.patch_feather_px,
+            vae=vae,
+            vae_dtype=vae_dtype,
+            accelerator=accelerator,
+            encode_fn=lambda v, imgs: self.encode_images_to_latents(args, v, imgs),
+            shift_scale_fn=lambda lat: self.shift_scale_latents(args, lat),
+        )
+
+        # Move VAE back
+        vae.to(org_device)
+        clean_memory_on_device(accelerator.device)
+
+        # Shuffle each size pool for non-duplicate usage
+        for size in self._patch_pools:
+            random.shuffle(self._patch_pools[size])
+
+        total_cached = sum(len(v) for v in self._patch_pools.values())
+        sizes_str = ", ".join(f"{s}x{s}: {len(v)}" for s, v in sorted(self._patch_pools.items()))
+        logger.info(f"[Patch Cache] Ready: {total_cached} patches in {len(self._patch_pools)} size pools [{sizes_str}]")
+
+    def _build_patch_batch(
+        self, original_batch, args, accelerator,
+        text_encoders, text_encoding_strategy, tokenize_strategy, weight_dtype,
+    ):
+        """Build a synthetic batch from pre-cached patch latents.
+
+        Selects a random size pool, pops ``batch_size`` items without
+        replacement (reshuffling only when the pool is exhausted), loads
+        the cached ``.npz`` latents, generates the feathered alpha mask,
+        and constructs a batch dict compatible with ``super().process_batch()``.
+        """
+        batch_size = (
+            original_batch["latents"].shape[0]
+            if "latents" in original_batch
+            else original_batch["images"].shape[0]
+        )
+
+        # Find a size pool with enough items
+        valid_sizes = [s for s, pool in self._patch_pools.items() if len(pool) >= batch_size]
+
+        if not valid_sizes:
+            # Recycle all pools: reshuffle
+            for s in self._patch_pools:
+                random.shuffle(self._patch_pools[s])
+            valid_sizes = [s for s, pool in self._patch_pools.items() if len(pool) >= batch_size]
+            if not valid_sizes:
+                logger.warning("[Patch] No pools have enough patches for a full batch. Skipping patch step.")
+                return None
+
+        size = random.choice(valid_sizes)
+        pool = self._patch_pools[size]
+
+        # Pop without replacement
+        npz_paths = [pool.pop() for _ in range(batch_size)]
+
+        # Load latents from disk
+        latent_list = []
+        source_names = []
+        for p in npz_paths:
+            data = np.load(p)
+            latent_list.append(torch.from_numpy(data["latents"]))
+            source_names.append(os.path.basename(p).replace(".npz", ""))
+
+        latents = torch.cat(latent_list, dim=0).to(accelerator.device)  # [B, C, H, W]
+
+        # Generate feathered alpha mask at latent resolution
+        latent_h = size // 8
+        latent_w = size // 8
+        single_mask = patch_utils.create_feathered_alpha_mask(
+            latent_h, latent_w, args.patch_feather_px, vae_scale=8
+        )
+        masks = single_mask.unsqueeze(0).expand(batch_size, -1, -1).clone()
+
+        # Uniform timesteps within patch range
+        patch_timesteps = torch.randint(
+            args.patch_min_timestep,
+            args.patch_max_timestep + 1,
+            (batch_size,),
+            device=accelerator.device,
+            dtype=torch.float32,
+        )
+        self._current_fixed_timesteps = patch_timesteps
+
+        # Build batch dict
+        patch_batch = {
+            "latents": latents,
+            "alpha_masks": masks.to(accelerator.device),
+            "loss_weights": torch.ones(batch_size, device=accelerator.device),
+            "_is_patch_batch": True,  # flag for caption dropout bypass
+        }
+
+        # Text encoder outputs — handle both cached and non-cached paths
+        if self._cached_patch_te_outputs is not None:
+            # Cached TE path: repeat the single-sample outputs for the batch
+            repeated = []
+            for t in self._cached_patch_te_outputs:
+                if isinstance(t, torch.Tensor):
+                    # Repeat along batch dimension
+                    rep = t.expand(batch_size, *t.shape[1:]).contiguous().to(accelerator.device)
+                    repeated.append(rep)
+                else:
+                    repeated.append(t)
+            patch_batch["text_encoder_outputs_list"] = repeated
+        else:
+            # Non-cached: provide captions and let process_batch encode on the fly
+            patch_batch["captions"] = [args.patch_caption_trigger] * batch_size
+            tokens_and_masks = tokenize_strategy.tokenize(args.patch_caption_trigger)
+            # tokens_and_masks is a list of tensors; repeat each for the batch
+            patch_batch["input_ids_list"] = [
+                t.repeat(batch_size, *([1] * (t.ndim - 1))).to(accelerator.device)
+                if isinstance(t, torch.Tensor) else t
+                for t in tokens_and_masks
+            ]
+
+        self._patch_step_count += 1
+        logger.info(
+            f"[Patch Step {self._patch_step_count}] size={size}x{size}, "
+            f"timesteps=[{args.patch_min_timestep}-{args.patch_max_timestep}], "
+            f"sources=[{', '.join(source_names[:3])}{'...' if len(source_names) > 3 else ''}], "
+            f"pool_remaining={len(pool)}"
+        )
+
+        return patch_batch
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
@@ -497,6 +746,36 @@ def setup_parser() -> argparse.ArgumentParser:
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
     )
+
+    # --- Patch training arguments ---
+    patch_group = parser.add_argument_group("Patch Training", "Train on random crops from unscaled images to learn fine details.")
+    patch_group.add_argument("--enable_patch_training", action="store_true",
+        help="Enable patch-based training interleaved with normal steps.")
+    patch_group.add_argument("--patch_ratio", type=float, default=0.3,
+        help="Fraction of steps replaced with patch steps (default: 0.3 = ~every 3rd step).")
+    patch_group.add_argument("--patch_min_size", type=int, default=256,
+        help="Minimum patch crop size in pixels (default: 256). Must be divisible by 16.")
+    patch_group.add_argument("--patch_max_size", type=int, default=512,
+        help="Maximum patch crop size in pixels (default: 512). Must be divisible by 16.")
+    patch_group.add_argument("--patch_min_timestep", type=int, default=0,
+        help="Minimum timestep for patch steps (default: 0).")
+    patch_group.add_argument("--patch_max_timestep", type=int, default=300,
+        help="Maximum timestep for patch steps (default: 300). Low values focus on fine details.")
+    patch_group.add_argument("--patch_variance_threshold", type=float, default=50.0,
+        help="Minimum grayscale pixel variance to accept a patch (default: 50.0). Rejects solid colors.")
+    patch_group.add_argument("--patch_feather_px", type=int, default=16,
+        help="Feather width in pixels for border alpha mask (default: 16).")
+    patch_group.add_argument("--patch_caption_trigger", type=str, default=None,
+        help="Caption/trigger word used for all patches. Required when patch training is enabled.")
+    patch_group.add_argument("--patch_max_retries", type=int, default=10,
+        help="Max retries to extract a valid patch before skipping (default: 10).")
+    patch_group.add_argument("--patch_regenerate", action="store_true",
+        help="Force regeneration of cached patches even if enough exist on disk.")
+    patch_group.add_argument("--patch_debug", action="store_true",
+        help="Extract sample patches, save to output_dir/patch_debug/, and exit (no training).")
+    patch_group.add_argument("--patch_debug_count", type=int, default=50,
+        help="Number of debug patches to extract (default: 50).")
+
     # Anima-specific default: lower cfm_lambda than the SDXL default of 0.05
     parser.set_defaults(cfm_lambda=0.02)
     return parser
@@ -508,6 +787,30 @@ if __name__ == "__main__":
     args = parser.parse_args()
     train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
+
+    # --- Patch debug mode: extract samples and exit ---
+    if getattr(args, "patch_debug", False):
+        # Resolve dataset config path
+        config_path = getattr(args, "dataset_config", None)
+        if config_path is None:
+            print("ERROR: --patch_debug requires --dataset_config to locate images.")
+            sys.exit(1)
+        output_dir = getattr(args, "output_dir", ".")
+        image_paths = patch_utils.collect_image_paths_from_toml(config_path)
+        if not image_paths:
+            print(f"ERROR: No images found in dataset config: {config_path}")
+            sys.exit(1)
+        print(f"[Patch Debug] Found {len(image_paths)} images. Extracting patches...")
+        patch_utils.save_debug_patches(
+            image_paths,
+            output_dir,
+            count=getattr(args, "patch_debug_count", 50),
+            min_size=getattr(args, "patch_min_size", 256),
+            max_size=getattr(args, "patch_max_size", 512),
+            variance_threshold=getattr(args, "patch_variance_threshold", 50.0),
+            max_retries=getattr(args, "patch_max_retries", 10),
+        )
+        sys.exit(0)
 
     # Automatically switch to Anima-specific LoRA module if generic one is provided
     if args.network_module == "networks.lora":
