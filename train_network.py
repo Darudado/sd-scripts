@@ -1203,6 +1203,33 @@ class NetworkTrainer:
             )
         if network is None:
             return
+
+        # GoRA: override args and net_kwargs to reflect enforced values in saved metadata
+        _gora_algo = (net_kwargs.get("algo", "") or "").lower()
+        if _gora_algo == "gora":
+            if args.network_alpha != args.network_dim:
+                accelerator.print(
+                    f"GoRA: overriding --network_alpha from {args.network_alpha} to {args.network_dim} "
+                    f"(GoRA requires alpha = dim)"
+                )
+                args.network_alpha = args.network_dim
+
+            if net_kwargs.get("use_scalar", "").lower() in ("true", "1", "yes"):
+                accelerator.print(
+                    "GoRA: overriding use_scalar from True to False "
+                    "(scalar destabilizes importance convergence)"
+                )
+                net_kwargs["use_scalar"] = "False"
+
+            conv_dim = net_kwargs.get("conv_dim", None)
+            conv_alpha = net_kwargs.get("conv_alpha", None)
+            if conv_dim is not None and conv_alpha is not None and int(conv_dim) > 0 and str(conv_alpha) != str(conv_dim):
+                accelerator.print(
+                    f"GoRA: overriding conv_alpha ({conv_alpha}) to conv_dim ({conv_dim}) "
+                    f"(GoRA requires alpha = dim)"
+                )
+                net_kwargs["conv_alpha"] = str(conv_dim)
+
         network_has_multiplier = hasattr(network, "set_multiplier")
 
         # TODO remove `hasattr` by setting up methods if not defined in the network like below  (hacky but will work):
