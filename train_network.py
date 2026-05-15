@@ -1379,6 +1379,27 @@ class NetworkTrainer:
             adaptive_n = gora_kwargs.get("gora_adaptive_n", "True").lower() in ("true", "1", "yes")
             adaptive_gamma = gora_kwargs.get("gora_adaptive_gamma", "False").lower() in ("true", "1", "yes")
 
+            # --- VRAM optimizations ---
+
+            # 1. Enable gradient checkpointing on UNet to reduce activation memory
+            #    (restored after GoRA init if it wasn't already enabled)
+            gora_checkpointing = gora_kwargs.get("gora_checkpointing", "true").lower() in ("true", "1", "yes")
+            unet_had_checkpointing = getattr(unet, '_gradient_checkpointing', False) or \
+                                     getattr(args, 'gradient_checkpointing', False)
+            if gora_checkpointing and not unet_had_checkpointing:
+                if hasattr(unet, 'enable_gradient_checkpointing'):
+                    unet.enable_gradient_checkpointing()
+                    accelerator.print("GoRA: Gradient checkpointing enabled on UNet for VRAM savings.")
+                else:
+                    gora_checkpointing = False  # can't enable if not supported
+
+            # 2. Detect pre-cached latents — if first batch has latents, VAE isn't needed
+            gora_has_latents = False
+            for batch in train_dataloader:
+                if isinstance(batch, dict) and "latents" in batch and batch["latents"] is not None:
+                    gora_has_latents = True
+                break
+
             # Save original devices for restoration after GoRA
             vae_orig_device = next(vae.parameters()).device
             unet_orig_device = next(unet.parameters()).device
@@ -1388,7 +1409,11 @@ class NetworkTrainer:
 
             # Move base models to accelerator device for GoRA forward pass
             # (accelerator.prepare hasn't run yet; models must be on same device as batch data)
-            vae.to(accelerator.device)
+            if not gora_has_latents:
+                vae.to(accelerator.device)
+                accelerator.print("GoRA: VAE moved to GPU (images will be encoded on-the-fly).")
+            else:
+                accelerator.print("GoRA: VAE kept on CPU (pre-cached latents detected).")
             unet.to(accelerator.device)
             for t_enc in text_encoders:
                 t_enc.to(accelerator.device)
@@ -1427,6 +1452,11 @@ class NetworkTrainer:
             )
             accelerator.print("GoRA: Pre-computation complete.")
 
+            # Restore VRAM optimizations
+            if gora_checkpointing and not unet_had_checkpointing:
+                if hasattr(unet, 'disable_gradient_checkpointing'):
+                    unet.disable_gradient_checkpointing()
+
             # Restore models to their original devices
             vae.to(vae_orig_device)
             unet.to(unet_orig_device)
@@ -1434,7 +1464,6 @@ class NetworkTrainer:
                 t_enc.to(orig_dev)
 
             # Free GPU memory fragmentation from GoRA precompute
-            import gc
             gc.collect()
             if accelerator.device.type == "cuda":
                 torch.cuda.empty_cache()
