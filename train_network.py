@@ -1379,6 +1379,13 @@ class NetworkTrainer:
             adaptive_n = gora_kwargs.get("gora_adaptive_n", "True").lower() in ("true", "1", "yes")
             adaptive_gamma = gora_kwargs.get("gora_adaptive_gamma", "False").lower() in ("true", "1", "yes")
 
+            # Save original devices for restoration after GoRA
+            vae_orig_device = next(vae.parameters()).device
+            unet_orig_device = next(unet.parameters()).device
+            te_orig_devices = [
+                next(t_enc.parameters()).device for t_enc in text_encoders
+            ]
+
             # Move base models to accelerator device for GoRA forward pass
             # (accelerator.prepare hasn't run yet; models must be on same device as batch data)
             vae.to(accelerator.device)
@@ -1418,6 +1425,19 @@ class NetworkTrainer:
                 adaptive_gamma=adaptive_gamma,
             )
             accelerator.print("GoRA: Pre-computation complete.")
+
+            # Restore models to their original devices
+            vae.to(vae_orig_device)
+            unet.to(unet_orig_device)
+            for t_enc, orig_dev in zip(text_encoders, te_orig_devices):
+                t_enc.to(orig_dev)
+
+            # Free GPU memory fragmentation from GoRA precompute
+            import gc
+            gc.collect()
+            if accelerator.device.type == "cuda":
+                torch.cuda.empty_cache()
+                accelerator.print("GoRA: GPU cache cleared.")
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
