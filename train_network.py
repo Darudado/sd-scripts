@@ -1415,6 +1415,7 @@ class NetworkTrainer:
                     is_train=True,
                     train_text_encoder=train_text_encoder,
                     train_unet=train_unet,
+                    edm2_model=None,
                 )
 
             network.prepare_gora(
