@@ -1365,6 +1365,53 @@ class NetworkTrainer:
                 if te_weight_dtype != weight_dtype:
                     self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
 
+        # GoRA: precompute gradients for new GoRA networks (no-op for others and resumption)
+        if hasattr(network, "prepare_gora") and hasattr(network, "_gora_needs_init") and network._gora_needs_init:
+            accelerator.print("GoRA: Pre-computing gradients for rank allocation and initialization...")
+
+            # Extract GoRA parameters from network_args
+            gora_kwargs = {}
+            for key, value in net_kwargs.items():
+                if key.startswith("gora_"):
+                    gora_kwargs[key] = value
+
+            max_steps = int(gora_kwargs.get("gora_steps", gora_kwargs.get("gora_max_steps", 64)))
+            adaptive_n = gora_kwargs.get("gora_adaptive_n", "True").lower() in ("true", "1", "yes")
+            adaptive_gamma = gora_kwargs.get("gora_adaptive_gamma", "False").lower() in ("true", "1", "yes")
+
+            # Create noise_scheduler early for GoRA forward pass
+            # (normally created later; stateless — safe to create here)
+            gora_noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
+
+            # Build forward function using the trainer's process_batch
+            def gora_forward_fn(batch):
+                return self.process_batch(
+                    batch=batch,
+                    text_encoders=text_encoders,
+                    unet=unet,
+                    network=network,
+                    vae=vae,
+                    noise_scheduler=gora_noise_scheduler,
+                    vae_dtype=vae_dtype,
+                    weight_dtype=weight_dtype,
+                    accelerator=accelerator,
+                    args=args,
+                    text_encoding_strategy=text_encoding_strategy,
+                    tokenize_strategy=tokenize_strategy,
+                    is_train=True,
+                    train_text_encoder=train_text_encoder,
+                    train_unet=train_unet,
+                )
+
+            network.prepare_gora(
+                dataloader=train_dataloader,
+                forward_fn=gora_forward_fn,
+                max_steps=max_steps,
+                adaptive_n=adaptive_n,
+                adaptive_gamma=adaptive_gamma,
+            )
+            accelerator.print("GoRA: Pre-computation complete.")
+
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
             flags = self.get_text_encoders_train_flags(args, text_encoders)
