@@ -1379,6 +1379,13 @@ class NetworkTrainer:
             adaptive_n = gora_kwargs.get("gora_adaptive_n", "True").lower() in ("true", "1", "yes")
             adaptive_gamma = gora_kwargs.get("gora_adaptive_gamma", "False").lower() in ("true", "1", "yes")
 
+            # Move base models to accelerator device for GoRA forward pass
+            # (accelerator.prepare hasn't run yet; models must be on same device as batch data)
+            vae.to(accelerator.device)
+            unet.to(accelerator.device)
+            for t_enc in text_encoders:
+                t_enc.to(accelerator.device)
+
             # Create noise_scheduler early for GoRA forward pass
             # (normally created later; stateless — safe to create here)
             gora_noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
