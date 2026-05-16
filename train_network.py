@@ -1206,7 +1206,7 @@ class NetworkTrainer:
 
         # GoRA: override args and net_kwargs to reflect enforced values in saved metadata
         _gora_algo = (net_kwargs.get("algo", "") or "").lower()
-        if _gora_algo == "gora":
+        if _gora_algo in ("gora", "ralora"):
             if args.network_alpha != args.network_dim:
                 accelerator.print(
                     f"GoRA: overriding --network_alpha from {args.network_alpha} to {args.network_dim} "
@@ -1300,6 +1300,9 @@ class NetworkTrainer:
         # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
 
+        train_dataloader_generator = torch.Generator(device="cpu")
+        train_dataloader_generator_init_seed = train_dataloader_generator.initial_seed()
+
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,
@@ -1308,6 +1311,7 @@ class NetworkTrainer:
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
             pin_memory=args.pin_data_loader_memory or args.pin_memory,
+            generator=train_dataloader_generator,
         )
 
         if val_dataset_group is not None:
@@ -1392,6 +1396,63 @@ class NetworkTrainer:
                 if te_weight_dtype != weight_dtype:
                     self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
 
+        network_needs_init = ((hasattr(network, "prepare_gora") and hasattr(network, "_gora_needs_init") and network._gora_needs_init) or
+            (hasattr(network, "_ralora_needs_init") and network._ralora_needs_init))
+
+        if network_needs_init:
+            # Detect pre-cached latents — if first batch has latents, VAE isn't needed
+            has_latents = False
+            for batch in train_dataloader:
+                if isinstance(batch, dict) and "latents" in batch and batch["latents"] is not None:
+                    has_latents = True
+                break
+
+            # Save original devices for restoration after gora or ralora
+            vae_orig_device = next(vae.parameters()).device
+            unet_orig_device = next(unet.parameters()).device
+            te_orig_devices = [
+                next(t_enc.parameters()).device for t_enc in text_encoders
+            ]
+
+            # Move base models to accelerator device for GoRA forward pass
+            # (accelerator.prepare hasn't run yet; models must be on same device as batch data)
+            if not has_latents:
+                vae.requires_grad_(False)
+                vae.eval()
+                vae.to(accelerator.device, dtype=vae_dtype)
+            unet.to(accelerator.device, dtype=unet_weight_dtype if self.cast_unet(args) else None)
+
+            temp_text_encoders = [
+                (t_enc.to(accelerator.device) if flag else t_enc)
+                for t_enc, flag in zip(text_encoders, self.get_text_encoders_train_flags(args, text_encoders))
+            ]
+            if len(text_encoders) > 1:
+                temp_text_encoder = temp_text_encoders
+            else:
+                temp_text_encoder = temp_text_encoders[0]
+
+            if args.gradient_checkpointing:
+                # according to TI example in Diffusers, train is required
+                unet.train()
+                for i, (t_enc, frag) in enumerate(zip(text_encoders, self.get_text_encoders_train_flags(args, text_encoders))):
+                    t_enc.train()
+
+                    # set top parameter requires_grad = True for gradient checkpointing works
+                    if frag:
+                        self.prepare_text_encoder_grad_ckpt_workaround(i, t_enc)
+            else:
+                unet.eval()
+                for t_enc in temp_text_encoders:
+                    t_enc.eval()
+
+            del t_enc
+
+            network.prepare_grad_etc(temp_text_encoder, unet)
+
+            # Create noise_scheduler early for GoRA forward pass
+            # (normally created later; stateless — safe to create here)
+            network_init_noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
+
         # GoRA: precompute gradients for new GoRA networks (no-op for others and resumption)
         if hasattr(network, "prepare_gora") and hasattr(network, "_gora_needs_init") and network._gora_needs_init:
             accelerator.print("GoRA: Pre-computing gradients for rank allocation and initialization...")
@@ -1406,49 +1467,6 @@ class NetworkTrainer:
             adaptive_n = gora_kwargs.get("gora_adaptive_n", "True").lower() in ("true", "1", "yes")
             adaptive_gamma = gora_kwargs.get("gora_adaptive_gamma", "False").lower() in ("true", "1", "yes")
 
-            # --- VRAM optimizations ---
-
-            # 1. Enable gradient checkpointing on UNet to reduce activation memory
-            #    (restored after GoRA init if it wasn't already enabled)
-            gora_checkpointing = gora_kwargs.get("gora_checkpointing", "true").lower() in ("true", "1", "yes")
-            unet_had_checkpointing = getattr(unet, '_gradient_checkpointing', False) or \
-                                     getattr(args, 'gradient_checkpointing', False)
-            if gora_checkpointing and not unet_had_checkpointing:
-                if hasattr(unet, 'enable_gradient_checkpointing'):
-                    unet.enable_gradient_checkpointing()
-                    accelerator.print("GoRA: Gradient checkpointing enabled on UNet for VRAM savings.")
-                else:
-                    gora_checkpointing = False  # can't enable if not supported
-
-            # 2. Detect pre-cached latents — if first batch has latents, VAE isn't needed
-            gora_has_latents = False
-            for batch in train_dataloader:
-                if isinstance(batch, dict) and "latents" in batch and batch["latents"] is not None:
-                    gora_has_latents = True
-                break
-
-            # Save original devices for restoration after GoRA
-            vae_orig_device = next(vae.parameters()).device
-            unet_orig_device = next(unet.parameters()).device
-            te_orig_devices = [
-                next(t_enc.parameters()).device for t_enc in text_encoders
-            ]
-
-            # Move base models to accelerator device for GoRA forward pass
-            # (accelerator.prepare hasn't run yet; models must be on same device as batch data)
-            if not gora_has_latents:
-                vae.to(accelerator.device)
-                accelerator.print("GoRA: VAE moved to GPU (images will be encoded on-the-fly).")
-            else:
-                accelerator.print("GoRA: VAE kept on CPU (pre-cached latents detected).")
-            unet.to(accelerator.device)
-            for t_enc in text_encoders:
-                t_enc.to(accelerator.device)
-
-            # Create noise_scheduler early for GoRA forward pass
-            # (normally created later; stateless — safe to create here)
-            gora_noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
-
             # Build forward function using the trainer's process_batch
             def gora_forward_fn(batch):
                 return self.process_batch(
@@ -1457,7 +1475,7 @@ class NetworkTrainer:
                     unet=unet,
                     network=network,
                     vae=vae,
-                    noise_scheduler=gora_noise_scheduler,
+                    noise_scheduler=network_init_noise_scheduler,
                     vae_dtype=vae_dtype,
                     weight_dtype=weight_dtype,
                     accelerator=accelerator,
@@ -1479,10 +1497,71 @@ class NetworkTrainer:
             )
             accelerator.print("GoRA: Pre-computation complete.")
 
-            # Restore VRAM optimizations
-            if gora_checkpointing and not unet_had_checkpointing:
-                if hasattr(unet, 'disable_gradient_checkpointing'):
-                    unet.disable_gradient_checkpointing()
+        # RaLoRA: precompute gradients for new RaLoRA networks (no-op for others and resumption)
+        if hasattr(network, "_ralora_needs_init") and network._ralora_needs_init:
+            accelerator.print("RaLoRA: Pre-computing gradients for rank and GID initialization...")
+
+            # Import RaLoRAModule
+            from lycoris.modules.locon import RaLoRAModule
+            
+            # Extract RaLoRA parameters from network_args
+            ralora_kwargs = {}
+            for key, value in net_kwargs.items():
+                if key.startswith("ralora_"):
+                    ralora_kwargs[key] = value
+
+            max_steps = int(ralora_kwargs.get("ralora_max_steps", 64))
+            n_max = int(ralora_kwargs.get("ralora_n_max", 32))
+            pro_mode = ralora_kwargs.get("ralora_pro", "False").lower() in ("true", "1", "yes")
+            erank_method = ralora_kwargs.get("ralora_erank_method", "entropy")
+            svd_threshold = float(ralora_kwargs.get("ralora_svd_threshold", 0.0))
+            cumulative_variance = float(ralora_kwargs.get("ralora_cumulative_variance", 0.0))
+
+            # Build forward function using the trainer's process_batch
+            def ralora_forward_fn(batch):
+                return self.process_batch(
+                    batch=batch,
+                    text_encoders=text_encoders,
+                    unet=unet,
+                    network=network,
+                    vae=vae,
+                    noise_scheduler=network_init_noise_scheduler,
+                    vae_dtype=vae_dtype,
+                    weight_dtype=weight_dtype,
+                    accelerator=accelerator,
+                    args=args,
+                    text_encoding_strategy=text_encoding_strategy,
+                    tokenize_strategy=tokenize_strategy,
+                    is_train=True,
+                    train_text_encoder=train_text_encoder,
+                    train_unet=train_unet,
+                    edm2_model=None,
+                )
+
+            # Compute world_size and global_rank for distributed
+            world_size = accelerator.num_processes if hasattr(accelerator, 'num_processes') else 1
+            global_rank = accelerator.process_index if hasattr(accelerator, 'process_index') else 0
+
+            RaLoRAModule.precompute_and_init(
+                model=network,
+                dataloader=train_dataloader,
+                forward_fn=ralora_forward_fn,
+                max_steps=max_steps,
+                n_max=n_max,
+                pro_mode=pro_mode,
+                erank_method=erank_method,
+                svd_threshold=svd_threshold,
+                cumulative_variance=cumulative_variance,
+                world_size=world_size,
+                global_rank=global_rank,
+                device=accelerator.device,
+                save_dir=args.output_dir if hasattr(args, 'output_dir') else None,
+            )
+            accelerator.print("RaLoRA: Pre-computation complete.")
+
+        if network_needs_init:
+            # Restore initial dataloader seed
+            train_dataloader_generator.manual_seed(train_dataloader_generator_init_seed)
 
             # Restore models to their original devices
             vae.to(vae_orig_device)
@@ -1490,11 +1569,11 @@ class NetworkTrainer:
             for t_enc, orig_dev in zip(text_encoders, te_orig_devices):
                 t_enc.to(orig_dev)
 
-            # Free GPU memory fragmentation from GoRA precompute
+            # Free GPU memory fragmentation from gora or RaLoRA precompute
             gc.collect()
             if accelerator.device.type == "cuda":
                 torch.cuda.empty_cache()
-                accelerator.print("GoRA: GPU cache cleared.")
+                accelerator.print("GPU cache cleared.")
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
