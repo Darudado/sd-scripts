@@ -61,6 +61,10 @@ except ImportError:
 
 setup_logging()
 import logging
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="torchao")
+logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
