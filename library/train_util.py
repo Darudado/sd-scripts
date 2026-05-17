@@ -5651,30 +5651,43 @@ def parse_string_to_type(s):
     else:
         return None
 
-class ZeroLRWarmupScheduler:
+class ZeroLRWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
     """Scheduler wrapper that returns LR=0 during warmup, then delegates to the underlying scheduler.
 
-    Unlike _LRScheduler-based wrappers, this avoids __init__ calling step() and
-    works cleanly with Accelerate's scheduler wrapping.
+    Inherits from _LRScheduler for proper integration with PyTorch's scheduler ecosystem
+    and Accelerate's scheduler wrapping. The inner scheduler is stepped on each step()
+    call, but its LR values are overridden to 0 during the warmup phase.
     """
 
-    def __init__(self, optimizer: Optimizer, inner_scheduler, warmup_steps: int):
-        self.optimizer = optimizer
+    def __init__(self, optimizer: Optimizer, inner_scheduler, warmup_steps: int, last_epoch: int = -1):
         self.inner_scheduler = inner_scheduler
         self.warmup_steps = warmup_steps
+        # Guard: prevent parent __init__ from prematurely stepping inner scheduler
+        self._initializing = True
+        super().__init__(optimizer, last_epoch=last_epoch)
+        self._initializing = False
+        # Undo parent's init step for correct warmup step count
         self._step_count = 0
-
-    def step(self, epoch=None):
-        self.inner_scheduler.step(epoch)
-        self._step_count += 1
-        if self._step_count <= self.warmup_steps:
+        if self.warmup_steps > 0:
             for group in self.optimizer.param_groups:
                 group["lr"] = 0.0
+            self._last_lr = [0.0 for _ in self.optimizer.param_groups]
 
-    def get_last_lr(self):
-        if self._step_count <= self.warmup_steps:
+    def get_lr(self):
+        """Return 0 during warmup, otherwise delegate to inner scheduler's last LR."""
+        if self.warmup_steps > 0 and self._step_count <= self.warmup_steps:
             return [0.0 for _ in self.optimizer.param_groups]
         return self.inner_scheduler.get_last_lr()
+
+    def step(self, epoch=None):
+        """Step inner scheduler, then apply LR via parent (zero during warmup)."""
+        if not getattr(self, '_initializing', False):
+            self.inner_scheduler.step(epoch)
+        super().step(epoch)
+
+    def get_last_lr(self):
+        """Return the last computed LR values."""
+        return self._last_lr
 
 
 # Modified version of get_scheduler() function from diffusers.optimizer.get_scheduler
@@ -5708,15 +5721,31 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         int(temp_lr_decay_steps * num_training_steps) if isinstance(temp_lr_decay_steps, float) else temp_lr_decay_steps
     )
 
-    # TODO add inputs to UI to support setting decay steps
-    if name == SchedulerType.WARMUP_STABLE_DECAY and (num_decay_steps is None or num_decay_steps == 0):
-        num_decay_steps = num_warmup_steps
-
     num_stable_steps = num_training_steps - num_warmup_steps - num_decay_steps
     num_cycles = args.lr_scheduler_num_cycles
     power = args.lr_scheduler_power
     timescale = args.lr_scheduler_timescale
     min_lr_ratio = args.lr_scheduler_min_lr_ratio
+
+    # DEBUG: Log scheduler parameter calculations for diagnosing warmup_stable_decay issues
+    phase_sum = num_warmup_steps + num_stable_steps + num_decay_steps
+    logger.info(
+        f"[SCHEDULER] name={name}, max_train_steps={args.max_train_steps}, num_processes={num_processes}, "
+        f"num_training_steps={num_training_steps}, num_warmup_steps={num_warmup_steps}, "
+        f"num_decay_steps={num_decay_steps}, num_stable_steps={num_stable_steps}, "
+        f"zero_lr_warmup={getattr(args, 'zero_lr_warmup', False)}, zero_lr_warmup_steps={zero_lr_warmup_steps}, "
+        f"phase_sum={phase_sum}, min_lr_ratio={min_lr_ratio}, num_cycles={num_cycles}"
+    )
+    if phase_sum != num_training_steps:
+        logger.warning(
+            f"[SCHEDULER] Phase sum mismatch: warmup({num_warmup_steps}) + stable({num_stable_steps}) "
+            f"+ decay({num_decay_steps}) = {phase_sum} != num_training_steps({num_training_steps})"
+        )
+    logger.info(
+        f"[SCHEDULER] Phase boundaries: warmup[0,{num_warmup_steps}), "
+        f"stable[{num_warmup_steps},{num_warmup_steps+num_stable_steps}), "
+        f"decay[{num_warmup_steps+num_stable_steps},{num_warmup_steps+num_stable_steps+num_decay_steps})"
+    )
 
     lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
     if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
