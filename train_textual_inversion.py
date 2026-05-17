@@ -499,8 +499,9 @@ class TextualInversionTrainer:
         accelerator.print(f"  gradient ccumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
-        progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+        progress_bar = tqdm(range(args.max_train_steps), smoothing=0.1, disable=not accelerator.is_local_main_process, desc="steps", bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]")
         global_step = 0
+        rate_tracker = train_util.RateTracker()
 
         noise_scheduler = DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
@@ -567,7 +568,7 @@ class TextualInversionTrainer:
             for text_encoder in text_encoders:
                 text_encoder.train()
 
-            loss_total = 0
+            loss_recorder = train_util.EMARecorder()
 
             for step, batch in enumerate(train_dataloader):
                 current_step.value = global_step
@@ -648,6 +649,7 @@ class TextualInversionTrainer:
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
+                    rate_tracker.tick()
                     progress_bar.update(1)
                     global_step += 1
 
@@ -701,16 +703,15 @@ class TextualInversionTrainer:
                         )
                     accelerator.log(logs, step=global_step)
 
-                loss_total += current_loss
-                avr_loss = loss_total / (step + 1)
-                logs = {"loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
+                loss_recorder.add(current_loss)
+                avr_loss: float = loss_recorder.average
+                progress_bar.set_postfix_str(f"{rate_tracker.display_rate}, loss={avr_loss:.4f}")  # , "lr": lr_scheduler.get_last_lr()[0]}
 
                 if global_step >= args.max_train_steps:
                     break
 
             if len(accelerator.trackers) > 0:
-                logs = {"loss/epoch": loss_total / len(train_dataloader)}
+                logs = {"loss/epoch": loss_recorder.average}
                 accelerator.log(logs, step=epoch + 1)
 
             accelerator.wait_for_everyone()

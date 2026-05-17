@@ -628,9 +628,10 @@ def train(args):
 
     progress_bar = tqdm(
         range(args.max_train_steps),
-        smoothing=0,
+        smoothing=0.1,
         disable=not accelerator.is_local_main_process,
         desc="steps",
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]",
     )
     global_step = 0
 
@@ -671,7 +672,8 @@ def train(args):
         # log empty object to commit the sample images to wandb
         accelerator.log({}, step=0)
 
-    loss_recorder = train_util.LossRecorder()
+    loss_recorder = train_util.EMARecorder()
+    rate_tracker = train_util.RateTracker()
     epoch = 0  # avoid error when max_train_steps is 0
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -804,6 +806,7 @@ def train(args):
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
+                rate_tracker.tick()
                 progress_bar.update(1)
                 global_step += 1
 
@@ -849,8 +852,7 @@ def train(args):
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
-            logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+            progress_bar.set_postfix_str(f"{rate_tracker.display_rate}, avr_loss={avr_loss:.4f}")  # , "lr": lr_scheduler.get_last_lr()[0]}
 
             if global_step >= args.max_train_steps:
                 break

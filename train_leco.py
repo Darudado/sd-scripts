@@ -200,8 +200,9 @@ def main():
     optimizer_train_fn()
     train_util.init_trackers(accelerator, args, "leco_train")
 
-    progress_bar = tqdm(total=args.max_train_steps, disable=not accelerator.is_local_main_process, desc="steps")
+    progress_bar = tqdm(total=args.max_train_steps, disable=not accelerator.is_local_main_process, desc="steps", bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]")
     global_step = 0
+    rate_tracker = train_util.RateTracker()
 
     while global_step < args.max_train_steps:
         with accelerator.accumulate(network):
@@ -290,6 +291,7 @@ def main():
 
         if accelerator.sync_gradients:
             global_step += 1
+            rate_tracker.tick()
             progress_bar.update(1)
             network_multiplier = accelerator.unwrap_model(network)
             network_multiplier.set_multiplier(0.0)
@@ -301,7 +303,7 @@ def main():
                 "network_multiplier": setting.multiplier,
             }
             accelerator.log(logs, step=global_step)
-            progress_bar.set_postfix(loss=f"{logs['loss']:.4f}")
+            progress_bar.set_postfix_str(f"{rate_tracker.display_rate}, " + ", ".join(f"{k}={v}" for k, v in logs.items()))
 
             if args.save_every_n_steps and global_step % args.save_every_n_steps == 0 and global_step < args.max_train_steps:
                 accelerator.wait_for_everyone()

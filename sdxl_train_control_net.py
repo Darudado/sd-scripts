@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 # TODO 他のスクリプトと共通化する
-def generate_step_logs(args: argparse.Namespace, current_loss, avr_loss, lr_scheduler):
+def generate_step_logs(args: argparse.Namespace, current_loss, avr_loss, lr_scheduler, it_s: float = 0.0):
     logs = {
         "loss/current": current_loss,
         "loss/average": avr_loss,
@@ -62,6 +62,9 @@ def generate_step_logs(args: argparse.Namespace, current_loss, avr_loss, lr_sche
 
     if args.optimizer_type.lower().startswith("DAdapt".lower()):
         logs["lr/d*lr"] = lr_scheduler.optimizers[-1].param_groups[0]["d"] * lr_scheduler.optimizers[-1].param_groups[0]["lr"]
+
+    if it_s > 0:
+        logs["train/it_s"] = round(it_s, 4)
 
     return logs
 
@@ -385,7 +388,7 @@ def train(args):
     accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
     accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
-    progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+    progress_bar = tqdm(range(args.max_train_steps), smoothing=0.1, disable=not accelerator.is_local_main_process, desc="steps", bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]")
     global_step = 0
 
     noise_scheduler = DDPMScheduler(
@@ -409,7 +412,8 @@ def train(args):
             init_kwargs=init_kwargs,
         )
 
-    loss_recorder = train_util.LossRecorder()
+    loss_recorder = train_util.EMARecorder()
+    rate_tracker = train_util.RateTracker()
     del train_dataset_group
 
     # function for saving/removing
@@ -565,6 +569,7 @@ def train(args):
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
+                rate_tracker.tick()
                 progress_bar.update(1)
                 global_step += 1
 
@@ -599,11 +604,10 @@ def train(args):
             current_loss = loss.detach().item()
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
-            logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+            progress_bar.set_postfix_str(f"{rate_tracker.display_rate}, avr_loss={avr_loss:.4f}")  # , "lr": lr_scheduler.get_last_lr()[0]}
 
             if len(accelerator.trackers) > 0:
-                logs = generate_step_logs(args, current_loss, avr_loss, lr_scheduler)
+                logs = generate_step_logs(args, current_loss, avr_loss, lr_scheduler, rate_tracker.it_per_sec)
                 accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
