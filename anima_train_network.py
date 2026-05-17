@@ -159,6 +159,12 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
     def get_text_encoding_strategy(self, args):
         return strategy_anima.AnimaTextEncodingStrategy()
+    
+    def get_text_encoders_train_flags(self, args, text_encoders):
+        return [self.is_train_text_encoder()]
+    
+    def is_train_text_encoder(self, args):
+        return False
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         pass
