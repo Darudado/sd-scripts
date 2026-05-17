@@ -38,7 +38,7 @@ from tqdm import tqdm
 from packaging.version import Version
 
 import torch
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
 from library.strategy_sdxl import SdxlTokenizeStrategy
@@ -5651,6 +5651,32 @@ def parse_string_to_type(s):
     else:
         return None
 
+class ZeroLRWarmupScheduler:
+    """Scheduler wrapper that returns LR=0 during warmup, then delegates to the underlying scheduler.
+
+    Unlike _LRScheduler-based wrappers, this avoids __init__ calling step() and
+    works cleanly with Accelerate's scheduler wrapping.
+    """
+
+    def __init__(self, optimizer: Optimizer, inner_scheduler, warmup_steps: int):
+        self.optimizer = optimizer
+        self.inner_scheduler = inner_scheduler
+        self.warmup_steps = warmup_steps
+        self._step_count = 0
+
+    def step(self, epoch=None):
+        self.inner_scheduler.step(epoch)
+        self._step_count += 1
+        if self._step_count <= self.warmup_steps:
+            for group in self.optimizer.param_groups:
+                group["lr"] = 0.0
+
+    def get_last_lr(self):
+        if self._step_count <= self.warmup_steps:
+            return [0.0 for _ in self.optimizer.param_groups]
+        return self.inner_scheduler.get_last_lr()
+
+
 # Modified version of get_scheduler() function from diffusers.optimizer.get_scheduler
 # Add some checking and features to the original function.
 
@@ -5675,8 +5701,6 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
 
     # zero_lr_warmup: if enabled, set LR to zero during warmup instead of gradually increasing
     zero_lr_warmup_steps = num_warmup_steps if getattr(args, "zero_lr_warmup", False) and num_warmup_steps else 0
-    if zero_lr_warmup_steps > 0:
-        num_warmup_steps = 0  # underlying scheduler gets no warmup; zero warmup is added via wrapper
 
     temp_lr_decay_steps = parse_string_to_type(args.lr_decay_steps) if args.lr_decay_steps is not None else args.lr_decay_steps or 0
 
@@ -5721,11 +5745,10 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         return return_vals
 
     def wrap_zero_lr_warmup(scheduler):
-        """Wrap scheduler with a SequentialLR that forces LR=0 during warmup steps, then switches to the underlying scheduler."""
+        """Wrap scheduler with a ZeroLRWarmupScheduler that forces LR=0 during warmup steps, then delegates to the underlying scheduler."""
         if zero_lr_warmup_steps > 0:
             logger.info(f"zero_lr_warmup enabled: LR will be 0 for the first {zero_lr_warmup_steps} steps")
-            zero_warmup = LambdaLR(optimizer, lr_lambda=lambda step: 0.0)
-            return SequentialLR(optimizer, [zero_warmup, scheduler], milestones=[zero_lr_warmup_steps])
+            return ZeroLRWarmupScheduler(optimizer, scheduler, warmup_steps=zero_lr_warmup_steps)
         return scheduler
 
     # using any lr_scheduler from other library
