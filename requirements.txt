@@ -25,15 +25,20 @@ voluptuous~=0.16.0
 huggingface-hub[hf_xet]~=0.36.2
 hf-xet~=1.5.0
 matplotlib~=3.10.9
-scipy~=1.17.1
+scipy~=1.15.3
 RamTorch @ git+https://github.com/67372a/RamTorch
 customized-optimizers @ git+https://github.com/67372a/customized-optimizers
 lycoris-lora @ git+https://github.com/67372a/LyCORIS@dev
-PyWavelets~=1.9.0
+PyWavelets~=1.8.0
 imagesize~=1.5.0
 numpy~=2.2.6
 urllib3~=2.7.0
 rich~=15.0.0
 sentencepiece~=0.2.1
+https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.0.post2/flash_attn-2.8.0.post2+cu128torch2.7.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl; platform_system == "Windows" and python_version == "3.11"
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.10"
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp311-cp311-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.11"
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.12"
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp313-cp313-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.13"
 # for kohya_ss library
 -e .
