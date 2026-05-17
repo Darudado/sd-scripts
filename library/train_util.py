@@ -38,7 +38,7 @@ from tqdm import tqdm
 from packaging.version import Version
 
 import torch
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
 from library.strategy_sdxl import SdxlTokenizeStrategy
@@ -4002,6 +4002,12 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         " / 学習率のスケジューラをウォームアップするステップ数（デフォルト0）、または学習ステップの比率（1未満のfloat値の場合）",
     )
     parser.add_argument(
+        "--zero_lr_warmup",
+        action="store_true",
+        help="When enabled, learning rate is set to zero during warmup steps instead of gradually increasing"
+        " / 有効時、ウォームアップ中は学習率を0に設定し、ウォームアップ完了後に目標学習率に即座に切り替えます",
+    )
+    parser.add_argument(
         "--lr_decay_steps",
         type=int_or_float,
         default=0,
@@ -5667,6 +5673,11 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
     )
 
+    # zero_lr_warmup: if enabled, set LR to zero during warmup instead of gradually increasing
+    zero_lr_warmup_steps = num_warmup_steps if getattr(args, "zero_lr_warmup", False) and num_warmup_steps else 0
+    if zero_lr_warmup_steps > 0:
+        num_warmup_steps = 0  # underlying scheduler gets no warmup; zero warmup is added via wrapper
+
     temp_lr_decay_steps = parse_string_to_type(args.lr_decay_steps) if args.lr_decay_steps is not None else args.lr_decay_steps or 0
 
     num_decay_steps: Optional[int] = (
@@ -5709,6 +5720,14 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             raise ValueError(f"{name} does not require `num_warmup_steps`. Set None or 0.")
         return return_vals
 
+    def wrap_zero_lr_warmup(scheduler):
+        """Wrap scheduler with a SequentialLR that forces LR=0 during warmup steps, then switches to the underlying scheduler."""
+        if zero_lr_warmup_steps > 0:
+            logger.info(f"zero_lr_warmup enabled: LR will be 0 for the first {zero_lr_warmup_steps} steps")
+            zero_warmup = LambdaLR(optimizer, lr_lambda=lambda step: 0.0)
+            return SequentialLR(optimizer, [zero_warmup, scheduler], milestones=[zero_lr_warmup_steps])
+        return scheduler
+
     # using any lr_scheduler from other library
     if args.lr_scheduler_type:
         lr_scheduler_type = args.lr_scheduler_type
@@ -5721,7 +5740,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             lr_scheduler_type = values[-1]
         lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
         lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
-        return wrap_check_needless_num_warmup_steps(lr_scheduler)
+        return wrap_zero_lr_warmup(wrap_check_needless_num_warmup_steps(lr_scheduler))
     else:
         logger.info(f"use {name} | {lr_scheduler_kwargs} as lr_scheduler")
 
@@ -5731,78 +5750,78 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         ), f"adafactor scheduler must be used with Adafactor optimizer / adafactor schedulerはAdafactorオプティマイザと同時に使ってください"
         initial_lr = float(name.split(":")[1])
         # logger.info(f"adafactor scheduler init lr {initial_lr}")
-        return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
+        return wrap_zero_lr_warmup(wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr)))
 
     if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
         name = DiffusersSchedulerType(name)
         schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
-        return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
+        return wrap_zero_lr_warmup(schedule_func(optimizer, **lr_scheduler_kwargs))  # step_rules and last_epoch are given as kwargs
 
     if name.lower() == 'CosineAnnealingLR'.lower():
-        return wrap_check_needless_num_warmup_steps(CosineAnnealingLR(optimizer, 
+        return wrap_zero_lr_warmup(wrap_check_needless_num_warmup_steps(CosineAnnealingLR(optimizer,
                                  T_max=num_training_steps,
                                  eta_min=lr_scheduler_kwargs.get("min_lr", 1e-8),
-                                 last_epoch=lr_scheduler_kwargs.get("last_epoch", -1)))
+                                 last_epoch=lr_scheduler_kwargs.get("last_epoch", -1))))
 
     name = SchedulerType(name)
     schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
 
     if name == SchedulerType.CONSTANT:
-        return wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs))
+        return wrap_zero_lr_warmup(wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs)))
 
     # All other schedulers require `num_warmup_steps`
     if num_warmup_steps is None:
         raise ValueError(f"{name} requires `num_warmup_steps`, please provide that argument.")
 
     if name == SchedulerType.CONSTANT_WITH_WARMUP:
-        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs)
+        return wrap_zero_lr_warmup(schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs))
 
     if name == SchedulerType.INVERSE_SQRT:
-        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs)
+        return wrap_zero_lr_warmup(schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs))
 
     # All other schedulers require `num_training_steps`
     if num_training_steps is None:
         raise ValueError(f"{name} requires `num_training_steps`, please provide that argument.")
 
     if name == SchedulerType.COSINE_WITH_RESTARTS:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
             num_cycles=num_cycles,
             **lr_scheduler_kwargs,
-        )
+        ))
 
     if name == SchedulerType.POLYNOMIAL:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, power=power, **lr_scheduler_kwargs
-        )
+        ))
 
     if name == SchedulerType.COSINE_WITH_MIN_LR:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
             num_cycles=num_cycles / 2,
             min_lr_rate=min_lr_ratio,
             **lr_scheduler_kwargs,
-        )
+        ))
 
     # these schedulers do not require `num_decay_steps`
     if name == SchedulerType.LINEAR or name == SchedulerType.COSINE:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
             **lr_scheduler_kwargs,
-        )
+        ))
 
     # All other schedulers require `num_decay_steps`
 
     if num_decay_steps is None:
         raise ValueError(f"{name} requires `num_decay_steps`, please provide that argument.")
     if name == SchedulerType.WARMUP_STABLE_DECAY:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer,
             num_warmup_steps=num_warmup_steps,
             num_stable_steps=num_stable_steps,
@@ -5810,15 +5829,15 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             num_cycles=num_cycles / 2.0,
             min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
             **lr_scheduler_kwargs,
-        )
+        ))
 
-    return schedule_func(
+    return wrap_zero_lr_warmup(schedule_func(
         optimizer,
         num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps,
         num_decay_steps=num_decay_steps,
         **lr_scheduler_kwargs,
-    )
+    ))
 
 
 
