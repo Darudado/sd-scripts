@@ -766,6 +766,7 @@ class NetworkTrainer:
                             text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
             batch_size = latents.shape[0]
+            per_t_step_losses = []
             for fixed_timesteps in timesteps_list:
                 timesteps = torch.full((batch_size,), fixed_timesteps, dtype=torch.long, device=latents.device)
                 # sample noise, call unet, get target
@@ -793,10 +794,12 @@ class NetworkTrainer:
                 loss = loss.mean(dim=list(range(1, loss.ndim)))  # mean over all dims except batch
                 loss = loss.mean()
                 total_loss += loss
+                per_t_step_losses.append(loss)
 
-        average_loss = total_loss / len(timesteps_list)    
+        average_loss = total_loss / len(timesteps_list)
+        per_timestep_losses = {t: l.detach().item() for t, l in zip(timesteps_list, per_t_step_losses)}
 
-        return average_loss
+        return average_loss, per_timestep_losses
 
     def cast_text_encoder(self, args):
         return True  # default for other than HunyuanImage
@@ -876,6 +879,8 @@ class NetworkTrainer:
         accelerator.print("Validating バリデーション処理...")
         total_loss = 0.0
         total_samples = 0
+        per_timestep_total_loss = {}
+        per_timestep_total_samples = {}
         with torch.no_grad():
             validation_steps = min(int(args.max_validation_steps), len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
             val_dataloader_seed = random.randint(global_step, 0x7FFFFFFF)
@@ -897,17 +902,26 @@ class NetworkTrainer:
                 else:
                     current_batch_size = 1
 
-                loss = self.process_val_batch(batch, text_encoders, unet, network, vae, noise_scheduler, vae_dtype,
+                loss, batch_per_t_losses = self.process_val_batch(batch, text_encoders, unet, network, vae, noise_scheduler, vae_dtype,
                                               weight_dtype, accelerator, args, text_encoding_strategy, tokenize_strategy,
                                               train_text_encoder=train_text_encoder,
                                               timesteps_list=timesteps_list)
                 total_loss += loss.detach().item() * current_batch_size
                 total_samples += current_batch_size
+                # Accumulate per-timestep losses
+                for t, t_loss in batch_per_t_losses.items():
+                    per_timestep_total_loss[t] = per_timestep_total_loss.get(t, 0.0) + t_loss * current_batch_size
+                    per_timestep_total_samples[t] = per_timestep_total_samples.get(t, 0) + current_batch_size
             current_val_loss = total_loss / total_samples if total_samples > 0 else 0.0
-            val_loss_recorder.add(current_val_loss)   
-                     
+            val_loss_recorder.add(current_val_loss)
+
         average_val_loss: float = val_loss_recorder.average
-        logs = {"loss/current_val_loss": current_val_loss, "loss/average_val_loss": average_val_loss}
+        # Compute per-timestep average validation losses
+        per_timestep_avg = {
+            f"loss/val/t{int(t)}": per_timestep_total_loss[t] / per_timestep_total_samples[t]
+            for t in per_timestep_total_loss
+        }
+        logs = {"loss/current_val_loss": current_val_loss, "loss/average_val_loss": average_val_loss, **per_timestep_avg}
 
         self.restore_rng_state(rng_states, accelerator)
 
@@ -2142,8 +2156,10 @@ class NetworkTrainer:
                 average_val_loss=average_val_loss,
                 it_s=rate_tracker.it_per_sec,
             )
+            if val_logs:
+                logs.update(val_logs)
             # log empty object to commit the sample images to wandb
-            accelerator.log(logs, step=0) 
+            accelerator.log(logs, step=0)
 
         # training loop
         if initial_step > 0:  # only if skip_until_initial_step is specified
@@ -2420,6 +2436,8 @@ class NetworkTrainer:
                             average_val_loss=average_val_loss,
                             it_s=rate_tracker.it_per_sec,
                         )
+                        if val_logs:
+                            logs.update(val_logs)
                         accelerator.log(logs, step=global_step)
                     current_global_step_loss = 0.0
                     if args.edm2_loss_weighting:
