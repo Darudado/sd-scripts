@@ -1,11 +1,9 @@
 accelerate~=1.13.0
 transformers~=4.54.1
-diffusers~=0.37.0
+diffusers~=0.37.1
 ftfy~=6.3.1
-# albumentations==1.3.0
 opencv-python~=4.13.0.92
 einops~=0.8.2
-# pytorch-lightning==1.9.0
 bitsandbytes~=0.49.2
 triton~=3.3.1; platform_system == "Linux"
 triton-windows~=3.3.1.post21; platform_system == "Windows"
@@ -15,52 +13,32 @@ pytorch_optimizer==3.10.0
 prodigy-plus-schedule-free~=2.0.1
 prodigyopt~=1.1.2
 dadaptation~=3.2
-came-pytorch~=0.1.3
 torchastic~=0.1.2
 torch-optimi~=0.3.3
 adv_optm~=2.2.3
 kornia~=0.8.2
 tensorboard~=2.20.0
 safetensors~=0.7.0
-wandb~=0.25.1
-# gradio==3.16.2
-# altair==4.2.2
-# easygui==0.98.3
+wandb~=0.26.1
 toml~=0.10.2
 voluptuous~=0.16.0
 huggingface-hub[hf_xet]~=0.36.2
-hf-xet~=1.4.2
-matplotlib~=3.10.8
-scipy~=1.17.1
+hf-xet~=1.5.0
+matplotlib~=3.10.9
+scipy~=1.15.3
 RamTorch @ git+https://github.com/67372a/RamTorch
 customized-optimizers @ git+https://github.com/67372a/customized-optimizers
 lycoris-lora @ git+https://github.com/67372a/LyCORIS@dev
-PyWavelets~=1.9.0
-# for Image utils
+PyWavelets~=1.8.0
 imagesize~=1.5.0
 numpy~=2.2.6
-urllib3>=2.6.3
-# <=2.0
-# for BLIP captioning
-# requests==2.28.2
-# timm==0.6.12
-# fairscale==0.4.13
-# for WD14 captioning (tensorflow)
-# tensorflow==2.10.1
-# for WD14 captioning (onnx)
-# onnx==1.15.0
-# onnxruntime-gpu==1.17.1
-# onnxruntime==1.17.1
-# for cuda 12.1(default 11.8)
-# onnxruntime-gpu --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
-
-# this is for onnx: 
-# protobuf==3.20.3
-# open clip for SDXL
-# open-clip-torch==2.20.0
-# For logging
-rich~=14.3.3
-# for T5XXL tokenizer (SD3/FLUX)
+urllib3~=2.7.0
+rich~=15.0.0
 sentencepiece~=0.2.1
+https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.0.post2/flash_attn-2.8.0.post2+cu128torch2.7.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl; platform_system == "Windows" and python_version == "3.11"
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.10"
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp311-cp311-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.11"
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.12"
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp313-cp313-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.13"
 # for kohya_ss library
 -e .

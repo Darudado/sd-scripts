@@ -4002,6 +4002,12 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         " / 学習率のスケジューラをウォームアップするステップ数（デフォルト0）、または学習ステップの比率（1未満のfloat値の場合）",
     )
     parser.add_argument(
+        "--zero_lr_warmup",
+        action="store_true",
+        help="When enabled, learning rate is set to zero during warmup steps instead of gradually increasing"
+        " / 有効時、ウォームアップ中は学習率を0に設定し、ウォームアップ完了後に目標学習率に即座に切り替えます",
+    )
+    parser.add_argument(
         "--lr_decay_steps",
         type=int_or_float,
         default=0,
@@ -5645,6 +5651,45 @@ def parse_string_to_type(s):
     else:
         return None
 
+class ZeroLRWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """Scheduler wrapper that returns LR=0 during warmup, then delegates to the underlying scheduler.
+
+    Inherits from _LRScheduler for proper integration with PyTorch's scheduler ecosystem
+    and Accelerate's scheduler wrapping. The inner scheduler is stepped on each step()
+    call, but its LR values are overridden to 0 during the warmup phase.
+    """
+
+    def __init__(self, optimizer: Optimizer, inner_scheduler, warmup_steps: int, last_epoch: int = -1):
+        self.inner_scheduler = inner_scheduler
+        self.warmup_steps = warmup_steps
+        # Guard: prevent parent __init__ from prematurely stepping inner scheduler
+        self._initializing = True
+        super().__init__(optimizer, last_epoch=last_epoch)
+        self._initializing = False
+        # Undo parent's init step for correct warmup step count
+        self._step_count = 0
+        if self.warmup_steps > 0:
+            for group in self.optimizer.param_groups:
+                group["lr"] = 0.0
+            self._last_lr = [0.0 for _ in self.optimizer.param_groups]
+
+    def get_lr(self):
+        """Return 0 during warmup, otherwise delegate to inner scheduler's last LR."""
+        if self.warmup_steps > 0 and self._step_count <= self.warmup_steps:
+            return [0.0 for _ in self.optimizer.param_groups]
+        return self.inner_scheduler.get_last_lr()
+
+    def step(self, epoch=None):
+        """Step inner scheduler, then apply LR via parent (zero during warmup)."""
+        if not getattr(self, '_initializing', False):
+            self.inner_scheduler.step(epoch)
+        super().step(epoch)
+
+    def get_last_lr(self):
+        """Return the last computed LR values."""
+        return self._last_lr
+
+
 # Modified version of get_scheduler() function from diffusers.optimizer.get_scheduler
 # Add some checking and features to the original function.
 
@@ -5667,15 +5712,14 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
     )
 
+    # zero_lr_warmup: if enabled, set LR to zero during warmup instead of gradually increasing
+    zero_lr_warmup_steps = num_warmup_steps if getattr(args, "zero_lr_warmup", False) and num_warmup_steps else 0
+
     temp_lr_decay_steps = parse_string_to_type(args.lr_decay_steps) if args.lr_decay_steps is not None else args.lr_decay_steps or 0
 
     num_decay_steps: Optional[int] = (
         int(temp_lr_decay_steps * num_training_steps) if isinstance(temp_lr_decay_steps, float) else temp_lr_decay_steps
     )
-
-    # TODO add inputs to UI to support setting decay steps
-    if name == SchedulerType.WARMUP_STABLE_DECAY and (num_decay_steps is None or num_decay_steps == 0):
-        num_decay_steps = num_warmup_steps
 
     num_stable_steps = num_training_steps - num_warmup_steps - num_decay_steps
     num_cycles = args.lr_scheduler_num_cycles
@@ -5683,11 +5727,34 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     timescale = args.lr_scheduler_timescale
     min_lr_ratio = args.lr_scheduler_min_lr_ratio
 
+    # DEBUG: Log scheduler parameter calculations for diagnosing warmup_stable_decay issues
+    phase_sum = num_warmup_steps + num_stable_steps + num_decay_steps
+    logger.info(
+        f"[SCHEDULER] name={name}, max_train_steps={args.max_train_steps}, num_processes={num_processes}, "
+        f"num_training_steps={num_training_steps}, num_warmup_steps={num_warmup_steps}, "
+        f"num_decay_steps={num_decay_steps}, num_stable_steps={num_stable_steps}, "
+        f"zero_lr_warmup={getattr(args, 'zero_lr_warmup', False)}, zero_lr_warmup_steps={zero_lr_warmup_steps}, "
+        f"phase_sum={phase_sum}, min_lr_ratio={min_lr_ratio}, num_cycles={num_cycles}"
+    )
+    if phase_sum != num_training_steps:
+        logger.warning(
+            f"[SCHEDULER] Phase sum mismatch: warmup({num_warmup_steps}) + stable({num_stable_steps}) "
+            f"+ decay({num_decay_steps}) = {phase_sum} != num_training_steps({num_training_steps})"
+        )
+    logger.info(
+        f"[SCHEDULER] Phase boundaries: warmup[0,{num_warmup_steps}), "
+        f"stable[{num_warmup_steps},{num_warmup_steps+num_stable_steps}), "
+        f"decay[{num_warmup_steps+num_stable_steps},{num_warmup_steps+num_stable_steps+num_decay_steps})"
+    )
+
     lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
     if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
         for arg in args.lr_scheduler_args:
             key, value = arg.split("=")
-            value = ast.literal_eval(value)
+            try:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                pass  # keep as plain string
 
             # TODO temp fix for warmup and first cycle steps pending UI changes
             if key == 'first_cycle_max_steps' and float(args.validation_split) > 0.0:
@@ -5706,6 +5773,13 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             raise ValueError(f"{name} does not require `num_warmup_steps`. Set None or 0.")
         return return_vals
 
+    def wrap_zero_lr_warmup(scheduler):
+        """Wrap scheduler with a ZeroLRWarmupScheduler that forces LR=0 during warmup steps, then delegates to the underlying scheduler."""
+        if zero_lr_warmup_steps > 0:
+            logger.info(f"zero_lr_warmup enabled: LR will be 0 for the first {zero_lr_warmup_steps} steps")
+            return ZeroLRWarmupScheduler(optimizer, scheduler, warmup_steps=zero_lr_warmup_steps)
+        return scheduler
+
     # using any lr_scheduler from other library
     if args.lr_scheduler_type:
         lr_scheduler_type = args.lr_scheduler_type
@@ -5718,7 +5792,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             lr_scheduler_type = values[-1]
         lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
         lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
-        return wrap_check_needless_num_warmup_steps(lr_scheduler)
+        return wrap_zero_lr_warmup(wrap_check_needless_num_warmup_steps(lr_scheduler))
     else:
         logger.info(f"use {name} | {lr_scheduler_kwargs} as lr_scheduler")
 
@@ -5728,78 +5802,78 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         ), f"adafactor scheduler must be used with Adafactor optimizer / adafactor schedulerはAdafactorオプティマイザと同時に使ってください"
         initial_lr = float(name.split(":")[1])
         # logger.info(f"adafactor scheduler init lr {initial_lr}")
-        return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
+        return wrap_zero_lr_warmup(wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr)))
 
     if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
         name = DiffusersSchedulerType(name)
         schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
-        return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
+        return wrap_zero_lr_warmup(schedule_func(optimizer, **lr_scheduler_kwargs))  # step_rules and last_epoch are given as kwargs
 
     if name.lower() == 'CosineAnnealingLR'.lower():
-        return wrap_check_needless_num_warmup_steps(CosineAnnealingLR(optimizer, 
+        return wrap_zero_lr_warmup(wrap_check_needless_num_warmup_steps(CosineAnnealingLR(optimizer,
                                  T_max=num_training_steps,
                                  eta_min=lr_scheduler_kwargs.get("min_lr", 1e-8),
-                                 last_epoch=lr_scheduler_kwargs.get("last_epoch", -1)))
+                                 last_epoch=lr_scheduler_kwargs.get("last_epoch", -1))))
 
     name = SchedulerType(name)
     schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
 
     if name == SchedulerType.CONSTANT:
-        return wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs))
+        return wrap_zero_lr_warmup(wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs)))
 
     # All other schedulers require `num_warmup_steps`
     if num_warmup_steps is None:
         raise ValueError(f"{name} requires `num_warmup_steps`, please provide that argument.")
 
     if name == SchedulerType.CONSTANT_WITH_WARMUP:
-        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs)
+        return wrap_zero_lr_warmup(schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs))
 
     if name == SchedulerType.INVERSE_SQRT:
-        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs)
+        return wrap_zero_lr_warmup(schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs))
 
     # All other schedulers require `num_training_steps`
     if num_training_steps is None:
         raise ValueError(f"{name} requires `num_training_steps`, please provide that argument.")
 
     if name == SchedulerType.COSINE_WITH_RESTARTS:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
             num_cycles=num_cycles,
             **lr_scheduler_kwargs,
-        )
+        ))
 
     if name == SchedulerType.POLYNOMIAL:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, power=power, **lr_scheduler_kwargs
-        )
+        ))
 
     if name == SchedulerType.COSINE_WITH_MIN_LR:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
             num_cycles=num_cycles / 2,
             min_lr_rate=min_lr_ratio,
             **lr_scheduler_kwargs,
-        )
+        ))
 
     # these schedulers do not require `num_decay_steps`
     if name == SchedulerType.LINEAR or name == SchedulerType.COSINE:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
             **lr_scheduler_kwargs,
-        )
+        ))
 
     # All other schedulers require `num_decay_steps`
 
     if num_decay_steps is None:
         raise ValueError(f"{name} requires `num_decay_steps`, please provide that argument.")
     if name == SchedulerType.WARMUP_STABLE_DECAY:
-        return schedule_func(
+        return wrap_zero_lr_warmup(schedule_func(
             optimizer,
             num_warmup_steps=num_warmup_steps,
             num_stable_steps=num_stable_steps,
@@ -5807,15 +5881,15 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             num_cycles=num_cycles / 2.0,
             min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
             **lr_scheduler_kwargs,
-        )
+        ))
 
-    return schedule_func(
+    return wrap_zero_lr_warmup(schedule_func(
         optimizer,
         num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps,
         num_decay_steps=num_decay_steps,
         **lr_scheduler_kwargs,
-    )
+    ))
 
 
 
@@ -7800,20 +7874,30 @@ class LossRecorder:
     
 class EMARecorder:
     """
-    Calculates a bias-corrected Exponential Moving Average (EMA).
+    Calculates a bias-corrected Exponential Moving Average (EMA) with
+    optional outlier-robust statistics.
 
     This is the preferred method for smoothing noisy data in real-time,
     such as mini-batch losses during model training. It gives more weight
     to recent values, making it responsive to trends.
+
+    Uses Welford's online algorithm for running variance to enable
+    automatic outlier clipping. Supports both the old LossRecorder
+    keyword-argument calling convention (epoch, step, loss) and the
+    simpler positional value call.
     """
-    def __init__(self, smoothing: float = 0.1):
+    def __init__(self, smoothing: float = 0.25, outlier_sigma: float = 0.0):
         """
         Initializes the EMA recorder.
 
         Args:
             smoothing (float): The smoothing factor, typically between 0 and 1.
                 A smaller value (e.g., 0.01) results in a smoother, less responsive average.
-                A larger value (e.g., 0.1) results in a noisier, more responsive average.
+                A larger value (e.g., 0.25) results in a more responsive average.
+                Default: 0.25 for fast adaptation while still filtering noise.
+            outlier_sigma (float): Number of standard deviations beyond which values
+                are clipped. Set to 0 to disable outlier clipping.
+                Recommended: 3.0--5.0 for typical training. Default: 0 (disabled).
         """
         if not 0.0 <= smoothing <= 1.0:
             raise ValueError("Smoothing factor must be between 0 and 1.")
@@ -7824,11 +7908,47 @@ class EMARecorder:
         self.ema: float = 0.0
         self.num_updates: int = 0
 
-    def add(self, value: float) -> None:
+        # Welford's online algorithm state for running mean and variance
+        self._welford_mean: float = 0.0
+        self._welford_m2: float = 0.0  # Sum of squared differences
+        self.outlier_sigma: float = outlier_sigma
+
+    def add(self, value: float = None, *, epoch: int = None, step: int = None, loss: float = None) -> None:
         """
         Updates the EMA with a new value.
+
+        Accepts both the simple positional form `add(value)` and the
+        legacy LossRecorder keyword form `add(epoch=epoch, step=step, loss=loss)`.
         """
+        # Support legacy LossRecorder calling convention
+        if value is None:
+            if loss is not None:
+                value = loss
+            else:
+                return  # Nothing to add
+
         self.num_updates += 1
+
+        # Outlier clipping: check against current statistics BEFORE updating them.
+        # This prevents a single extreme outlier from contaminating the running variance.
+        if self.outlier_sigma > 0 and self.num_updates > 5:
+            variance = self._welford_m2 / (self.num_updates - 1) if self.num_updates > 1 else 0.0
+            std = variance ** 0.5
+            # Fallback: if all values have been nearly identical (std ~ 0),
+            # use a minimum std of 20% of the current EMA to still catch outliers
+            min_std = 0.2 * abs(self.ema) if self.ema != 0 else 0.01
+            effective_std = max(std, min_std)
+            if effective_std > 0:
+                lower_bound = self.ema - self.outlier_sigma * effective_std
+                upper_bound = self.ema + self.outlier_sigma * effective_std
+                value = max(lower_bound, min(value, upper_bound))
+
+        # Update running variance via Welford's algorithm (with possibly clipped value)
+        delta = value - self._welford_mean
+        self._welford_mean += delta / self.num_updates
+        delta2 = value - self._welford_mean
+        self._welford_m2 += delta * delta2
+
         # Standard EMA update rule
         self.ema = self.beta * self.ema + self.smoothing * value
 
@@ -7847,3 +7967,113 @@ class EMARecorder:
         # As num_updates -> infinity, the correction factor -> 1
         correction_factor = 1 - (self.beta ** self.num_updates)
         return self.ema / correction_factor
+
+    @property
+    def moving_average(self) -> float:
+        """Alias for backward compatibility with LossRecorder."""
+        return self.average
+
+    @property
+    def std(self) -> float:
+        """Returns the running standard deviation (for diagnostics)."""
+        if self.num_updates < 2:
+            return 0.0
+        return (self._welford_m2 / (self.num_updates - 1)) ** 0.5
+
+
+class RateTracker:
+    """
+    Tracks iterations per second using Welford's online algorithm for
+    running mean and variance of step durations.
+
+    Unlike tqdm's built-in EMA-based rate smoothing, Welford provides
+    both the running mean step time AND its variance, enabling
+    statistically robust rate display that is resistant to I/O hiccups
+    and other transient timing outliers.
+
+    Usage:
+        rate_tracker = RateTracker()
+        # ... inside the training loop, at each optimizer step boundary:
+        rate_tracker.tick()
+        # Display in tqdm postfix:
+        logs = {"avr_loss": ..., "it/s": rate_tracker.display_rate}
+    """
+    def __init__(self, skip_first: bool = True):
+        """
+        Args:
+            skip_first: If True, discards the first recorded interval (step 0→1),
+                which typically includes torch.compile, CUDA init, and other
+                one-time overhead that would otherwise appear as an outlier
+                and corrupt the running statistics. Default: True.
+        """
+        self._welford_mean: float = 0.0   # Running mean step time (seconds)
+        self._welford_m2: float = 0.0     # Sum of squared differences
+        self._count: int = 0               # Number of steps recorded
+        self._last_time: float | None = None  # perf_counter of last tick
+        self._skip_first: bool = skip_first
+        self._first_skipped: bool = False
+
+    def tick(self) -> None:
+        """
+        Record the end of one optimizer step and begin timing the next.
+
+        Call this once per optimizer step (i.e., inside the
+        ``if accelerator.sync_gradients:`` block, before
+        ``progress_bar.update(1)``).
+        """
+        now = time.perf_counter()
+        if self._last_time is not None:
+            elapsed = now - self._last_time
+            if self._skip_first and not self._first_skipped:
+                self._first_skipped = True
+                # Discard this interval—it includes torch.compile / init overhead
+            else:
+                self._add(elapsed)
+        self._last_time = now
+
+    def _add(self, value: float) -> None:
+        """Update Welford statistics with a new step duration."""
+        self._count += 1
+        delta = value - self._welford_mean
+        self._welford_mean += delta / self._count
+        delta2 = value - self._welford_mean
+        self._welford_m2 += delta * delta2
+
+    @property
+    def it_per_sec(self) -> float:
+        """Running mean iterations per second (1 / mean step time)."""
+        if self._welford_mean == 0.0:
+            return 0.0
+        return 1.0 / self._welford_mean
+
+    @property
+    def mean_step_time(self) -> float:
+        """Running mean step time in seconds."""
+        return self._welford_mean
+
+    @property
+    def display_rate(self) -> str:
+        """Formatted rate string for tqdm postfix display.
+
+        Shows ``it/s`` with two decimals when rate >= 1.0 (e.g. ``"12.34it/s"``),
+        and ``s/it`` with two decimals when slower (e.g. ``"1.25s/it"``).
+        """
+        rate = self.it_per_sec
+        if rate >= 1.0:
+            return f"{rate:.2f}it/s"
+        elif rate > 0.0:
+            return f"{1.0 / rate:.2f}s/it"
+        else:
+            return "0.0it/s"
+
+    @property
+    def step_time_std(self) -> float:
+        """Running standard deviation of step durations in seconds."""
+        if self._count < 2:
+            return 0.0
+        return (self._welford_m2 / (self._count - 1)) ** 0.5
+
+    @property
+    def step_count(self) -> int:
+        """Number of timed steps recorded."""
+        return self._count

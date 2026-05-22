@@ -836,7 +836,7 @@ def train(args):
     accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
     accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
-    progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+    progress_bar = tqdm(range(args.max_train_steps), smoothing=0.1, disable=not accelerator.is_local_main_process, desc="steps", bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]")
     global_step = 0
 
     noise_scheduler = DDPMScheduler(
@@ -880,6 +880,7 @@ def train(args):
 
     loss_recorder = train_util.EMARecorder()
     val_loss_recorder = train_util.EMARecorder()
+    rate_tracker = train_util.RateTracker()
 
     if args.edm2_loss_weighting:
         loss_scaled_recorder = train_util.EMARecorder()
@@ -896,6 +897,7 @@ def train(args):
         accelerator.print("")
         accelerator.print("Validating バリデーション処理...")
         total_loss = 0.0
+        total_samples = 0
 
         # set eval
         for m in training_models:
@@ -911,6 +913,16 @@ def train(args):
                 batch = next(cyclic_val_dataloader)
                 val_dataloader_state = random.getstate()
                 random.setstate(val_original_state)
+
+                # Determine current batch size for proper weighted averaging
+                if "latents" in batch and batch["latents"] is not None:
+                    current_batch_size = batch["latents"].shape[0]
+                elif "images" in batch:
+                    current_batch_size = batch["images"].shape[0]
+                elif "captions" in batch:
+                    current_batch_size = len(batch["captions"])
+                else:
+                    current_batch_size = 1
                 
                 # Validation batch processing (simplified from train loop)
                 if "latents" in batch and batch["latents"] is not None:
@@ -998,9 +1010,11 @@ def train(args):
 
                     loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
                     loss = loss.mean()
-                    total_loss += loss.item()
+                    total_loss += loss.item() * current_batch_size
 
-        current_val_loss = total_loss / (validation_steps * len(timesteps_list))
+                total_samples += current_batch_size
+
+        current_val_loss = total_loss / (total_samples * len(timesteps_list)) if total_samples > 0 else 0.0
         val_loss_recorder.add(current_val_loss)
         average_val_loss = val_loss_recorder.average
         
@@ -1273,6 +1287,7 @@ def train(args):
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
+                rate_tracker.tick()
                 progress_bar.update(1)
                 global_step += 1
 
@@ -1375,8 +1390,7 @@ def train(args):
             current_val_loss, average_val_loss, val_logs = None, None, {}
 
             avr_loss: float = loss_recorder.average
-            logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+            progress_bar.set_postfix_str(f"{rate_tracker.display_rate}, avr_loss={avr_loss:.4f}")  # , "lr": lr_scheduler.get_last_lr()[0]}
 
             if global_step >= args.max_train_steps:
                 break

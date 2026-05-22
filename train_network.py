@@ -61,6 +61,10 @@ except ImportError:
 
 setup_logging()
 import logging
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="torchao")
+logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +97,13 @@ class NetworkTrainer:
         mean_grad_norm=None,
         mean_combined_norm=None,
         edm2_lr_scheduler=None,
-        current_loss_scaled=None, 
-        average_loss_scaled=None, 
-        current_loss_edm2=None, 
-        average_loss_edm2=None, 
+        current_loss_scaled=None,
+        average_loss_scaled=None,
+        current_loss_edm2=None,
+        average_loss_edm2=None,
         current_val_loss=None,
         average_val_loss=None,
+        it_s: float = 0.0,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
 
@@ -149,6 +154,9 @@ class NetworkTrainer:
 
         if edm2_lr_scheduler is not None:
             logs[f"lr/edm2"] = edm2_lr_scheduler.get_last_lr()[0]
+
+        if it_s > 0:
+            logs["train/it_s"] = round(it_s, 4)
 
         return logs
 
@@ -762,6 +770,7 @@ class NetworkTrainer:
                             text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
             batch_size = latents.shape[0]
+            per_t_step_losses = []
             for fixed_timesteps in timesteps_list:
                 timesteps = torch.full((batch_size,), fixed_timesteps, dtype=torch.long, device=latents.device)
                 # sample noise, call unet, get target
@@ -789,10 +798,12 @@ class NetworkTrainer:
                 loss = loss.mean(dim=list(range(1, loss.ndim)))  # mean over all dims except batch
                 loss = loss.mean()
                 total_loss += loss
+                per_t_step_losses.append(loss)
 
-        average_loss = total_loss / len(timesteps_list)    
+        average_loss = total_loss / len(timesteps_list)
+        per_timestep_losses = {t: l.detach().item() for t, l in zip(timesteps_list, per_t_step_losses)}
 
-        return average_loss
+        return average_loss, per_timestep_losses
 
     def cast_text_encoder(self, args):
         return True  # default for other than HunyuanImage
@@ -871,6 +882,9 @@ class NetworkTrainer:
         accelerator.print("") 
         accelerator.print("Validating バリデーション処理...")
         total_loss = 0.0
+        total_samples = 0
+        per_timestep_total_loss = {}
+        per_timestep_total_samples = {}
         with torch.no_grad():
             validation_steps = min(int(args.max_validation_steps), len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
             val_dataloader_seed = random.randint(global_step, 0x7FFFFFFF)
@@ -881,16 +895,37 @@ class NetworkTrainer:
                 batch = next(cyclic_val_dataloader)
                 val_dataloader_state = random.getstate()
                 random.setstate(val_original_state)
-                loss = self.process_val_batch(batch, text_encoders, unet, network, vae, noise_scheduler, vae_dtype, 
-                                              weight_dtype, accelerator, args, text_encoding_strategy, tokenize_strategy, 
+
+                # Determine current batch size for proper weighted averaging
+                if "latents" in batch and batch["latents"] is not None:
+                    current_batch_size = batch["latents"].shape[0]
+                elif "images" in batch:
+                    current_batch_size = batch["images"].shape[0]
+                elif "captions" in batch:
+                    current_batch_size = len(batch["captions"])
+                else:
+                    current_batch_size = 1
+
+                loss, batch_per_t_losses = self.process_val_batch(batch, text_encoders, unet, network, vae, noise_scheduler, vae_dtype,
+                                              weight_dtype, accelerator, args, text_encoding_strategy, tokenize_strategy,
                                               train_text_encoder=train_text_encoder,
                                               timesteps_list=timesteps_list)
-                total_loss += loss.detach().item()
-            current_val_loss = total_loss / validation_steps
-            val_loss_recorder.add(current_val_loss)   
-                     
+                total_loss += loss.detach().item() * current_batch_size
+                total_samples += current_batch_size
+                # Accumulate per-timestep losses
+                for t, t_loss in batch_per_t_losses.items():
+                    per_timestep_total_loss[t] = per_timestep_total_loss.get(t, 0.0) + t_loss * current_batch_size
+                    per_timestep_total_samples[t] = per_timestep_total_samples.get(t, 0) + current_batch_size
+            current_val_loss = total_loss / total_samples if total_samples > 0 else 0.0
+            val_loss_recorder.add(current_val_loss)
+
         average_val_loss: float = val_loss_recorder.average
-        logs = {"loss/current_val_loss": current_val_loss, "loss/average_val_loss": average_val_loss}
+        # Compute per-timestep average validation losses
+        per_timestep_avg = {
+            f"loss/val/t{int(t)}": per_timestep_total_loss[t] / per_timestep_total_samples[t]
+            for t in per_timestep_total_loss
+        }
+        logs = {"loss/current_val_loss": current_val_loss, "loss/average_val_loss": average_val_loss, **per_timestep_avg}
 
         self.restore_rng_state(rng_states, accelerator)
 
@@ -1190,6 +1225,33 @@ class NetworkTrainer:
             )
         if network is None:
             return
+
+        # GoRA: override args and net_kwargs to reflect enforced values in saved metadata
+        _gora_algo = (net_kwargs.get("algo", "") or "").lower()
+        if _gora_algo in ("gora", "ralora"):
+            if args.network_alpha != args.network_dim:
+                accelerator.print(
+                    f"GoRA: overriding --network_alpha from {args.network_alpha} to {args.network_dim} "
+                    f"(GoRA requires alpha = dim)"
+                )
+                args.network_alpha = args.network_dim
+
+            if net_kwargs.get("use_scalar", "").lower() in ("true", "1", "yes"):
+                accelerator.print(
+                    "GoRA: overriding use_scalar from True to False "
+                    "(scalar destabilizes importance convergence)"
+                )
+                net_kwargs["use_scalar"] = "False"
+
+            conv_dim = net_kwargs.get("conv_dim", None)
+            conv_alpha = net_kwargs.get("conv_alpha", None)
+            if conv_dim is not None and conv_alpha is not None and int(conv_dim) > 0 and str(conv_alpha) != str(conv_dim):
+                accelerator.print(
+                    f"GoRA: overriding conv_alpha ({conv_alpha}) to conv_dim ({conv_dim}) "
+                    f"(GoRA requires alpha = dim)"
+                )
+                net_kwargs["conv_alpha"] = str(conv_dim)
+
         network_has_multiplier = hasattr(network, "set_multiplier")
 
         # TODO remove `hasattr` by setting up methods if not defined in the network like below  (hacky but will work):
@@ -1260,6 +1322,9 @@ class NetworkTrainer:
         # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
 
+        train_dataloader_generator = torch.Generator(device="cpu")
+        train_dataloader_generator_init_seed = train_dataloader_generator.initial_seed()
+
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,
@@ -1268,6 +1333,7 @@ class NetworkTrainer:
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
             pin_memory=args.pin_data_loader_memory or args.pin_memory,
+            generator=train_dataloader_generator,
         )
 
         if val_dataset_group is not None:
@@ -1351,6 +1417,185 @@ class NetworkTrainer:
                 # nn.Embedding not support FP8
                 if te_weight_dtype != weight_dtype:
                     self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
+
+        network_needs_init = ((hasattr(network, "prepare_gora") and hasattr(network, "_gora_needs_init") and network._gora_needs_init) or
+            (hasattr(network, "_ralora_needs_init") and network._ralora_needs_init))
+
+        if network_needs_init:
+            # Detect pre-cached latents — if first batch has latents, VAE isn't needed
+            has_latents = False
+            for batch in train_dataloader:
+                if isinstance(batch, dict) and "latents" in batch and batch["latents"] is not None:
+                    has_latents = True
+                break
+
+            # Save original devices for restoration after gora or ralora
+            vae_orig_device = next(vae.parameters()).device
+            unet_orig_device = next(unet.parameters()).device
+            te_orig_devices = [
+                next(t_enc.parameters()).device for t_enc in text_encoders
+            ]
+
+            # Move base models to accelerator device for GoRA forward pass
+            # (accelerator.prepare hasn't run yet; models must be on same device as batch data)
+            if not has_latents:
+                vae.requires_grad_(False)
+                vae.eval()
+                vae.to(accelerator.device, dtype=vae_dtype)
+            unet.to(accelerator.device, dtype=unet_weight_dtype if self.cast_unet(args) else None)
+
+            temp_text_encoders = [
+                (t_enc.to(accelerator.device) if flag else t_enc)
+                for t_enc, flag in zip(text_encoders, self.get_text_encoders_train_flags(args, text_encoders))
+            ]
+            if len(text_encoders) > 1:
+                temp_text_encoder = temp_text_encoders
+            else:
+                temp_text_encoder = temp_text_encoders[0]
+
+            if args.gradient_checkpointing:
+                # according to TI example in Diffusers, train is required
+                unet.train()
+                for i, (t_enc, frag) in enumerate(zip(text_encoders, self.get_text_encoders_train_flags(args, text_encoders))):
+                    t_enc.train()
+
+                    # set top parameter requires_grad = True for gradient checkpointing works
+                    if frag:
+                        self.prepare_text_encoder_grad_ckpt_workaround(i, t_enc)
+            else:
+                unet.eval()
+                for t_enc in temp_text_encoders:
+                    t_enc.eval()
+
+            del t_enc
+
+            network.prepare_grad_etc(temp_text_encoder, unet)
+
+            # Create noise_scheduler early for GoRA forward pass
+            # (normally created later; stateless — safe to create here)
+            network_init_noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
+
+        # GoRA: precompute gradients for new GoRA networks (no-op for others and resumption)
+        if hasattr(network, "prepare_gora") and hasattr(network, "_gora_needs_init") and network._gora_needs_init:
+            accelerator.print("GoRA: Pre-computing gradients for rank allocation and initialization...")
+
+            # Extract GoRA parameters from network_args
+            gora_kwargs = {}
+            for key, value in net_kwargs.items():
+                if key.startswith("gora_"):
+                    gora_kwargs[key] = value
+
+            max_steps = int(gora_kwargs.get("gora_steps", gora_kwargs.get("gora_max_steps", 64)))
+            adaptive_n = gora_kwargs.get("gora_adaptive_n", "True").lower() in ("true", "1", "yes")
+            adaptive_gamma = gora_kwargs.get("gora_adaptive_gamma", "False").lower() in ("true", "1", "yes")
+
+            # Build forward function using the trainer's process_batch
+            def gora_forward_fn(batch):
+                return self.process_batch(
+                    batch=batch,
+                    text_encoders=text_encoders,
+                    unet=unet,
+                    network=network,
+                    vae=vae,
+                    noise_scheduler=network_init_noise_scheduler,
+                    vae_dtype=vae_dtype,
+                    weight_dtype=weight_dtype,
+                    accelerator=accelerator,
+                    args=args,
+                    text_encoding_strategy=text_encoding_strategy,
+                    tokenize_strategy=tokenize_strategy,
+                    is_train=True,
+                    train_text_encoder=train_text_encoder,
+                    train_unet=train_unet,
+                    edm2_model=None,
+                )
+
+            network.prepare_gora(
+                dataloader=train_dataloader,
+                forward_fn=gora_forward_fn,
+                max_steps=max_steps,
+                adaptive_n=adaptive_n,
+                adaptive_gamma=adaptive_gamma,
+            )
+            accelerator.print("GoRA: Pre-computation complete.")
+
+        # RaLoRA: precompute gradients for new RaLoRA networks (no-op for others and resumption)
+        if hasattr(network, "_ralora_needs_init") and network._ralora_needs_init:
+            accelerator.print("RaLoRA: Pre-computing gradients for rank and GID initialization...")
+
+            # Import RaLoRAModule
+            from lycoris.modules.locon import RaLoRAModule
+            
+            # Extract RaLoRA parameters from network_args
+            ralora_kwargs = {}
+            for key, value in net_kwargs.items():
+                if key.startswith("ralora_"):
+                    ralora_kwargs[key] = value
+
+            max_steps = int(ralora_kwargs.get("ralora_max_steps", 64))
+            n_max = int(ralora_kwargs.get("ralora_n_max", 32))
+            pro_mode = ralora_kwargs.get("ralora_pro", "False").lower() in ("true", "1", "yes")
+            erank_method = ralora_kwargs.get("ralora_erank_method", "entropy")
+            svd_threshold = float(ralora_kwargs.get("ralora_svd_threshold", 0.0))
+            cumulative_variance = float(ralora_kwargs.get("ralora_cumulative_variance", 0.0))
+
+            # Build forward function using the trainer's process_batch
+            def ralora_forward_fn(batch):
+                return self.process_batch(
+                    batch=batch,
+                    text_encoders=text_encoders,
+                    unet=unet,
+                    network=network,
+                    vae=vae,
+                    noise_scheduler=network_init_noise_scheduler,
+                    vae_dtype=vae_dtype,
+                    weight_dtype=weight_dtype,
+                    accelerator=accelerator,
+                    args=args,
+                    text_encoding_strategy=text_encoding_strategy,
+                    tokenize_strategy=tokenize_strategy,
+                    is_train=True,
+                    train_text_encoder=train_text_encoder,
+                    train_unet=train_unet,
+                    edm2_model=None,
+                )
+
+            # Compute world_size and global_rank for distributed
+            world_size = accelerator.num_processes if hasattr(accelerator, 'num_processes') else 1
+            global_rank = accelerator.process_index if hasattr(accelerator, 'process_index') else 0
+
+            RaLoRAModule.precompute_and_init(
+                model=network,
+                dataloader=train_dataloader,
+                forward_fn=ralora_forward_fn,
+                max_steps=max_steps,
+                n_max=n_max,
+                pro_mode=pro_mode,
+                erank_method=erank_method,
+                svd_threshold=svd_threshold,
+                cumulative_variance=cumulative_variance,
+                world_size=world_size,
+                global_rank=global_rank,
+                device=accelerator.device,
+                save_dir=args.output_dir if hasattr(args, 'output_dir') else None,
+            )
+            accelerator.print("RaLoRA: Pre-computation complete.")
+
+        if network_needs_init:
+            # Restore initial dataloader seed
+            train_dataloader_generator.manual_seed(train_dataloader_generator_init_seed)
+
+            # Restore models to their original devices
+            vae.to(vae_orig_device)
+            unet.to(unet_orig_device)
+            for t_enc, orig_dev in zip(text_encoders, te_orig_devices):
+                t_enc.to(orig_dev)
+
+            # Free GPU memory fragmentation from gora or RaLoRA precompute
+            gc.collect()
+            if accelerator.device.type == "cuda":
+                torch.cuda.empty_cache()
+                accelerator.print("GPU cache cleared.")
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
@@ -1800,6 +2045,7 @@ class NetworkTrainer:
 
         loss_recorder = train_util.EMARecorder()
         val_loss_recorder = train_util.EMARecorder()
+        rate_tracker = train_util.RateTracker()
 
         if args.edm2_loss_weighting:
             loss_scaled_recorder = train_util.EMARecorder()
@@ -1910,11 +2156,14 @@ class NetworkTrainer:
                 average_loss_scaled,
                 current_global_step_loss_edm2,
                 average_loss_edm2,
-                current_val_loss=current_val_loss, 
-                average_val_loss=average_val_loss
+                current_val_loss=current_val_loss,
+                average_val_loss=average_val_loss,
+                it_s=rate_tracker.it_per_sec,
             )
+            if val_logs:
+                logs.update(val_logs)
             # log empty object to commit the sample images to wandb
-            accelerator.log(logs, step=0) 
+            accelerator.log(logs, step=0)
 
         # training loop
         if initial_step > 0:  # only if skip_until_initial_step is specified
@@ -1932,7 +2181,8 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - global_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            range(args.max_train_steps - global_step), smoothing=0.1, disable=not accelerator.is_local_main_process, desc="steps",
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]",
         )
 
         for epoch in range(epoch_to_start, num_train_epochs):
@@ -2059,6 +2309,7 @@ class NetworkTrainer:
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
+                    rate_tracker.tick()
                     progress_bar.update(1)
                     global_step += 1
 
@@ -2152,8 +2403,8 @@ class NetworkTrainer:
                         loss_edm2_recorder.add(current_global_step_loss_edm2 / accumulation_counter)
                         
                     avr_loss: float = loss_recorder.average
-                    logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                    progress_bar.set_postfix(**{**max_mean_logs, **logs})
+                    combined = {**max_mean_logs, "avr_loss": f"{avr_loss:.4f}"}
+                    progress_bar.set_postfix_str(f"{rate_tracker.display_rate}, " + ", ".join(f"{k}={v}" for k, v in combined.items()))
 
                     if is_tracking:
                         current_global_step_loss = (current_global_step_loss / accumulation_counter)
@@ -2185,9 +2436,12 @@ class NetworkTrainer:
                             average_loss_scaled,
                             current_global_step_loss_edm2,
                             average_loss_edm2,
-                            current_val_loss=current_val_loss, 
-                            average_val_loss=average_val_loss
+                            current_val_loss=current_val_loss,
+                            average_val_loss=average_val_loss,
+                            it_s=rate_tracker.it_per_sec,
                         )
+                        if val_logs:
+                            logs.update(val_logs)
                         accelerator.log(logs, step=global_step)
                     current_global_step_loss = 0.0
                     if args.edm2_loss_weighting:

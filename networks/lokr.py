@@ -449,7 +449,10 @@ def create_network(
     conv_alpha = kwargs.get("conv_alpha", None)
     if conv_lora_dim is not None:
         conv_lora_dim = int(conv_lora_dim)
-        if conv_alpha is None:
+        if conv_lora_dim == 0:
+            conv_lora_dim = None
+            conv_alpha = None
+        elif conv_alpha is None:
             conv_alpha = 1.0
         else:
             conv_alpha = float(conv_alpha)

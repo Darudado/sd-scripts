@@ -436,7 +436,7 @@ def train(args):
     if getattr(args, "contrastive_flow_matching", False):
         accelerator.print(f"  Contrastive Flow Matching (\u0394FM) enabled (lambda: {args.cfm_lambda})")
 
-    progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+    progress_bar = tqdm(range(args.max_train_steps), smoothing=0.1, disable=not accelerator.is_local_main_process, desc="steps", bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]")
     global_step = 0
 
     noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
@@ -491,7 +491,8 @@ def train(args):
     if vae is not None:
         logger.info(f"vae device: {vae.device}")
 
-    loss_recorder = train_util.LossRecorder()
+    loss_recorder = train_util.EMARecorder()
+    rate_tracker = train_util.RateTracker()
     epoch = 0
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -648,6 +649,7 @@ def train(args):
 
             # Checks if the accelerator has performed an optimization step
             if accelerator.sync_gradients:
+                rate_tracker.tick()
                 progress_bar.update(1)
                 global_step += 1
 
@@ -694,8 +696,7 @@ def train(args):
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
-            logs = {"avr_loss": avr_loss}
-            progress_bar.set_postfix(**logs)
+            progress_bar.set_postfix_str(f"{rate_tracker.display_rate}, avr_loss={avr_loss:.4f}")
 
             if global_step >= args.max_train_steps:
                 break
