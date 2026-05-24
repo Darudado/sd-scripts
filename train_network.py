@@ -2108,6 +2108,11 @@ class NetworkTrainer:
         avr_loss = 0.0
         accumulation_counter = 0
 
+        # Detect step_func optimizer (e.g. AdamWScheduleFreePlus with Polyak step size).
+        # step_func(function_value) replaces step() and requires the current loss value.
+        _use_step_func = hasattr(optimizer, 'step_func') and callable(getattr(optimizer, 'step_func'))
+        _step_func_loss_accum = 0.0
+
         # For --sample_at_first
         if train_util.sample_images_check(args, 0, global_step) or train_util.calculate_val_loss_check(args, global_step, 0, val_dataloader, train_dataloader):
             with torch.no_grad():
@@ -2244,6 +2249,10 @@ class NetworkTrainer:
                     edm2_loss = loss
                     loss = pre_scaling_loss
 
+                    # Accumulate loss for step_func optimizer (Polyak step size needs function value)
+                    if _use_step_func:
+                        _step_func_loss_accum += loss.detach().item()
+
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
 
@@ -2272,7 +2281,29 @@ class NetworkTrainer:
                         #if hasattr(network, "update_norms"):
                         #    network.update_norms()
 
-                    optimizer.step()
+                    if _use_step_func:
+                        # Schedulefree-plus optimizers (e.g. AdamWScheduleFreePlus) use
+                        # step_func(function_value) instead of step(). step_func reads p.grad
+                        # directly, so gradients must be unscaled for mixed precision.
+                        # The Polyak step size requires the current loss value.
+                        if accelerator.sync_gradients:
+                            if not (args.max_grad_norm != 0.0 or args.edm2_loss_weighting):
+                                # Gradients weren't unscaled above; do it now so step_func
+                                # sees correctly-scaled gradients.
+                                accelerator.unscale_gradients()
+                            avg_loss = _step_func_loss_accum / accumulation_counter
+                            optimizer.step_func(avg_loss)
+                            _step_func_loss_accum = 0.0
+                            # accelerate's optimizer.step() normally calls GradScaler.step()
+                            # + update(), but step_func bypasses this. Update the scaler to
+                            # reset its per-optimizer "unscaled" state so the next
+                            # unscale_gradients() call doesn't raise RuntimeError, and to
+                            # allow the scale factor to be adjusted.
+                            scaler = getattr(optimizer, 'scaler', None)
+                            if scaler is not None:
+                                scaler.update()
+                    else:
+                        optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
