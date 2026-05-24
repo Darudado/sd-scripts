@@ -152,6 +152,11 @@ class NetworkTrainer:
                     if "effective_lr" in opt.param_groups[i]:
                         logs[f"lr/d*eff_lr/{lr_desc}"] = opt.param_groups[i]["d"] * opt.param_groups[i]["effective_lr"]
 
+            # Log scheduled_lr for Polyak step-size optimizers (e.g. AdamWScheduleFreePlus)
+            opt_for_scheduled = lr_scheduler.optimizers[-1] if hasattr(lr_scheduler, "optimizers") else optimizer
+            if opt_for_scheduled is not None and "scheduled_lr" in opt_for_scheduled.param_groups[i]:
+                logs[f"lr/scheduled/{lr_desc}"] = opt_for_scheduled.param_groups[i]["scheduled_lr"]
+
         if edm2_lr_scheduler is not None:
             logs[f"lr/edm2"] = edm2_lr_scheduler.get_last_lr()[0]
 

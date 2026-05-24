@@ -7128,6 +7128,10 @@ def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
                     lr_scheduler.optimizers[-1].param_groups[lr_index]["d"] * lr_scheduler.optimizers[-1].param_groups[lr_index]["effective_lr"]
                 )
 
+        # Log scheduled_lr for Polyak step-size optimizers (e.g. AdamWScheduleFreePlus)
+        if "scheduled_lr" in lr_scheduler.optimizers[-1].param_groups[lr_index]:
+            logs["lr/scheduled/" + name] = lr_scheduler.optimizers[-1].param_groups[lr_index]["scheduled_lr"]
+
 
 # scheduler:
 SCHEDULER_LINEAR_START = 0.00085
