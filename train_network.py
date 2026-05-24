@@ -59,6 +59,13 @@ try:
 except ImportError:
     TLORA_AVAILABLE = False
 
+# LoRA² adaptive rank regularization support
+try:
+    from lycoris.modules.lora2 import LoRA2Module
+    LORA2_AVAILABLE = True
+except ImportError:
+    LORA2_AVAILABLE = False
+
 setup_logging()
 import logging
 import warnings
@@ -81,6 +88,10 @@ class NetworkTrainer:
         self.tlora_min_rank = 1
         self.tlora_mask_alpha = 1.0
         self.tlora_max_timestep = 1000
+
+        # LoRA² adaptive rank regularization config
+        self.lora2_enabled = False
+        self.lora2_lambda_r = 1e-4
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -510,6 +521,26 @@ class NetworkTrainer:
             return
         clear_timestep_mask()
 
+    def setup_lora2_regularization(self, net_kwargs):
+        """
+        Initialize LoRA² rank regularization if the algo is lora2.
+
+        Reads lora2_lambda_r from network_args.
+        Must be called after the network is created.
+        """
+        algo = (net_kwargs.get("algo", "lora") or "lora").lower()
+        if algo != "lora2":
+            return
+        if not LORA2_AVAILABLE:
+            logger.warning("LoRA² requested but LoRA2Module is not available. Skipping LoRA² setup.")
+            return
+
+        self.lora2_enabled = True
+        self.lora2_lambda_r = float(net_kwargs.get("lora2_lambda_r", 1e-4))
+        logger.info(
+            f"LoRA² rank regularization enabled: lambda_r={self.lora2_lambda_r}"
+        )
+
     # endregion
 
     def process_batch(
@@ -678,7 +709,15 @@ class NetworkTrainer:
         else:
             loss_scaled = None
 
-        return loss.mean(), pre_scaling_loss, loss_scaled
+        final_loss = loss.mean()
+
+        # LoRA²: add rank regularization loss
+        if is_train and self.lora2_enabled and LORA2_AVAILABLE:
+            rank_reg_loss = LoRA2Module.get_total_rank_reg_loss()
+            if rank_reg_loss.item() > 0:
+                final_loss = final_loss + self.lora2_lambda_r * rank_reg_loss
+
+        return final_loss, pre_scaling_loss, loss_scaled
     
     def process_val_batch(
         self,
@@ -2043,6 +2082,9 @@ class NetworkTrainer:
 
         # Initialize T-LoRA timestep masking if applicable
         self.setup_tlora_masking(net_kwargs, args.network_dim, noise_scheduler)
+
+        # Initialize LoRA² rank regularization if applicable
+        self.setup_lora2_regularization(net_kwargs)
 
         edm2_model, edm2_optimizer, edm2_lr_scheduler = prepare_edm2_loss_weighting(args, noise_scheduler, accelerator)
 
