@@ -2110,7 +2110,10 @@ class NetworkTrainer:
 
         # Detect step_func optimizer (e.g. AdamWScheduleFreePlus with Polyak step size).
         # step_func(function_value) replaces step() and requires the current loss value.
-        _use_step_func = hasattr(optimizer, 'step_func') and callable(getattr(optimizer, 'step_func'))
+        # After accelerator.prepare(), the optimizer is wrapped in AcceleratedOptimizer
+        # which doesn't expose step_func. The raw optimizer lives at optimizer.optimizer.
+        _raw_optimizer = getattr(optimizer, 'optimizer', optimizer)
+        _use_step_func = hasattr(_raw_optimizer, 'step_func') and callable(getattr(_raw_optimizer, 'step_func'))
         _step_func_loss_accum = 0.0
 
         # For --sample_at_first
@@ -2292,7 +2295,7 @@ class NetworkTrainer:
                                 # sees correctly-scaled gradients.
                                 accelerator.unscale_gradients()
                             avg_loss = _step_func_loss_accum / accumulation_counter
-                            optimizer.step_func(avg_loss)
+                            _raw_optimizer.step_func(avg_loss)
                             _step_func_loss_accum = 0.0
                             # accelerate's optimizer.step() normally calls GradScaler.step()
                             # + update(), but step_func bypasses this. Update the scaler to

@@ -92,6 +92,61 @@ class TestStepFuncDetection:
         assert _use_step_func_sf is True
         assert _use_step_func_adam is False
 
+    def test_detection_through_accelerate_wrapper(self):
+        """
+        After accelerator.prepare(), the optimizer is wrapped in an
+        AcceleratedOptimizer that doesn't expose step_func directly.
+        The raw optimizer lives at optimizer.optimizer.
+        Regression test: detection must unwrap to find step_func.
+        """
+        model = _SimpleModel()
+        raw_opt = _make_step_func_optimizer(model)
+
+        # Simulate AcceleratedOptimizer wrapper (has .optimizer pointing to raw)
+        wrapper = MagicMock()
+        wrapper.optimizer = raw_opt
+        wrapper.scaler = None
+        # The wrapper itself does NOT have step_func
+        del wrapper.step_func
+
+        # Detection logic from train_network.py:
+        _raw_optimizer = getattr(wrapper, "optimizer", wrapper)
+        _use_step_func = hasattr(_raw_optimizer, "step_func") and callable(getattr(_raw_optimizer, "step_func"))
+
+        assert _use_step_func is True, "Must detect step_func through accelerator wrapper"
+
+        # Verify the raw optimizer's step_func can be called via _raw_optimizer
+        _raw_optimizer.step_func(1.0)
+        assert raw_opt.param_groups[0]["k"] == 1
+
+    def test_detection_no_wrapper(self):
+        """
+        When optimizer is not wrapped (no .optimizer attr), detection
+        must still work by falling back to the optimizer itself.
+        """
+        model = _SimpleModel()
+        raw_opt = _make_step_func_optimizer(model)
+
+        # No wrapper — getattr falls back to raw_opt itself
+        _raw_optimizer = getattr(raw_opt, "optimizer", raw_opt)
+        _use_step_func = hasattr(_raw_optimizer, "step_func") and callable(getattr(_raw_optimizer, "step_func"))
+
+        assert _use_step_func is True
+        assert _raw_optimizer is raw_opt  # should be the same object
+
+    def test_detection_non_step_func_through_wrapper(self):
+        """Non-step_func optimizer inside a wrapper should NOT be detected."""
+        model = _SimpleModel()
+        raw_adam = _make_adam_optimizer(model)
+
+        wrapper = MagicMock()
+        wrapper.optimizer = raw_adam
+
+        _raw_optimizer = getattr(wrapper, "optimizer", wrapper)
+        _use_step_func = hasattr(_raw_optimizer, "step_func") and callable(getattr(_raw_optimizer, "step_func"))
+
+        assert _use_step_func is False
+
 
 # ---------------------------------------------------------------------------
 # 2. step_func basic operation
