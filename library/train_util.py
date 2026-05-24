@@ -5504,87 +5504,6 @@ def get_optimizer(args, trainable_params, optimizer_kwargs: Dict = {}) -> tuple[
             optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
-    """
-    # wrap any of above optimizer with schedulefree, if optimizer is not schedulefree
-    if args.optimizer_schedulefree_wrapper and not optimizer_type.endswith("schedulefree".lower()):
-        try:
-            import schedulefree as sf
-        except ImportError:
-            raise ImportError("No schedulefree / schedulefreeがインストールされていないようです")
-
-        schedulefree_wrapper_kwargs = {}
-        if args.schedulefree_wrapper_args is not None and len(args.schedulefree_wrapper_args) > 0:
-            for arg in args.schedulefree_wrapper_args:
-                key, value = arg.split("=")
-                value = ast.literal_eval(value)
-                schedulefree_wrapper_kwargs[key] = value
-
-        sf_wrapper = sf.ScheduleFreeWrapper(optimizer, **schedulefree_wrapper_kwargs)
-        sf_wrapper.train()  # make optimizer as train mode
-
-        # we need to make optimizer as a subclass of torch.optim.Optimizer, we make another Proxy class over SFWrapper
-        class OptimizerProxy(torch.optim.Optimizer):
-            def __init__(self, sf_wrapper):
-                self._sf_wrapper = sf_wrapper
-
-            def __getattr__(self, name):
-                return getattr(self._sf_wrapper, name)
-
-            # override properties
-            @property
-            def state(self):
-                return self._sf_wrapper.state
-
-            @state.setter
-            def state(self, state):
-                self._sf_wrapper.state = state
-
-            @property
-            def param_groups(self):
-                return self._sf_wrapper.param_groups
-
-            @param_groups.setter
-            def param_groups(self, param_groups):
-                self._sf_wrapper.param_groups = param_groups
-
-            @property
-            def defaults(self):
-                return self._sf_wrapper.defaults
-
-            @defaults.setter
-            def defaults(self, defaults):
-                self._sf_wrapper.defaults = defaults
-
-            def add_param_group(self, param_group):
-                self._sf_wrapper.add_param_group(param_group)
-
-            def load_state_dict(self, state_dict):
-                self._sf_wrapper.load_state_dict(state_dict)
-
-            def state_dict(self):
-                return self._sf_wrapper.state_dict()
-
-            def zero_grad(self):
-                self._sf_wrapper.zero_grad()
-
-            def step(self, closure=None):
-                self._sf_wrapper.step(closure)
-
-            def train(self):
-                self._sf_wrapper.train()
-
-            def eval(self):
-                self._sf_wrapper.eval()
-
-            # isinstance チェックをパスするためのメソッド
-            def __instancecheck__(self, instance):
-                return isinstance(instance, (type(self), Optimizer))
-
-        optimizer = OptimizerProxy(sf_wrapper)
-
-        logger.info(f"wrap optimizer with ScheduleFreeWrapper | {schedulefree_wrapper_kwargs}")
-    """
-
     # for logging
     optimizer_name = optimizer_class.__module__ + "." + optimizer_class.__name__
     optimizer_args = ",".join([f"{k}={v}" for k, v in optimizer_kwargs.items()])
@@ -5597,7 +5516,7 @@ def get_optimizer(args, trainable_params, optimizer_kwargs: Dict = {}) -> tuple[
 
 
 def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) -> Tuple[Callable, Callable]:
-    if not is_schedulefree_optimizer(optimizer, args) or getattr(args, "fused_optimizer_groups", False):
+    if not is_schedulefree_optimizer(args) or getattr(args, "fused_optimizer_groups", False):
         # return dummy func
         return lambda: None, lambda: None
 
@@ -5608,11 +5527,35 @@ def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) 
     return train_fn, eval_fn
 
 
-def is_schedulefree_optimizer(optimizer: Optimizer, args: argparse.Namespace) -> bool:
-    return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower().endswith("schedulefreewrapper".lower())
+def is_schedulefree_plus_optimizer(args: argparse.Namespace) -> bool:
+    sfp_suffixes = ["schedulefreeplus"]
+    lower_case_optimizer_type = args.optimizer_type.lower()
+
+    for sfp_suffix in sfp_suffixes:
+        if lower_case_optimizer_type.endswith(sfp_suffix):
+            return True
+        
+    return False
+
+def is_schedulefree_optimizer(args: argparse.Namespace) -> bool:
+    schedulefree_suffixes = ["schedulefree", "schedulefreewrapper", "schedulefreeplus"]
+    lower_case_optimizer_type = args.optimizer_type.lower()
+
+    for schedulefree_suffix in schedulefree_suffixes:
+        if lower_case_optimizer_type.endswith(schedulefree_suffix):
+            return True
+        
+    return False
 
 def is_wrapper_optimizer(args: argparse.Namespace) -> bool:
-    return args.optimizer_type.lower().endswith("schedulefreewrapper".lower()) or args.optimizer_type.lower().endswith("snoo_asgd".lower())
+    wrapper_suffixes = ["schedulefreewrapper", "snoo_asgd"]
+    lower_case_optimizer_type = args.optimizer_type.lower()
+
+    for wrapper_suffix in wrapper_suffixes:
+        if lower_case_optimizer_type.endswith(wrapper_suffix):
+            return True
+        
+    return False
 
 def get_dummy_scheduler(optimizer: Optimizer) -> Any:
     # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
@@ -5699,7 +5642,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     Unified API to get any scheduler from its name.
     """
     # if schedulefree optimizer, return dummy scheduler
-    if args.optimizer_type.lower().split(".")[0] not in {"LoraEasyCustomOptimizer".lower(), "prodigyplus".lower()} and is_schedulefree_optimizer(optimizer, args):
+    if args.optimizer_type.lower().split(".")[0] not in {"LoraEasyCustomOptimizer".lower(), "prodigyplus".lower()} and is_schedulefree_optimizer(args):
         return get_dummy_scheduler(optimizer)
     
     # Need to apply scheduler to base_optimizer

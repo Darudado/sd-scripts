@@ -387,7 +387,7 @@ def train(args):
 
         logger.info(f"using {len(optimizers)} optimizers for blockwise fused optimizers")
 
-        if train_util.is_schedulefree_optimizer(optimizers[0], args):
+        if train_util.is_schedulefree_optimizer(args):
             raise ValueError("Schedule-free optimizer is not supported with blockwise fused optimizers")
         optimizer_train_fn = lambda: None  # dummy function
         optimizer_eval_fn = lambda: None  # dummy function
