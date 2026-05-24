@@ -16,6 +16,7 @@ from accelerate import init_empty_weights
 
 from library.safetensors_utils import load_safetensors
 from library.utils import setup_logging
+from library.offline_utils import safe_from_pretrained
 
 setup_logging()
 import logging
@@ -206,7 +207,7 @@ def load_byt5(
 """
 
     logger.info(f"Loading BYT5 tokenizer from {BYT5_TOKENIZER_PATH}")
-    byt5_tokenizer = AutoTokenizer.from_pretrained(BYT5_TOKENIZER_PATH)
+    byt5_tokenizer = safe_from_pretrained(AutoTokenizer, BYT5_TOKENIZER_PATH)
 
     logger.info("Initializing BYT5 text encoder")
     config = json.loads(BYT5_CONFIG_JSON)
@@ -496,7 +497,7 @@ def load_qwen2_5_vl(
 
     # Load tokenizer
     logger.info(f"Loading tokenizer from {QWEN_2_5_VL_IMAGE_ID}")
-    tokenizer = Qwen2Tokenizer.from_pretrained(QWEN_2_5_VL_IMAGE_ID)
+    tokenizer = safe_from_pretrained(Qwen2Tokenizer, QWEN_2_5_VL_IMAGE_ID)
     return tokenizer, qwen2_5_vl
 
 

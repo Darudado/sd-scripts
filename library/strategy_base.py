@@ -7,6 +7,7 @@ from typing import Any, List, Optional, Tuple, Union, Callable
 import numpy as np
 import torch
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
+from library.offline_utils import safe_from_pretrained
 
 
 # TODO remove circular import by moving ImageInfo to a separate file
@@ -62,7 +63,7 @@ class TokenizeStrategy:
                 tokenizer = model_class.from_pretrained(local_tokenizer_path)  # same for v1 and v2
 
         if tokenizer is None:
-            tokenizer = model_class.from_pretrained(model_id, subfolder=subfolder)
+            tokenizer = safe_from_pretrained(model_class, model_id, subfolder=subfolder)
 
         if tokenizer_cache_dir and not os.path.exists(local_tokenizer_path):
             logger.info(f"save Tokenizer to cache: {local_tokenizer_path}")

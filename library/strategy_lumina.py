@@ -5,6 +5,7 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from transformers import AutoTokenizer, AutoModel, Gemma2Model, GemmaTokenizerFast
 from library import train_util
+from library.offline_utils import safe_from_pretrained
 from library.strategy_base import (
     LatentsCachingStrategy,
     TokenizeStrategy,
@@ -27,8 +28,8 @@ class LuminaTokenizeStrategy(TokenizeStrategy):
     def __init__(
         self, system_prompt:str, max_length: Optional[int], tokenizer_cache_dir: Optional[str] = None
     ) -> None:
-        self.tokenizer: GemmaTokenizerFast = AutoTokenizer.from_pretrained(
-            GEMMA_ID, cache_dir=tokenizer_cache_dir
+        self.tokenizer: GemmaTokenizerFast = safe_from_pretrained(
+            AutoTokenizer, GEMMA_ID, cache_dir=tokenizer_cache_dir
         )
         self.tokenizer.padding_side = "right"
 
