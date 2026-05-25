@@ -320,6 +320,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             fixed_timesteps=fixed_timesteps, 
             is_train=is_train,
         )
+        # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
+        # Must be stored BEFORE unsqueeze to 5D (wavelet DWT expects 4D)
+        if is_train and getattr(self, "wavelet_masking_enabled", False):
+            self._noisy_latents = noisy_model_input.detach()
+
         # Set T-LoRA timestep mask before timestep scaling (mask expects [0, max_timestep] range)
         self.apply_tlora_mask(timesteps)
 

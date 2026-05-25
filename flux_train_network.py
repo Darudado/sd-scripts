@@ -346,6 +346,10 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, fixed_timesteps=fixed_timesteps, is_train=is_train
         )
 
+        # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
+        if is_train and getattr(self, "wavelet_masking_enabled", False):
+            self._noisy_latents = noisy_model_input.detach()
+
         # pack latents and get img_ids
         packed_noisy_model_input = flux_utils.pack_latents(noisy_model_input)  # b, c, h*2, w*2 -> b, h*w, c*4
         packed_latent_height, packed_latent_width = noisy_model_input.shape[2] // 2, noisy_model_input.shape[3] // 2

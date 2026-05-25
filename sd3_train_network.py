@@ -349,6 +349,10 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
             args, latents, noise, accelerator.device, weight_dtype, fixed_timesteps=fixed_timesteps, is_train=is_train
         )
 
+        # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
+        if is_train and getattr(self, "wavelet_masking_enabled", False):
+            self._noisy_latents = noisy_model_input.detach()
+
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
             noisy_model_input.requires_grad_(True)

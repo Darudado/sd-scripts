@@ -552,6 +552,11 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         noisy_model_input, _, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, fixed_timesteps=fixed_timesteps, is_train=is_train
         )
+
+        # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
+        if is_train and getattr(self, "wavelet_masking_enabled", False):
+            self._noisy_latents = noisy_model_input.detach()
+
         # bfloat16 is too low precision for 0-1000 TODO fix get_noisy_model_input_and_timesteps
         timesteps = (sigmas[:, 0, 0, 0] * 1000).to(torch.int64)
         # print(

@@ -8025,3 +8025,144 @@ class RateTracker:
     def step_count(self) -> int:
         """Number of timed steps recorded."""
         return self._count
+
+
+# region Latent Wavelet Diffusion (LWD) utilities
+# Based on: "Latent Wavelet Diffusion for Ultra-High-Resolution Image Synthesis" (Sigillo et al., ICLR 2026)
+# Reference implementation: https://github.com/LuigiSigillo/LatentWaveletDiffusion
+
+
+def setup_wavelet_dwt(device: torch.device):
+    """
+    Initialize a Haar-based Discrete Wavelet Transform module for LWD.
+
+    Uses DWTForward(J=1, wave='haar') from pytorch_wavelets. The Haar wavelet
+    is chosen for its computational efficiency, compact support, and superior
+    spatial localization which produces sharp binary training masks.
+
+    Args:
+        device: torch device to place the DWT module on
+
+    Returns:
+        DWTForward module on the specified device
+    """
+    try:
+        from pytorch_wavelets import DWTForward
+    except ImportError:
+        raise ImportError(
+            "pytorch-wavelets is required for LWD wavelet masking. "
+            "Install it with: pip install pytorch-wavelets"
+        )
+    dwt = DWTForward(J=1, wave="haar").to(device)
+    dwt.eval()
+    for param in dwt.parameters():
+        param.requires_grad_(False)
+    return dwt
+
+
+def compute_wavelet_attention_map(
+    latent: torch.Tensor,
+    dwt,
+) -> torch.Tensor:
+    """
+    Compute a wavelet-based spatial saliency map from a noisy latent tensor.
+
+    This implements Section 3.2 of the LWD paper: applies a single-level Haar DWT
+    to the latent, aggregates high-frequency subband energy (LH, HL, HH),
+    upsamples, and normalizes to [0, 1].
+
+    The map highlights regions with strong structural detail (textures, edges,
+    transitions) and is used to create a time-dependent binary mask that focuses
+    the denoising loss on detail-rich spatial regions.
+
+    Args:
+        latent: Noisy latent tensor of shape (B, C, H, W)
+        dwt: DWTForward module (from setup_wavelet_dwt)
+
+    Returns:
+        attn_map: Normalized attention map of shape (B, H, W), values in [0, 1]
+    """
+    B, C, H, W = latent.shape
+
+    # Cast to float32 for wavelet processing (wavelets may not support fp16/bf16)
+    original_dtype = latent.dtype
+    latent_f32 = latent.to(dtype=torch.float32)
+
+    # Apply 2D Haar DWT: LL low-frequency, high[0] contains (LH, HL, HH)
+    # Each subband has shape (B, num_directions, C, H//2, W//2)
+    _LL, high = dwt(latent_f32)
+    LH = high[0][:, 0]  # (B, C, H//2, W//2)
+    HL = high[0][:, 1]  # (B, C, H//2, W//2)
+    HH = high[0][:, 2]  # (B, C, H//2, W//2)
+
+    # Compute per-location high-frequency energy, averaged across channels
+    # E(i,j) = (1/C) * sum_c [LH^2 + HL^2 + HH^2]  (Eq. 3 in paper)
+    LH_energy = LH.pow(2).mean(dim=1)  # (B, H//2, W//2)
+    HL_energy = HL.pow(2).mean(dim=1)  # (B, H//2, W//2)
+    HH_energy = HH.pow(2).mean(dim=1)  # (B, H//2, W//2)
+    HF_energy = LH_energy + HL_energy + HH_energy  # (B, H//2, W//2)
+
+    # Upsample to original spatial resolution via bilinear interpolation
+    attn_map_raw = torch.nn.functional.interpolate(
+        HF_energy.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False
+    ).squeeze(1)  # (B, H, W)
+
+    # Min-max normalize per sample to [0, 1]
+    attn_min = attn_map_raw.amin(dim=(1, 2), keepdim=True)
+    attn_max = attn_map_raw.amax(dim=(1, 2), keepdim=True)
+    attn_map = (attn_map_raw - attn_min) / (attn_max - attn_min + 1e-8)  # (B, H, W)
+
+    # Restore original dtype
+    attn_map = attn_map.to(dtype=original_dtype)
+
+    return attn_map
+
+
+def get_wavelet_mask(
+    A: torch.Tensor,
+    l: float,
+    T: int,
+    timesteps: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute the time-dependent binary mask for LWD wavelet masking.
+
+    Implements Eq. 6 from the paper:
+        M_t(i, j) = 1  if  T * (A_wavelet(i,j) + l) >= t
+                   = 0  otherwise
+
+    This ensures that:
+    - All spatial regions receive at least l*T steps of supervision
+    - High-frequency regions (A close to 1) receive up to (1+l)*T steps
+    - Smooth regions (A close to 0) receive l*T steps (the minimum)
+
+    Args:
+        A: Wavelet attention map of shape (B, H, W), values in [0, 1]
+        l: Lower bound on supervision fraction (paper optimal: 0.3)
+        T: Total number of diffusion timesteps (e.g., 1000)
+        timesteps: Current timestep per sample, shape (B,)
+
+    Returns:
+        mask: Binary mask of shape (B, 1, H, W), values {0.0, 1.0}
+    """
+    B, H, W = A.shape
+    device = A.device
+
+    # Ensure consistent dtype for computation
+    original_dtype = A.dtype
+    A_f32 = A.to(dtype=torch.float32, device=device)
+
+    # Broadcast timesteps to spatial dims: (B, 1, 1) -> (B, H, W)
+    t_matrix = timesteps.to(dtype=torch.float32, device=device).view(B, 1, 1).expand(B, H, W)
+
+    # Compute threshold: T * (A + l)  (Eq. 6)
+    thresholds = T * (A_f32 + l)  # (B, H, W)
+
+    # Generate binary mask
+    mask = (thresholds >= t_matrix).to(dtype=original_dtype)  # (B, H, W)
+
+    # Add channel dimension for broadcasting with loss tensor (B, C, H, W)
+    return mask.unsqueeze(1)  # (B, 1, H, W)
+
+
+# endregion

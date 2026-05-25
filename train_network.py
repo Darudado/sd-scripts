@@ -99,6 +99,12 @@ class NetworkTrainer:
         self.ffl_module = None
         self.ffl_loss_value = None
 
+        # Latent Wavelet Diffusion (LWD) masking config
+        self.wavelet_masking_enabled = False
+        self.wavelet_dwt = None
+        self._noisy_latents = None  # stored by get_noise_pred_and_target for wavelet map computation
+        self._wavelet_mask_ratio = 0.0  # fraction of loss elements masked (for logging)
+
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
         self,
@@ -121,6 +127,7 @@ class NetworkTrainer:
         current_val_loss=None,
         average_val_loss=None,
         current_ffl_loss=None,
+        current_wav_mask_ratio=None,
         it_s: float = 0.0,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
@@ -135,6 +142,9 @@ class NetworkTrainer:
 
         if current_ffl_loss is not None:
             logs["loss/current_ffl"] = current_ffl_loss
+
+        if current_wav_mask_ratio is not None:
+            logs["loss/wavelet_mask_ratio"] = current_wav_mask_ratio
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -356,6 +366,10 @@ class NetworkTrainer:
         noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
             args, noise_scheduler, latents, fixed_timesteps=fixed_timesteps, is_train=is_train, pixel_counts=pixel_counts
         )
+
+        # Store noisy latents for LWD wavelet masking (used in process_batch)
+        if is_train and getattr(self, "wavelet_masking_enabled", False):
+            self._noisy_latents = noisy_latents.detach() if isinstance(noisy_latents, torch.Tensor) else None
 
         # ensure the hidden state will require grad
         if is_train and args.gradient_checkpointing:
@@ -698,6 +712,29 @@ class NetworkTrainer:
                 loss = loss - float(args.cfm_lambda) * loss_contrastive
             if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                 loss = apply_masked_loss(loss, batch)
+
+            # --- LWD Wavelet Masking: apply spatial mask to element-wise loss ---
+            if self.wavelet_masking_enabled and self._noisy_latents is not None:
+                with torch.no_grad():
+                    A = train_util.compute_wavelet_attention_map(self._noisy_latents, self.wavelet_dwt)
+                    M = train_util.get_wavelet_mask(
+                        A,
+                        l=float(getattr(args, "wavelet_mask_l_bound", 0.3)),
+                        T=noise_scheduler.config.num_train_timesteps,
+                        timesteps=timesteps,
+                    )
+                # M shape: (B, 1, H, W), loss shape: (B, C, H, W) or (B, seq_len)
+                if loss.ndim == 4 and loss.shape[2:] == M.shape[2:]:
+                    loss = loss * M
+                    self._wavelet_mask_ratio = M.mean().item()
+                elif loss.ndim == 2:
+                    # For packed/sequence models, skip masking (shape mismatch)
+                    self._wavelet_mask_ratio = 0.0
+                else:
+                    logger.warning_once(
+                        f"Wavelet mask shape {M.shape} incompatible with loss shape {loss.shape}, skipping mask"
+                    )
+                    self._wavelet_mask_ratio = 0.0
         else:
                 loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
         loss = loss.mean(dim=list(range(1, loss.ndim)))  # mean over all dims except batch
@@ -2118,6 +2155,16 @@ class NetworkTrainer:
                 f"alpha={args.focal_frequency_loss_alpha}"
             )
 
+        # Initialize Latent Wavelet Diffusion (LWD) masking if enabled
+        if getattr(args, "wavelet_masking", False):
+            self.wavelet_masking_enabled = True
+            self.wavelet_dwt = train_util.setup_wavelet_dwt(accelerator.device)
+            logger.info(
+                f"Latent Wavelet Diffusion (LWD) masking enabled: "
+                f"l_bound={getattr(args, 'wavelet_mask_l_bound', 0.3)}, "
+                f"wavelet=haar, J=1"
+            )
+
         edm2_model, edm2_optimizer, edm2_lr_scheduler = prepare_edm2_loss_weighting(args, noise_scheduler, accelerator)
 
         train_util.init_trackers(accelerator, args, "network_train")
@@ -2185,6 +2232,7 @@ class NetworkTrainer:
         current_global_step_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
         average_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
         current_global_step_ffl = 0.0 if self.ffl_enabled else None
+        current_global_step_wav_mask = 0.0 if self.wavelet_masking_enabled else None
         avr_loss = 0.0
         accumulation_counter = 0
 
@@ -2325,6 +2373,10 @@ class NetworkTrainer:
                     # Track FFL loss for logging
                     if self.ffl_enabled and self.ffl_loss_value is not None:
                         current_global_step_ffl = (current_global_step_ffl or 0.0) + self.ffl_loss_value
+
+                    # Track wavelet mask ratio for logging
+                    if self.wavelet_masking_enabled:
+                        current_global_step_wav_mask = (current_global_step_wav_mask or 0.0) + self._wavelet_mask_ratio
 
                     if loss.ndim != 0:
                         loss = loss.mean()
@@ -2559,6 +2611,7 @@ class NetworkTrainer:
                             current_val_loss=current_val_loss,
                             average_val_loss=average_val_loss,
                             current_ffl_loss=(current_global_step_ffl / accumulation_counter) if self.ffl_enabled and current_global_step_ffl is not None else None,
+                            current_wav_mask_ratio=(current_global_step_wav_mask / accumulation_counter) if self.wavelet_masking_enabled and current_global_step_wav_mask is not None else None,
                             it_s=rate_tracker.it_per_sec,
                         )
                         if val_logs:
@@ -2570,6 +2623,8 @@ class NetworkTrainer:
                         current_global_step_loss_edm2 = 0.0
                     if self.ffl_enabled:
                         current_global_step_ffl = 0.0
+                    if self.wavelet_masking_enabled:
+                        current_global_step_wav_mask = 0.0
                     accumulation_counter = 0
 
                 if global_step >= args.max_train_steps:
@@ -3109,6 +3164,24 @@ def setup_parser() -> argparse.ArgumentParser:
     # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
     # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")
     # parser.add_argument("--loraplus_text_encoder_lr_ratio", default=None, type=float, help="LoRA+ text encoder learning rate ratio")
+
+    # Latent Wavelet Diffusion (LWD) arguments
+    parser.add_argument(
+        "--wavelet_masking",
+        action="store_true",
+        help="Enable LWD wavelet-based spatial masking on the training loss. "
+        "Focuses training on detail-rich regions via frequency-aware masks derived from Haar DWT. "
+        "Based on: 'Latent Wavelet Diffusion for Ultra-High-Resolution Image Synthesis' (ICLR 2026). "
+        "Requires pytorch-wavelets.",
+    )
+    parser.add_argument(
+        "--wavelet_mask_l_bound",
+        type=float,
+        default=0.3,
+        help="Lower bound l for wavelet masking (default: 0.3). All spatial regions receive at least "
+        "l*T supervision steps. Paper ablation shows 0.3 is optimal. Range: [0.0, 1.0].",
+    )
+
     return parser
 
 
