@@ -47,6 +47,17 @@ If you find this project helpful, please consider supporting its development via
 
 ### Change History
 
+- **Version 0.10.5 (2026-05-08):**
+    - Support for transformers version 5 and later has been added. Thanks to marcus165090-spec for [PR #2315](https://github.com/kohya-ss/sd-scripts/pull/2315) (followed by [PR #2316](https://github.com/kohya-ss/sd-scripts/pull/2316)).
+        - The `transformers` version in `requirements.txt` remains 4.x, but it also works with 5.x. If you use 5.x for any reason, please also update `diffusers` to the latest version.
+    - Support for ControlNet-LLLite training for Anima has been added. Thanks to [PR #2317](https://github.com/kohya-ss/sd-scripts/pull/2317).
+        - For details, please refer to the [documentation](./docs/anima_train_control_net_lllite.md).
+
+- **Version 0.10.4 (2026-05-07):**
+    - Improved compatibility with Intel GPUs. Thanks to WhitePr for [PR #2307](https://github.com/kohya-ss/sd-scripts/pull/2307).
+    - Support for training inpainting models for SD 1.5/SDXL has been added. Thanks to allanoepping for [PR #2309](https://github.com/kohya-ss/sd-scripts/pull/2309) (followed by [PR #2318](https://github.com/kohya-ss/sd-scripts/pull/2318)).
+        - For details, please refer to the [documentation](./docs/inpainting_training.md).
+
 - **Version 0.10.3 (2026-04-02):**
     - Stability when training with fp16 on Anima has been further improved. See [PR #2302](https://github.com/kohya-ss/sd-scripts/pull/2302) for details. We deeply appreciate those who reported the issue.
 
@@ -63,16 +74,6 @@ If you find this project helpful, please consider supporting its development via
     - Stability when training with fp16 on Anima has been improved. See [PR #2297](https://github.com/kohya-ss/sd-scripts/pull/2297) for details. However, it still seems to be unstable in some cases. If you encounter any issues, please let us know the details via Issues.
     - Other minor bug fixes and improvements were made.
 
-- **Version 0.10.1 (2026-02-13):**
-    - [Anima Preview](https://huggingface.co/circlestone-labs/Anima) model LoRA training and fine-tuning are now supported. See [PR #2260](https://github.com/kohya-ss/sd-scripts/pull/2260) and [PR #2261](https://github.com/kohya-ss/sd-scripts/pull/2261).
-    - Many thanks to CircleStone Labs for releasing this amazing model, and to duongve13112002 for submitting great PR #2260.
-    - For details, please refer to the [documentation](./docs/anima_train_network.md).
-
-- **Version 0.10.0 (2026-01-19):**
-    - `sd3` branch is merged to `main` branch. From this version, FLUX.1 and SD3/SD3.5 etc. are supported in the `main` branch.
-    - There are still some missing parts in the documentation, so please let us know if you find any issues via Issues etc.
-    - The `sd3` branch will be maintained as a development branch synchronized with `dev` for the time being.
-
 ### Supported Models
 
 * **Stable Diffusion 1.x/2.x**
@@ -81,12 +82,14 @@ If you find this project helpful, please consider supporting its development via
 * **FLUX.1**
 * **LUMINA**
 * **HunyuanImage-2.1**
+* **Anima preview**
 
 ### Features
 
 * LoRA training
 * Fine-tuning (native training, DreamBooth): except for HunyuanImage-2.1
 * Textual Inversion training: SD/SDXL
+* Inpainting model training: SD1.5 and SDXL
 * Image generation
 * Other utilities such as model conversion, image tagging, LoRA merging, etc.
 
@@ -107,6 +110,7 @@ If you find this project helpful, please consider supporting its development via
 * [ControlNet-LLLite Training](./docs/train_lllite_README.md) / [Japanese version](./docs/train_lllite_README-ja.md)
 * [Validation](./docs/validation.md)
 * [Masked Loss Training](./docs/masked_loss_README.md) / [Japanese version](./docs/masked_loss_README-ja.md)
+* [Inpainting Training](./docs/inpainting_training.md)
 
 ### Other Documentation (English and Japanese)
 

@@ -50,6 +50,17 @@ Stable Diffusion等の画像生成モデルの学習、モデルによる画像�
 
 ### 更新履歴
 
+- **Version 0.10.5 (2026-05-08):**
+    - transformersのバージョン5以降に対応しました。[PR #2315](https://github.com/kohya-ss/sd-scripts/pull/2315) および [PR #2316](https://github.com/kohya-ss/sd-scripts/pull/2316) marcus165090-spec氏に感謝します。
+        - `requirements.txt`の`transformers`のバージョンは4.xのままですが、5.xでも動作します。何らかの理由で5.xを用いる場合はdiffusersもあわせて最新バージョンにしてください。
+    - Anima向けのControlNet-LLLite学習に対応しました。[PR #2317](https://github.com/kohya-ss/sd-scripts/pull/2317)
+        - 詳細は[ドキュメント](./docs/anima_train_control_net_lllite.md)をご覧ください。
+
+- **Version 0.10.4 (2026-05-07):**
+    - Intel GPUの互換性を向上しました。[PR #2307](https://github.com/kohya-ss/sd-scripts/pull/2307) WhitePr氏に感謝します。
+    - SD 1.5/SDXLのinpaintingモデルの学習に対応しました。[PR #2309](https://github.com/kohya-ss/sd-scripts/pull/2309) および [PR #2318](https://github.com/kohya-ss/sd-scripts/pull/2318)allanoepping氏に感謝します。
+        - 詳細は[ドキュメント](./docs/inpainting_training.md)をご覧ください。
+
 - **Version 0.10.3 (2026-04-02):**
     - Animaでfp16で学習する際の安定性をさらに改善しました。[PR #2302](https://github.com/kohya-ss/sd-scripts/pull/2302) 問題をご報告いただいた方々に深く感謝します。
 
@@ -66,16 +77,6 @@ Stable Diffusion等の画像生成モデルの学習、モデルによる画像�
     - Animaでfp16で学習する際の安定性が向上しました。[PR #2297](https://github.com/kohya-ss/sd-scripts/pull/2297) ただし、依然として不安定な場合があるようです。問題が発生する場合は、詳細をIssueでお知らせください。
     - その他、細かいバグ修正や改善を行いました。
 
-- **Version 0.10.1 (2026-02-13):**
-    - [Anima Preview](https://huggingface.co/circlestone-labs/Anima)モデルのLoRA学習およびfine-tuningをサポートしました。[PR #2260](https://github.com/kohya-ss/sd-scripts/pull/2260) および[PR #2261](https://github.com/kohya-ss/sd-scripts/pull/2261)
-    - 素晴らしいモデルを公開された CircleStone Labs、および PR #2260を提出していただいたduongve13112002氏に深く感謝します。
-    - 詳細は[ドキュメント](./docs/anima_train_network.md)をご覧ください。
-
-- **Version 0.10.0 (2026-01-19):**
-    - `sd3`ブランチを`main`ブランチにマージしました。このバージョンからFLUX.1およびSD3/SD3.5等のモデルが`main`ブランチでサポートされます。
-    - ドキュメントにはまだ不備があるため、お気づきの点はIssue等でお知らせください。
-    - `sd3`ブランチは当面、`dev`ブランチと同期して開発ブランチとして維持します。
-
 ### サポートモデル
 
 * **Stable Diffusion 1.x/2.x**
@@ -84,12 +85,14 @@ Stable Diffusion等の画像生成モデルの学習、モデルによる画像�
 * **FLUX.1**
 * **LUMINA**
 * **HunyuanImage-2.1**
+* **Anima preview**
 
 ### 機能
 
 * LoRA学習
 * fine-tuning（DreamBooth）：HunyuanImage-2.1以外のモデル
 * Textual Inversion学習：SD/SDXL
+* インペインティングモデル学習：SD1.5およびSDXL
 * 画像生成
 * その他、モデル変換やタグ付け、LoRAマージなどのユーティリティ
 
@@ -112,6 +115,7 @@ Stable Diffusion等の画像生成モデルの学習、モデルによる画像�
 * [ControlNet-LLLite学習](./docs/train_lllite_README-ja.md) / [英語版](./docs/train_lllite_README.md)
 * [Validation](./docs/validation.md)
 * [マスク損失学習](./docs/masked_loss_README-ja.md) / [英語版](./docs/masked_loss_README.md)
+* [インペインティング学習](./docs/inpainting_training.md)
 
 ### その他のドキュメント
 
