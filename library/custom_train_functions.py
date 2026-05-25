@@ -151,6 +151,31 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         action="store_true",
         help="debiased estimation loss / debiased estimation loss",
     )
+    # Focal Frequency Loss arguments
+    parser.add_argument(
+        "--focal_frequency_loss",
+        action="store_true",
+        help="Enable focal frequency loss as an auxiliary loss in latent space. "
+        "Penalizes hard-to-synthesize frequency components in the noise prediction. "
+        "/ 潜在空間でfocal frequency lossを補助損失として有効にする。"
+        "ノイズ予測における合成困難な周波数成分にペナルティを与える",
+    )
+    parser.add_argument(
+        "--focal_frequency_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for focal frequency loss (default: 1.0) / "
+        "focal frequency lossの重み（デフォルト: 1.0）",
+    )
+    parser.add_argument(
+        "--focal_frequency_loss_alpha",
+        type=float,
+        default=1.0,
+        help="Alpha scaling factor for the spectrum weight matrix in FFL. "
+        "Controls how focused the model is on hard frequencies (default: 1.0) / "
+        "FFLのスペクトル重み行列のalphaスケーリング係数。"
+        "モデルが困難な周波数にどれだけ集中するかを制御する（デフォルト: 1.0）",
+    )
     if support_weighted_captions:
         parser.add_argument(
             "--weighted_captions",

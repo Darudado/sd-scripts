@@ -31,6 +31,7 @@ import types
 from collections import deque
 from typing import Deque
 from library.laplace_mse_loss import mse_pyramid_loss_2d_non_reduced
+from library.focal_frequency_loss import FocalFrequencyLoss
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
 

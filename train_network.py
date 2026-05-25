@@ -34,6 +34,7 @@ from library.strategy_sdxl import SdxlTextEncodingStrategy
 
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset
+from library.focal_frequency_loss import FocalFrequencyLoss
 import library.config_util as config_util
 from library.config_util import (
     ConfigSanitizer,
@@ -93,6 +94,11 @@ class NetworkTrainer:
         self.lora2_enabled = False
         self.lora2_lambda_r = 1e-4
 
+        # Focal Frequency Loss config
+        self.ffl_enabled = False
+        self.ffl_module = None
+        self.ffl_loss_value = None
+
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
         self,
@@ -114,6 +120,7 @@ class NetworkTrainer:
         average_loss_edm2=None,
         current_val_loss=None,
         average_val_loss=None,
+        current_ffl_loss=None,
         it_s: float = 0.0,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
@@ -125,6 +132,9 @@ class NetworkTrainer:
         if current_loss_edm2 is not None:
             logs["loss/current_edm2"] = current_loss_edm2
             logs["loss/average_edm2"] = average_loss_edm2
+
+        if current_ffl_loss is not None:
+            logs["loss/current_ffl"] = current_ffl_loss
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -716,6 +726,13 @@ class NetworkTrainer:
             rank_reg_loss = LoRA2Module.get_total_rank_reg_loss()
             if rank_reg_loss.item() > 0:
                 final_loss = final_loss + self.lora2_lambda_r * rank_reg_loss
+
+        # Focal Frequency Loss: auxiliary frequency-domain loss on latent space
+        self.ffl_loss_value = None
+        if is_train and self.ffl_enabled and self.ffl_module is not None:
+            ffl_loss = self.ffl_module(noise_pred, target)
+            self.ffl_loss_value = ffl_loss.detach().item()
+            final_loss = final_loss + ffl_loss
 
         return final_loss, pre_scaling_loss, loss_scaled
     
@@ -1849,6 +1866,9 @@ class NetworkTrainer:
             "ss_validate_every_n_epochs": args.validate_every_n_epochs,
             "ss_validate_every_n_steps": args.validate_every_n_steps,
             "ss_resize_interpolation": args.resize_interpolation,
+            "ss_focal_frequency_loss": bool(getattr(args, "focal_frequency_loss", False)),
+            "ss_focal_frequency_loss_weight": getattr(args, "focal_frequency_loss_weight", 1.0),
+            "ss_focal_frequency_loss_alpha": getattr(args, "focal_frequency_loss_alpha", 1.0),
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -2086,6 +2106,18 @@ class NetworkTrainer:
         # Initialize LoRA² rank regularization if applicable
         self.setup_lora2_regularization(net_kwargs)
 
+        # Initialize Focal Frequency Loss if enabled
+        if getattr(args, "focal_frequency_loss", False):
+            self.ffl_enabled = True
+            self.ffl_module = FocalFrequencyLoss(
+                loss_weight=float(args.focal_frequency_loss_weight),
+                alpha=float(args.focal_frequency_loss_alpha),
+            )
+            logger.info(
+                f"Focal Frequency Loss enabled: weight={args.focal_frequency_loss_weight}, "
+                f"alpha={args.focal_frequency_loss_alpha}"
+            )
+
         edm2_model, edm2_optimizer, edm2_lr_scheduler = prepare_edm2_loss_weighting(args, noise_scheduler, accelerator)
 
         train_util.init_trackers(accelerator, args, "network_train")
@@ -2152,6 +2184,7 @@ class NetworkTrainer:
         average_loss_scaled = 0.0 if args.edm2_loss_weighting else None
         current_global_step_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
         average_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
+        current_global_step_ffl = 0.0 if self.ffl_enabled else None
         avr_loss = 0.0
         accumulation_counter = 0
 
@@ -2213,6 +2246,7 @@ class NetworkTrainer:
                 average_loss_edm2,
                 current_val_loss=current_val_loss,
                 average_val_loss=average_val_loss,
+                current_ffl_loss=None,
                 it_s=rate_tracker.it_per_sec,
             )
             if val_logs:
@@ -2287,6 +2321,10 @@ class NetworkTrainer:
                         train_unet=train_unet,
                         edm2_model=edm2_model,
                     )
+
+                    # Track FFL loss for logging
+                    if self.ffl_enabled and self.ffl_loss_value is not None:
+                        current_global_step_ffl = (current_global_step_ffl or 0.0) + self.ffl_loss_value
 
                     if loss.ndim != 0:
                         loss = loss.mean()
@@ -2476,6 +2514,7 @@ class NetworkTrainer:
                 else:
                     current_global_step_loss_scaled = None
                     current_global_step_loss_edm2 = None
+                # Note: FFL loss is already tracked above (accumulated per micro-step)
 
                 if accelerator.sync_gradients:
                     loss_recorder.add(current_global_step_loss / accumulation_counter)
@@ -2519,6 +2558,7 @@ class NetworkTrainer:
                             average_loss_edm2,
                             current_val_loss=current_val_loss,
                             average_val_loss=average_val_loss,
+                            current_ffl_loss=(current_global_step_ffl / accumulation_counter) if self.ffl_enabled and current_global_step_ffl is not None else None,
                             it_s=rate_tracker.it_per_sec,
                         )
                         if val_logs:
@@ -2528,6 +2568,8 @@ class NetworkTrainer:
                     if args.edm2_loss_weighting:
                         current_global_step_loss_scaled = 0.0
                         current_global_step_loss_edm2 = 0.0
+                    if self.ffl_enabled:
+                        current_global_step_ffl = 0.0
                     accumulation_counter = 0
 
                 if global_step >= args.max_train_steps:
