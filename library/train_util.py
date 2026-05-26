@@ -1719,7 +1719,7 @@ class BaseDataset(torch.utils.data.Dataset):
         flippeds = []  # 変数名が微妙
         text_encoder_outputs_list = []
         custom_attributes = []
-        masks = []
+        inpainting_masks = []
         masked_images = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
@@ -1824,7 +1824,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     mask = self.random_mask(pil_image.size)
                     mask, masked_image = self.prepare_mask_and_masked_image(pil_image, mask)
 
-                    masks.append(mask)
+                    inpainting_masks.append(mask)
                     masked_images.append(masked_image)
 
                 latents = None
@@ -1976,7 +1976,7 @@ class BaseDataset(torch.utils.data.Dataset):
             images = None
         example["images"] = images
 
-        example["masks"] = torch.stack(masks) if masks else None
+        example["masks"] = torch.stack(inpainting_masks) if inpainting_masks else None
         example["masked_images"] = torch.stack(masked_images) if masked_images else None
 
         example["latents"] = torch.stack(latents_list) if latents_list[0] is not None else None

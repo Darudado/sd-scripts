@@ -623,7 +623,7 @@ class NetworkTrainer:
             latents = self.shift_scale_latents(args, latents)
 
             # Prepare inpainting masked_latents if batch contains masks
-            if batch.get("masks") is not None:
+            if batch.get("masks") is not None and batch.get("masked_images") is not None:
                 masked_latents = self.encode_images_to_latents(
                     args, vae, batch["masked_images"].to(accelerator.device, dtype=vae_dtype)
                 )
