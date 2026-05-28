@@ -2486,7 +2486,16 @@ class NetworkTrainer:
                     if self.weight_noise_enabled and accelerator.sync_gradients:
                         unwrapped_network = accelerator.unwrap_model(network)
                         if hasattr(unwrapped_network, "inject_weight_noise"):
-                            noise_norm = unwrapped_network.inject_weight_noise()
+                            # Compute effective batch size and fallback LR for dynamic scaling.
+                            # Pass the optimizer so the network can resolve per-param LR
+                            # from optimizer.param_groups for accurate dynamic scaling.
+                            _eff_bs = args.train_batch_size * args.gradient_accumulation_steps
+                            _fallback_lr = lr_scheduler.get_last_lr()[0]
+                            _raw_opt = getattr(optimizer, 'optimizer', optimizer)
+                            noise_norm = unwrapped_network.inject_weight_noise(
+                                lr=_fallback_lr, effective_batch_size=_eff_bs,
+                                optimizer=_raw_opt,
+                            )
                             if current_global_step_wnoise is not None:
                                 current_global_step_wnoise += noise_norm
 
