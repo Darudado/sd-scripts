@@ -2268,6 +2268,7 @@ class NetworkTrainer:
         current_global_step_wnoise = 0.0 if self.weight_noise_enabled else None
         avr_loss = 0.0
         accumulation_counter = 0
+        accumulated_samples = 0  # Tracks actual samples across micro-batches for dynamic sigma
 
         # Detect step_func optimizer (e.g. AdamWScheduleFreePlus with Polyak step size).
         # step_func(function_value) replaces step() and requires the current loss value.
@@ -2381,6 +2382,18 @@ class NetworkTrainer:
 
                     accumulation_counter += 1
 
+                    # Track actual micro-batch size for accurate effective batch size
+                    _actual_bs = None
+                    if "latents" in batch and batch["latents"] is not None:
+                        _actual_bs = batch["latents"].shape[0]
+                    elif "images" in batch and batch["images"] is not None:
+                        _actual_bs = batch["images"].shape[0]
+                    elif "captions" in batch:
+                        _actual_bs = len(batch["captions"])
+                    if _actual_bs is None:
+                        _actual_bs = args.train_batch_size
+                    accumulated_samples += _actual_bs
+
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
@@ -2487,9 +2500,9 @@ class NetworkTrainer:
                         unwrapped_network = accelerator.unwrap_model(network)
                         if hasattr(unwrapped_network, "inject_weight_noise"):
                             # Compute effective batch size and fallback LR for dynamic scaling.
-                            # Pass the optimizer so the network can resolve per-param LR
-                            # from optimizer.param_groups for accurate dynamic scaling.
-                            _eff_bs = args.train_batch_size * args.gradient_accumulation_steps
+                            # Use actual accumulated samples (handles incomplete batches
+                            # and partial gradient accumulation) × num_processes for DDP.
+                            _eff_bs = accumulated_samples * accelerator.num_processes
                             _fallback_lr = lr_scheduler.get_last_lr()[0]
                             _raw_opt = getattr(optimizer, 'optimizer', optimizer)
                             noise_norm = unwrapped_network.inject_weight_noise(
@@ -2681,6 +2694,7 @@ class NetworkTrainer:
                     if self.weight_noise_enabled:
                         current_global_step_wnoise = 0.0
                     accumulation_counter = 0
+                    accumulated_samples = 0
 
                 if global_step >= args.max_train_steps:
                     break
