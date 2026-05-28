@@ -5675,7 +5675,7 @@ def get_optimizer(args, trainable_params, optimizer_kwargs: Dict = {}) -> tuple[
             case_sensitive_optimizer_type = values[-1]
 
         # Need to handle base optimizer
-        if case_sensitive_optimizer_type.lower() == "schedulefreewrapper" or args.optimizer_type.lower().endswith("snoo_asgd".lower()):
+        if is_wrapper_optimizer(args):
             case_sensitive_full_base_optimizer_name = optimizer_kwargs.get("base_optimizer_type", None)
             base_optimizer_values = case_sensitive_full_base_optimizer_name.split(".")
             base_optimizer_module = importlib.import_module(".".join(base_optimizer_values[:-1]))
@@ -5722,7 +5722,7 @@ def is_schedulefree_plus_optimizer(args: argparse.Namespace) -> bool:
     return False
 
 def is_schedulefree_optimizer(args: argparse.Namespace) -> bool:
-    schedulefree_suffixes = ["schedulefree", "schedulefreewrapper", "schedulefreeplus"]
+    schedulefree_suffixes = ["schedulefree", "schedulefreewrapper", "schedulefreeplus", "soda"]
     lower_case_optimizer_type = args.optimizer_type.lower()
 
     for schedulefree_suffix in schedulefree_suffixes:
@@ -5732,7 +5732,7 @@ def is_schedulefree_optimizer(args: argparse.Namespace) -> bool:
     return False
 
 def is_wrapper_optimizer(args: argparse.Namespace) -> bool:
-    wrapper_suffixes = ["schedulefreewrapper", "snoo_asgd"]
+    wrapper_suffixes = ["schedulefreewrapper", "snoo_asgd", "sodawrapper"]
     lower_case_optimizer_type = args.optimizer_type.lower()
 
     for wrapper_suffix in wrapper_suffixes:
