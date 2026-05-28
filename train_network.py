@@ -83,6 +83,9 @@ class NetworkTrainer:
         self.is_sdxl = False
         self.latent_shift = 0.0
 
+        # Weight Noising config (inspired by ai-toolkit-perceptual)
+        self.weight_noise_enabled = False
+
         # T-LoRA timestep-dependent rank masking config
         self.tlora_enabled = False
         self.tlora_max_rank = 0
@@ -128,6 +131,7 @@ class NetworkTrainer:
         average_val_loss=None,
         current_ffl_loss=None,
         current_wav_mask_ratio=None,
+        current_weight_noise_norm=None,
         it_s: float = 0.0,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
@@ -145,6 +149,9 @@ class NetworkTrainer:
 
         if current_wav_mask_ratio is not None:
             logs["loss/wavelet_mask_ratio"] = current_wav_mask_ratio
+
+        if current_weight_noise_norm is not None:
+            logs["weight_noise/noise_norm"] = current_weight_noise_norm
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -2181,6 +2188,15 @@ class NetworkTrainer:
                 f"wavelet=haar, J=1"
             )
 
+        # Initialize Weight Noising if the network supports it
+        _wn_sigma = net_kwargs.get("weight_noise_sigma", None)
+        if _wn_sigma is not None and float(_wn_sigma) > 0:
+            self.weight_noise_enabled = True
+            _wn_mode = net_kwargs.get("weight_noise_mode", "relative")
+            logger.info(
+                f"Weight noising enabled: sigma={_wn_sigma}, mode={_wn_mode}"
+            )
+
         edm2_model, edm2_optimizer, edm2_lr_scheduler = prepare_edm2_loss_weighting(args, noise_scheduler, accelerator)
 
         train_util.init_trackers(accelerator, args, "network_train")
@@ -2249,6 +2265,7 @@ class NetworkTrainer:
         average_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
         current_global_step_ffl = 0.0 if self.ffl_enabled else None
         current_global_step_wav_mask = 0.0 if self.wavelet_masking_enabled else None
+        current_global_step_wnoise = 0.0 if self.weight_noise_enabled else None
         avr_loss = 0.0
         accumulation_counter = 0
 
@@ -2463,6 +2480,16 @@ class NetworkTrainer:
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
+                    # Weight noising: inject Gaussian noise into adapter params
+                    # after optimizer step (inspired by ai-toolkit-perceptual).
+                    # Runs after EMA would be updated so EMA stays clean.
+                    if self.weight_noise_enabled and accelerator.sync_gradients:
+                        unwrapped_network = accelerator.unwrap_model(network)
+                        if hasattr(unwrapped_network, "inject_weight_noise"):
+                            noise_norm = unwrapped_network.inject_weight_noise()
+                            if current_global_step_wnoise is not None:
+                                current_global_step_wnoise += noise_norm
+
                     if args.edm2_loss_weighting:
                         edm2_optimizer.step()
                         edm2_lr_scheduler.step()
@@ -2628,6 +2655,7 @@ class NetworkTrainer:
                             average_val_loss=average_val_loss,
                             current_ffl_loss=(current_global_step_ffl / accumulation_counter) if self.ffl_enabled and current_global_step_ffl is not None else None,
                             current_wav_mask_ratio=(current_global_step_wav_mask / accumulation_counter) if self.wavelet_masking_enabled and current_global_step_wav_mask is not None else None,
+                            current_weight_noise_norm=(current_global_step_wnoise / accumulation_counter) if self.weight_noise_enabled and current_global_step_wnoise is not None else None,
                             it_s=rate_tracker.it_per_sec,
                         )
                         if val_logs:
@@ -2641,6 +2669,8 @@ class NetworkTrainer:
                         current_global_step_ffl = 0.0
                     if self.wavelet_masking_enabled:
                         current_global_step_wav_mask = 0.0
+                    if self.weight_noise_enabled:
+                        current_global_step_wnoise = 0.0
                     accumulation_counter = 0
 
                 if global_step >= args.max_train_steps:
