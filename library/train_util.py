@@ -5916,7 +5916,19 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             lr_scheduler_type = values[-1]
         lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
         lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
-        return wrap_zero_lr_warmup(wrap_check_needless_num_warmup_steps(lr_scheduler))
+
+        # For custom schedulers with internal warmup_steps, zero_lr_warmup uses that value
+        # instead of the standard num_warmup_steps (which is always 0 for custom schedulers)
+        if getattr(args, "zero_lr_warmup", False):
+            custom_warmup_steps = lr_scheduler_kwargs.get("warmup_steps", 0)
+            if custom_warmup_steps > 0:
+                logger.info(
+                    f"zero_lr_warmup enabled for custom scheduler: "
+                    f"LR will be 0 for the first {custom_warmup_steps} steps"
+                )
+                return ZeroLRWarmupScheduler(optimizer, lr_scheduler, warmup_steps=custom_warmup_steps)
+
+        return wrap_check_needless_num_warmup_steps(lr_scheduler)
     else:
         logger.info(f"use {name} | {lr_scheduler_kwargs} as lr_scheduler")
 
