@@ -51,7 +51,7 @@ from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
 )
-from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments
+from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments, apply_snr_weight_for_flow_matching
 
 
 def train(args):
@@ -774,6 +774,11 @@ def train(args):
                 )
                 if weighting is not None:
                     loss = loss * weighting
+
+                # Min-SNR-γ for flow matching
+                if args.min_snr_gamma:
+                    loss = apply_snr_weight_for_flow_matching(loss, sigmas, args.min_snr_gamma)
+
                 if args.masked_loss or (
                     "alpha_masks" in batch and batch["alpha_masks"] is not None
                 ):

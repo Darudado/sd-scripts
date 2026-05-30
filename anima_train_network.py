@@ -24,6 +24,7 @@ from library import (
     strategy_base,
     train_util,
 )
+from library.custom_train_functions import apply_snr_weight_for_flow_matching
 import train_network
 from library.utils import setup_logging
 from library.ramtorch_util import apply_ramtorch_to_module
@@ -1122,6 +1123,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         )
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
+        if args.min_snr_gamma:
+            # Anima timesteps are already in [0, 1] range (sigmas) — they are divided by 1000
+            # in get_noise_pred_and_target before being returned
+            loss = apply_snr_weight_for_flow_matching(loss, timesteps, args.min_snr_gamma)
         return loss
 
     def get_sai_model_spec(self, args):

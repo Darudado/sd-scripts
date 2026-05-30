@@ -92,6 +92,44 @@ def apply_snr_weight(loss: torch.Tensor, timesteps: torch.IntTensor, noise_sched
     return loss
 
 
+def apply_snr_weight_for_flow_matching(loss: torch.Tensor, sigmas: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Apply Min-SNR-γ weighting for flow matching (rectified flow) models.
+
+    Computes the signal-to-noise ratio from sigma: SNR = (1 - σ)² / σ²
+    and applies the velocity-prediction weight: min(SNR, γ) / (SNR + 1).
+
+    This is the flow-matching analog of apply_snr_weight for DDPM models.
+    Flow matching velocity prediction (v = ε - x₀) is mathematically analogous
+    to v-prediction in DDPM, so the v-prediction formula is used.
+
+    Reference: https://arxiv.org/abs/2303.09556
+
+    Args:
+        loss: Per-element loss tensor (any shape, e.g. (B,) or (B, C, H, W)).
+        sigmas: Noise levels from the flow matching scheduler.
+            Can be shape (B, 1, 1, 1), (B,), or broadcastable with loss.
+        gamma: Min-SNR gamma value. 5.0 is recommended by the paper.
+
+    Returns:
+        Weighted loss tensor (same shape as input loss).
+    """
+    # Clamp sigma away from zero to avoid division by zero at σ=0 (clean data, infinite SNR)
+    sigma = sigmas.clamp(min=1e-6)
+
+    # SNR in flow matching: (1 - σ)² / σ²
+    snr = ((1.0 - sigma) / sigma) ** 2
+
+    # Cap SNR at gamma
+    min_snr = torch.minimum(snr, torch.full_like(snr, gamma))
+
+    # Velocity prediction weight: min(SNR, γ) / (SNR + 1)
+    snr_weight = min_snr / (snr + 1)
+
+    snr_weight = snr_weight.to(dtype=loss.dtype, device=loss.device)
+
+    return loss * snr_weight
+
+
 def scale_v_prediction_loss_like_noise_prediction(loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler):
     scale = get_snr_scale(timesteps, noise_scheduler)
     loss = loss * scale

@@ -1066,8 +1066,7 @@ class NetworkTrainer:
             if args.v_parameterization:
                 raise ValueError("`--flow_model` is incompatible with `--v_parameterization`; Rectified Flow already predicts velocity.")
             if args.min_snr_gamma:
-                logger.warning("`--min_snr_gamma` is ignored when Rectified Flow is enabled.")
-                args.min_snr_gamma = None
+                logger.info("`--min_snr_gamma` is enabled for Rectified Flow (flow-matching SNR adaptation).")
             if args.debiased_estimation_loss:
                 logger.warning("`--debiased_estimation_loss` is ignored when Rectified Flow is enabled.")
                 args.debiased_estimation_loss = False

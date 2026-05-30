@@ -22,6 +22,7 @@ from library import (
     strategy_flux,
     train_util,
 )
+from library.custom_train_functions import apply_snr_weight_for_flow_matching
 from library import utils
 from library.utils import setup_logging
 
@@ -458,6 +459,10 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         return model_pred, target, timesteps, weighting, noise
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
+        if args.min_snr_gamma:
+            # Convert timesteps (in [0, 1000] range) to flow matching sigmas (in [0, 1] range)
+            sigmas = timesteps / noise_scheduler.config.num_train_timesteps
+            loss = apply_snr_weight_for_flow_matching(loss, sigmas, args.min_snr_gamma)
         return loss
 
     def get_sai_model_spec(self, args):
