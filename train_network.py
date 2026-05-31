@@ -508,7 +508,7 @@ class NetworkTrainer:
         algo = (net_kwargs.get("algo", "lora") or "lora").lower()
 
         # Path 2: LoCon flag approach (algo=lora/locon + use_timestep_mask=True)
-        if algo in ("lora", "locon") and net_kwargs.get("use_timestep_mask"):
+        if algo in ("lora", "locon", "ortholora") and net_kwargs.get("use_timestep_mask"):
             self.tlora_enabled = True
             self.tlora_use_network_method = True
             self.tlora_max_rank = int(network_dim) if network_dim is not None else 4
