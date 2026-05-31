@@ -28,6 +28,9 @@ from torchvision import transforms
 
 # Helpers
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from library.image_utils import to_srgb
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
 
 IMAGE_TRANSFORMS = transforms.Compose(
@@ -93,7 +96,7 @@ def test_latent_cache(args, pairs):
         print(f"\n[1.2] Processing: {os.path.basename(img_path)}")
 
         # Load image
-        img = Image.open(img_path).convert("RGB")
+        img = to_srgb(Image.open(img_path))
         img_np = np.array(img)
         print(f"  Raw image: {img_np.shape} dtype={img_np.dtype} " f"min={img_np.min()} max={img_np.max()}")
 
@@ -421,7 +424,7 @@ def test_full_batch_simulation(args, pairs):
     print(f"\n[3.3] Simulating latent caching phase...")
     per_sample_latents = []
     for img_path, _ in pairs:
-        img = Image.open(img_path).convert("RGB")
+        img = to_srgb(Image.open(img_path))
         img_np = np.array(img)
         img_tensor = IMAGE_TRANSFORMS(img_np).unsqueeze(0).unsqueeze(2)  # (1,C,1,H,W)
         img_tensor = img_tensor.to(device, dtype=vae_dtype)

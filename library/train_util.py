@@ -32,6 +32,7 @@ from collections import deque
 from typing import Deque
 from library.laplace_mse_loss import mse_pyramid_loss_2d_non_reduced
 from library.focal_frequency_loss import FocalFrequencyLoss
+from library.image_utils import to_srgb
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2065,7 +2066,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def prepare_mask_and_masked_image(image, mask):
-        image = np.array(image.convert("RGB"))
+        image = np.array(to_srgb(image))
         image = image.transpose(2, 0, 1)  # HWC -> CHW
         image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
 
@@ -3369,8 +3370,7 @@ def load_image(image_path, alpha=False):
                 if not image.mode == "RGBA":
                     image = image.convert("RGBA")
             else:
-                if not image.mode == "RGB":
-                    image = image.convert("RGB")
+                image = to_srgb(image)
             img = np.array(image, np.uint8)
             return img
     except (IOError, OSError) as e:
@@ -7714,7 +7714,7 @@ def sample_image_inference(
     pipeline.scheduler = scheduler
 
     if controlnet_image is not None:
-        controlnet_image = Image.open(controlnet_image).convert("RGB")
+        controlnet_image = to_srgb(Image.open(controlnet_image))
         controlnet_image = controlnet_image.resize((width, height), Image.LANCZOS)
 
     # Round down so the latent shape is divisible by the UNet's largest stride:
@@ -7745,7 +7745,7 @@ def sample_image_inference(
             if not os.path.exists(image_path):
                 logger.warning(f"inpaint image not found, skipping sample: {image_path}")
                 return
-            inpaint_image = Image.open(image_path).convert("RGB").resize((width, height), Image.LANCZOS)
+            inpaint_image = to_srgb(Image.open(image_path)).resize((width, height), Image.LANCZOS)
             inpaint_mask = _gen_mask(width, height, seed=seed)
             logger.info(f"inpaint image: {image_path}")
         else:
@@ -8007,7 +8007,7 @@ class ImageLoadingDataset(torch.utils.data.Dataset):
         img_path = self.images[idx]
 
         try:
-            image = Image.open(img_path).convert("RGB")
+            image = to_srgb(Image.open(img_path))
             # convert to tensor temporarily so dataloader will accept it
             tensor_pil = transforms.functional.pil_to_tensor(image)
         except Exception as e:

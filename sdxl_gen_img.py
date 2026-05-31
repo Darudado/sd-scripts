@@ -61,6 +61,7 @@ from library.sdxl_original_unet import InferSdxlUNet2DConditionModel
 from library.original_unet import FlashAttentionFunction
 from networks.control_net_lllite import ControlNetLLLite
 from library.utils import GradualLatent, EulerAncestralDiscreteSchedulerGL
+from library.image_utils import to_srgb
 from library.utils import setup_logging, add_logging_arguments
 
 setup_logging()
@@ -1949,7 +1950,7 @@ def main(args):
             image = Image.open(p)
             if image.mode != "RGB":
                 logger.info(f"convert image to RGB from {image.mode}: {p}")
-                image = image.convert("RGB")
+                image = to_srgb(image)
             images.append(image)
 
         return images

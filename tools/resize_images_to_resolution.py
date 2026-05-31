@@ -6,6 +6,7 @@ import shutil
 import math
 from PIL import Image
 import numpy as np
+from library.image_utils import to_srgb
 from library.utils import setup_logging, resize_image
 setup_logging()
 import logging
@@ -34,8 +35,7 @@ def resize_images(src_img_folder, dst_img_folder, max_resolution="512x512", divi
     # Load image
     # img = cv2.imread(os.path.join(src_img_folder, filename))
     image = Image.open(os.path.join(src_img_folder, filename))
-    if not image.mode == "RGB":
-      image = image.convert("RGB")
+    image = to_srgb(image)
     img = np.array(image, np.uint8)
 
     base, _ = os.path.splitext(filename)

@@ -37,6 +37,7 @@ from library import (
 )
 import library.train_util as train_util
 import library.config_util as config_util
+from library.image_utils import to_srgb
 from library.config_util import ConfigSanitizer, BlueprintGenerator
 from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments
 from library.utils import setup_logging, add_logging_arguments
@@ -60,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 def _load_control_image(path: str, width: int, height: int, device, dtype) -> torch.Tensor:
     """Load a control image and return (1, 3, H, W) in [-1, 1]."""
-    img = Image.open(path).convert("RGB").resize((width, height), Image.LANCZOS)
+    img = to_srgb(Image.open(path)).resize((width, height), Image.LANCZOS)
     arr = np.array(img, dtype=np.float32) / 127.5 - 1.0  # HWC, [-1, 1]
     tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()  # (1, 3, H, W)
     return tensor.to(device=device, dtype=dtype)

@@ -16,6 +16,7 @@ from diffusers import SchedulerMixin, StableDiffusionPipeline
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, StableDiffusionSafetyChecker
 from diffusers.utils import logging
+from library.image_utils import to_srgb
 
 try:
     from diffusers.utils import PIL_INTERPOLATION
@@ -444,7 +445,7 @@ def prepare_controlnet_image(
             images = []
 
             for image_ in image:
-                image_ = image_.convert("RGB")
+                image_ = to_srgb(image_)
                 image_ = image_.resize((width, height), resample=PIL_INTERPOLATION["lanczos"])
                 image_ = np.array(image_)
                 image_ = image_[None, :]
@@ -905,7 +906,7 @@ class StableDiffusionLongPromptWeightingPipeline(StableDiffusionPipeline):
             # Cast inpaint inputs to self.vae.dtype rather than the UNet dtype, so
             # that VAE encode operates in its own precision regardless of mixed
             # precision settings (mirrors the existing decode path).
-            img_np = np.array(inpaint_image.convert("RGB")).astype(np.float32) / 127.5 - 1.0
+            img_np = np.array(to_srgb(inpaint_image)).astype(np.float32) / 127.5 - 1.0
             img_t = torch.from_numpy(img_np).permute(2, 0, 1)[None].to(device=device, dtype=self.vae.dtype)
             mask_np = np.array(inpaint_mask.convert("L")).astype(np.float32) / 255.0
             mask_np = (mask_np >= 0.5).astype(np.float32)

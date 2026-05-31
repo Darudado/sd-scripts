@@ -44,6 +44,7 @@ from safetensors import safe_open
 
 import anima_minimal_inference as ami
 from networks.control_net_lllite_anima import ControlNetLLLiteDiT, load_lllite_weights
+from library.image_utils import to_srgb
 from library.utils import setup_logging
 
 setup_logging()
@@ -66,7 +67,7 @@ def _load_control_image(
     path: str, height: int, width: int, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
     """Load and normalize a control image to a (1, 3, H, W) tensor in [-1, 1]."""
-    img = Image.open(path).convert("RGB")
+    img = to_srgb(Image.open(path))
     if img.size != (width, height):  # PIL size is (W, H)
         img = img.resize((width, height), Image.BICUBIC)
     arr = np.asarray(img).astype(np.float32) / 127.5 - 1.0

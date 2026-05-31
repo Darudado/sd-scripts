@@ -18,6 +18,7 @@ from torchvision import transforms
 
 import library.model_util as model_util
 import library.train_util as train_util
+from library.image_utils import to_srgb
 from library.utils import setup_logging
 
 setup_logging()
@@ -140,8 +141,7 @@ def main(args):
         else:
             try:
                 image = Image.open(image_path)
-                if image.mode != "RGB":
-                    image = image.convert("RGB")
+                image = to_srgb(image)
             except Exception as e:
                 logger.error(f"Could not load image path / 画像を読み込めません: {image_path}, error: {e}")
                 continue

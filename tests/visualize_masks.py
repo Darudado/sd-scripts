@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 from PIL import Image, ImageDraw
+from library.image_utils import to_srgb
 
 from library.mask_generator import (
     cloud_mask,
@@ -111,7 +112,7 @@ class ImageSource:
         if self._pool:
             path = self._pool[index % len(self._pool)]
             try:
-                return Image.open(path).convert("RGB").resize((width, height), Image.LANCZOS)
+                return to_srgb(Image.open(path)).resize((width, height), Image.LANCZOS)
             except Exception as e:
                 print(f"  Warning: could not open {path}: {e} — using synthetic fallback")
         return _synthetic_image(width, height, seed=index)

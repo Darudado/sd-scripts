@@ -16,6 +16,7 @@ from safetensors.torch import save_file
 
 from library import flux_models, flux_utils, strategy_base, train_util
 from library.device_utils import init_ipex, clean_memory_on_device
+from library.image_utils import to_srgb
 from library.safetensors_utils import mem_eff_save_file
 
 init_ipex()
@@ -247,7 +248,7 @@ def sample_image_inference(
     t5_attn_mask = t5_attn_mask.to(accelerator.device) if args.apply_t5_attn_mask else None
 
     if controlnet_image is not None:
-        controlnet_image = Image.open(controlnet_image).convert("RGB")
+        controlnet_image = to_srgb(Image.open(controlnet_image))
         controlnet_image = controlnet_image.resize((width, height), Image.LANCZOS)
         controlnet_image = torch.from_numpy((np.array(controlnet_image) / 127.5) - 1)
         controlnet_image = controlnet_image.permute(2, 0, 1).unsqueeze(0).to(weight_dtype).to(accelerator.device)

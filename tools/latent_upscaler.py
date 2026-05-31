@@ -17,6 +17,7 @@ init_ipex()
 from torch import nn
 from tqdm import tqdm
 from PIL import Image
+from library.image_utils import to_srgb
 from library.utils import setup_logging
 setup_logging()
 import logging
@@ -284,7 +285,7 @@ def upscale_images(args: argparse.Namespace):
     images = []
     for image_path in image_paths:
         image = Image.open(image_path)
-        image = image.convert("RGB")
+        image = to_srgb(image)
 
         # make divisible by 8
         width = image.width

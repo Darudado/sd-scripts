@@ -45,6 +45,7 @@ from library.device_utils import get_preferred_device, init_ipex
 init_ipex()
 
 from library import model_util, sdxl_model_util
+from library.image_utils import to_srgb
 from library.utils import setup_logging
 
 setup_logging()
@@ -88,7 +89,7 @@ def _get_timestep_embedding(x, outdim):
 
 def load_image(path: str, width: int, height: int) -> torch.Tensor:
     """Load an RGB image and return a [-1, 1] float32 tensor of shape (1, 3, H, W)."""
-    img = Image.open(path).convert("RGB").resize((width, height), Image.LANCZOS)
+    img = to_srgb(Image.open(path)).resize((width, height), Image.LANCZOS)
     arr = np.array(img).astype(np.float32) / 127.5 - 1.0
     return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
 

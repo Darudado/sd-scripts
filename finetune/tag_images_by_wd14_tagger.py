@@ -13,6 +13,7 @@ from PIL import Image
 from tqdm import tqdm
 
 import library.train_util as train_util
+from library.image_utils import to_srgb
 from library.utils import setup_logging, resize_image
 
 setup_logging()
@@ -39,7 +40,7 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
     if image.mode in ("RGBA", "LA") or "transparency" in image.info:
         image = image.convert("RGBA")
     elif image.mode != "RGB":
-        image = image.convert("RGB")
+        image = to_srgb(image)
 
     # If image is RGBA, combine with white background
     if image.mode == "RGBA":

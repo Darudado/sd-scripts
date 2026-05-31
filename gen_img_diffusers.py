@@ -102,6 +102,7 @@ from tools.original_control_net import ControlNetInfo
 from library.original_unet import UNet2DConditionModel, InferUNet2DConditionModel
 from library.original_unet import FlashAttentionFunction
 from library.utils import GradualLatent, EulerAncestralDiscreteSchedulerGL
+from library.image_utils import to_srgb
 
 from XTI_hijack import unet_forward_XTI, downblock_forward_XTI, upblock_forward_XTI
 from library.utils import setup_logging, add_logging_arguments
@@ -2738,7 +2739,7 @@ def main(args):
             image = Image.open(p)
             if image.mode != "RGB":
                 logger.info(f"convert image to RGB from {image.mode}: {p}")
-                image = image.convert("RGB")
+                image = to_srgb(image)
             images.append(image)
 
         return images

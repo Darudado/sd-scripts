@@ -14,6 +14,7 @@ from transformers import AutoProcessor, AutoModelForCausalLM
 from transformers.generation.utils import GenerationMixin
 
 import library.train_util as train_util
+from library.image_utils import to_srgb
 from library.utils import setup_logging
 setup_logging()
 import logging
@@ -130,8 +131,7 @@ def main(args):
             if image is None:
                 try:
                     image = Image.open(image_path)
-                    if image.mode != "RGB":
-                        image = image.convert("RGB")
+                    image = to_srgb(image)
                 except Exception as e:
                     logger.error(f"Could not load image path / 画像を読み込めません: {image_path}, error: {e}")
                     continue

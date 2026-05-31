@@ -19,6 +19,7 @@ from torchvision.transforms.functional import InterpolationMode
 sys.path.append(os.path.dirname(__file__))
 from blip.blip import blip_decoder, is_url
 import library.train_util as train_util
+from library.image_utils import to_srgb
 from library.utils import setup_logging
 setup_logging()
 import logging
@@ -51,7 +52,7 @@ class ImageLoadingTransformDataset(torch.utils.data.Dataset):
         img_path = self.images[idx]
 
         try:
-            image = Image.open(img_path).convert("RGB")
+            image = to_srgb(Image.open(img_path))
             # convert to tensor temporarily so dataloader will accept it
             tensor = IMAGE_TRANSFORM(image)
         except Exception as e:
@@ -142,8 +143,7 @@ def main(args):
             if img_tensor is None:
                 try:
                     raw_image = Image.open(image_path)
-                    if raw_image.mode != "RGB":
-                        raw_image = raw_image.convert("RGB")
+                    raw_image = to_srgb(raw_image)
                     img_tensor = IMAGE_TRANSFORM(raw_image)
                 except Exception as e:
                     logger.error(f"Could not load image path / 画像を読み込めません: {image_path}, error: {e}")

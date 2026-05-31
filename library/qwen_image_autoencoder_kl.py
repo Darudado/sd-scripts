@@ -29,6 +29,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from library.safetensors_utils import load_safetensors
+from library.image_utils import to_srgb
 
 from library.utils import setup_logging
 
@@ -1663,7 +1664,7 @@ if __name__ == "__main__":
 
     # Process images
     def encode_decode_image(image_path, output_path):
-        image = Image.open(image_path).convert("RGB")
+        image = to_srgb(Image.open(image_path))
 
         # Crop to multiple of 8
         width, height = image.size
