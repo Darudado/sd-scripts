@@ -92,6 +92,7 @@ class NetworkTrainer:
         self.tlora_min_rank = 1
         self.tlora_mask_alpha = 1.0
         self.tlora_max_timestep = 1000
+        self.tlora_use_network_method = False  # True → use network.set_timestep_mask()
 
         # LoRA² adaptive rank regularization config
         self.lora2_enabled = False
@@ -492,20 +493,49 @@ class NetworkTrainer:
 
     def setup_tlora_masking(self, net_kwargs, network_dim, noise_scheduler):
         """
-        Initialize T-LoRA timestep masking if the algo is tlora.
+        Initialize T-LoRA timestep masking.
 
-        Reads tlora_min_rank and tlora_mask_alpha from network_args.
+        Supports two paths:
+        1. ``algo="tlora"`` — full TLoraModule with SVD-based parameterization
+           (module-level mask from lycoris.modules.tlora).
+        2. ``algo="locon"/"lora"`` + ``use_timestep_mask=True`` — lightweight
+           mask flag on LoConModule, saves as standard lora_up/lora_down.
+
+        Reads tlora_min_rank / tlora_mask_alpha (path 1) or
+        tlora_min_rank / tlora_alpha (path 2) from network_args.
         Must be called after the network is created.
         """
         algo = (net_kwargs.get("algo", "lora") or "lora").lower()
+
+        # Path 2: LoCon flag approach (algo=lora/locon + use_timestep_mask=True)
+        if algo in ("lora", "locon") and net_kwargs.get("use_timestep_mask"):
+            self.tlora_enabled = True
+            self.tlora_use_network_method = True
+            self.tlora_max_rank = int(network_dim) if network_dim is not None else 4
+            tlora_min_rank = net_kwargs.get("tlora_min_rank", None)
+            if tlora_min_rank is None:
+                self.tlora_min_rank = max(1, self.tlora_max_rank // 2)
+            else:
+                self.tlora_min_rank = int(tlora_min_rank)
+            self.tlora_min_rank = max(0, min(self.tlora_min_rank, self.tlora_max_rank))
+            self.tlora_mask_alpha = float(net_kwargs.get("tlora_alpha", 1.0))
+            self.tlora_max_timestep = noise_scheduler.config.num_train_timesteps
+            logger.info(
+                f"T-LoRA masking enabled (LoCon flag): max_rank={self.tlora_max_rank}, "
+                f"min_rank={self.tlora_min_rank}, alpha={self.tlora_mask_alpha}, "
+                f"max_timestep={self.tlora_max_timestep}"
+            )
+            return
+
+        # Path 1: Full TLoraModule approach (algo=tlora)
         if algo != "tlora":
             return
         if not TLORA_AVAILABLE:
             logger.warning("T-LoRA requested but lyco_tlora is not available. Skipping T-LoRA setup.")
             return
 
-
         self.tlora_enabled = True
+        self.tlora_use_network_method = False
         self.tlora_max_rank = int(network_dim) if network_dim is not None else 4
         tlora_min_rank = net_kwargs.get("tlora_min_rank", None)
         if tlora_min_rank is None:
@@ -516,7 +546,7 @@ class NetworkTrainer:
         self.tlora_mask_alpha = float(net_kwargs.get("tlora_mask_alpha", 1.0))
         self.tlora_max_timestep = noise_scheduler.config.num_train_timesteps
         logger.info(
-            f"T-LoRA masking enabled: max_rank={self.tlora_max_rank}, "
+            f"T-LoRA masking enabled (TLoraModule): max_rank={self.tlora_max_rank}, "
             f"min_rank={self.tlora_min_rank}, mask_alpha={self.tlora_mask_alpha}, "
             f"max_timestep={self.tlora_max_timestep}"
         )
@@ -525,40 +555,44 @@ class NetworkTrainer:
         """
         Compute and set the T-LoRA timestep mask for the current batch.
 
-        Computes a per-sample mask so each sample in the batch gets a rank
-        mask matching its own noise level, avoiding the bias of a single
-        shared mask (e.g. max timestep penalizing low-noise samples).
-        For batch_size=1 (common in LoRA training), this is equivalent to
-        computing a single mask.
+        Dispatches to either the network-level method (LoCon flag approach,
+        which uses a shared GPU buffer aliased across all modules) or the
+        module-level functions from lycoris.modules.tlora (full TLoraModule).
         """
         if not self.tlora_enabled:
             return
 
-        if timesteps.numel() == 1:
-            # Fast path for batch_size=1: avoid tensor ops
-            mask = compute_timestep_mask(
-                timestep=int(timesteps.item()),
-                max_timestep=self.tlora_max_timestep,
-                max_rank=self.tlora_max_rank,
-                min_rank=self.tlora_min_rank,
-                alpha=self.tlora_mask_alpha,
-            )
+        if self.tlora_use_network_method:
+            # LoCon flag: use network.set_timestep_mask (shared buffer, no CPU transfer)
+            self.network.set_timestep_mask(timesteps, self.tlora_max_timestep)
         else:
-            # Per-sample masks: shape (B, max_rank)
-            mask = compute_timestep_mask_batch(
-                timesteps=timesteps,
-                max_timestep=self.tlora_max_timestep,
-                max_rank=self.tlora_max_rank,
-                min_rank=self.tlora_min_rank,
-                alpha=self.tlora_mask_alpha,
-            )
-        set_timestep_mask(mask)
+            # Full TLoraModule: compute mask tensor, set via module-level function
+            if timesteps.numel() == 1:
+                mask = compute_timestep_mask(
+                    timestep=int(timesteps.item()),
+                    max_timestep=self.tlora_max_timestep,
+                    max_rank=self.tlora_max_rank,
+                    min_rank=self.tlora_min_rank,
+                    alpha=self.tlora_mask_alpha,
+                )
+            else:
+                mask = compute_timestep_mask_batch(
+                    timesteps=timesteps,
+                    max_timestep=self.tlora_max_timestep,
+                    max_rank=self.tlora_max_rank,
+                    min_rank=self.tlora_min_rank,
+                    alpha=self.tlora_mask_alpha,
+                )
+            set_timestep_mask(mask)
 
     def clear_tlora_mask_if_needed(self):
         """Clear the T-LoRA mask after the forward pass."""
         if not self.tlora_enabled:
             return
-        clear_timestep_mask()
+        if self.tlora_use_network_method:
+            self.network.clear_timestep_mask()
+        else:
+            clear_timestep_mask()
 
     def setup_lora2_regularization(self, net_kwargs):
         """
@@ -1345,6 +1379,9 @@ class NetworkTrainer:
             )
         if network is None:
             return
+
+        # Store network reference for T-LoRA mask setter (LoCon flag path)
+        self.network = network
 
         # GoRA: override args and net_kwargs to reflect enforced values in saved metadata
         _gora_algo = (net_kwargs.get("algo", "") or "").lower()
