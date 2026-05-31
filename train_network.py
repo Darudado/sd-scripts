@@ -386,8 +386,15 @@ class NetworkTrainer:
             for t in text_encoder_conds:
                 t.requires_grad_(True)
 
-        # Set T-LoRA timestep mask before the forward pass
-        self.apply_tlora_mask(timesteps)
+        # Set T-LoRA timestep mask before the forward pass.
+        # Path 1 (full T-LoRA, algo="tlora"): mask is integral to the
+        #   architecture — used at inference time (ComfyUI loader applies
+        #   per-step masking).  Always apply, including validation.
+        # Path 2 (LoCon flag, use_timestep_mask=True): mask is a training
+        #   curriculum technique — checkpoint saves as standard lora_up/lora_down
+        #   with all ranks active at inference.  Only apply during training.
+        if is_train or not self.tlora_use_network_method:
+            self.apply_tlora_mask(timesteps)
         
         # For inpainting models: concatenate [noisy_latents, mask, masked_latents] -> 9-channel UNet input
         unet_latents = noisy_latents
@@ -411,8 +418,9 @@ class NetworkTrainer:
                 weight_dtype,
             )
 
-        # Clear T-LoRA mask after the forward pass
-        self.clear_tlora_mask_if_needed()
+        # Clear T-LoRA mask after the forward pass (matching the guard above)
+        if is_train or not self.tlora_use_network_method:
+            self.clear_tlora_mask_if_needed()
 
         # Upcast for grokking
         latents = latents.to(torch.float64)
