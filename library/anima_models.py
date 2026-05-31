@@ -2,7 +2,7 @@
 # Original code: NVIDIA CORPORATION & AFFILIATES, licensed under Apache-2.0
 
 import math
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -141,79 +141,42 @@ def _rotate_half(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
     return x_new.view(x_new.shape[0], x_new.shape[1], x_new.shape[2], -1)
 
 
-def _apply_rotary_pos_emb_base(
-    t: torch.Tensor,
-    freqs: torch.Tensor,
-    start_positions: torch.Tensor = None,
+def apply_rotary_pos_emb_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    rope_cos_sin: tuple[torch.Tensor, torch.Tensor],
     tensor_format: str = "sbhd",
-    interleaved: bool = False,
-) -> torch.Tensor:
-    max_seq_len = freqs.shape[0]
-    cur_seq_len = t.shape[1] if tensor_format == "bshd" else t.shape[0]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to q and k using precomputed (cos, sin) tensors."""
+    cos_, sin_ = rope_cos_sin
+    max_seq_len = cos_.shape[0]
+    cur_seq_len = q.shape[1] if tensor_format == "bshd" else q.shape[0]
 
-    if start_positions is not None:
-        max_offset = torch.max(start_positions)
-        assert max_offset + cur_seq_len <= max_seq_len, f"Rotary Embeddings only supported up to {max_seq_len} sequence length!"
-        freqs = torch.concatenate([freqs[i : i + cur_seq_len] for i in start_positions], dim=1)
-
-    assert cur_seq_len <= max_seq_len, f"Rotary Embeddings only supported up to {max_seq_len} sequence length!"
-    freqs = freqs[:cur_seq_len]
+    assert cur_seq_len <= max_seq_len, (
+        f"Rotary Embeddings only supported up to {max_seq_len} sequence length!"
+    )
+    cos_ = cos_[:cur_seq_len]
+    sin_ = sin_[:cur_seq_len]
 
     if tensor_format == "bshd":
-        freqs = freqs.transpose(0, 1)
-    cos_ = torch.cos(freqs).to(t.dtype)
-    sin_ = torch.sin(freqs).to(t.dtype)
+        cos_ = cos_.transpose(0, 1)
+        sin_ = sin_.transpose(0, 1)
 
-    rot_dim = freqs.shape[-1]
-    t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-    t = (t * cos_) + (_rotate_half(t, interleaved) * sin_)
-    return torch.cat((t, t_pass), dim=-1)
+    rot_dim = cos_.shape[-1]
 
+    cos_q = cos_.to(q.dtype)
+    sin_q = sin_.to(q.dtype)
+    q_rot = q[..., :rot_dim]
+    q_emb = (q_rot * cos_q) + (_rotate_half(q_rot, False) * sin_q)
+    q = q_emb if rot_dim == q.shape[-1] else torch.cat((q_emb, q[..., rot_dim:]), dim=-1)
 
-def apply_rotary_pos_emb(
-    t: torch.Tensor,
-    freqs: torch.Tensor,
-    tensor_format: str = "sbhd",
-    start_positions: Union[torch.Tensor, None] = None,
-    interleaved: bool = False,
-    fused: bool = False,
-    cu_seqlens: Union[torch.Tensor, None] = None,
-    cp_size: int = 1,
-) -> torch.Tensor:
-    assert not (cp_size > 1 and start_positions is not None), "start_positions != None with CP SIZE > 1 is not supported!"
+    cos_k = cos_q if k.dtype == q.dtype else cos_.to(k.dtype)
+    sin_k = sin_q if k.dtype == q.dtype else sin_.to(k.dtype)
+    k_rot = k[..., :rot_dim]
+    k_emb = (k_rot * cos_k) + (_rotate_half(k_rot, False) * sin_k)
+    k = k_emb if rot_dim == k.shape[-1] else torch.cat((k_emb, k[..., rot_dim:]), dim=-1)
 
-    assert tensor_format != "thd" or cu_seqlens is not None, "cu_seqlens must not be None when tensor_format is 'thd'."
-
-    assert fused == False
-
-    if tensor_format == "thd":
-        cu_seqlens = cu_seqlens // cp_size
-        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        return torch.cat(
-            [
-                _apply_rotary_pos_emb_base(
-                    x.unsqueeze(1),
-                    freqs,
-                    start_positions=(start_positions[idx : idx + 1] if start_positions is not None else None),
-                    interleaved=interleaved,
-                )
-                for idx, x in enumerate(torch.split(t, seqlens))
-            ]
-        ).squeeze(1)
-
-    if tensor_format == "sbhd":
-        seqlen = t.size(0)
-    elif tensor_format == "bshd":
-        seqlen = t.size(1)
-    else:
-        raise ValueError(f"Unsupported tensor_format: {tensor_format}.")
-    return _apply_rotary_pos_emb_base(
-        t,
-        freqs,
-        start_positions,
-        tensor_format,
-        interleaved=interleaved,
-    )
+    return q, k
 
 
 # Basic building blocks
@@ -232,9 +195,8 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
-            output = self._norm(x.float()).type_as(x)
-            return output * self.weight
+        output = self._norm(x.float())
+        return (output * self.weight).to(x.dtype)
 
 
 class GPT2FeedForward(nn.Module):
@@ -296,12 +258,11 @@ class Attention(nn.Module):
         self.context_dim = context_dim
 
         self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
-        self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
-
         self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
-        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
-
         self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
+        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
         self.v_norm = nn.Identity()
 
         self.output_proj = nn.Linear(inner_dim, query_dim, bias=False)
@@ -330,23 +291,21 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
-        rope_emb: Optional[torch.Tensor] = None,
+        rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> tuple:
         q = self.q_proj(x)
         context = x if context is None else context
         k = self.k_proj(context)
         v = self.v_proj(context)
-        q, k, v = map(
-            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
-            (q, k, v),
-        )
+        q = q.unflatten(-1, (self.n_heads, self.head_dim))
+        k = k.unflatten(-1, (self.n_heads, self.head_dim))
+        v = v.unflatten(-1, (self.n_heads, self.head_dim))
 
         q = self.q_norm(q)
         k = self.k_norm(k)
         v = self.v_norm(v)
-        if self.is_selfattn and rope_emb is not None:
-            q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=False)
-            k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=False)
+        if self.is_selfattn and rope_cos_sin is not None:
+            q, k = apply_rotary_pos_emb_qk(q, k, rope_cos_sin, tensor_format=self.qkv_format)
 
         return q, k, v
 
@@ -355,9 +314,9 @@ class Attention(nn.Module):
         x: torch.Tensor,
         attn_params: attention.AttentionParams,
         context: Optional[torch.Tensor] = None,
-        rope_emb: Optional[torch.Tensor] = None,
+        rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
+        q, k, v = self.compute_qkv(x, context, rope_cos_sin=rope_cos_sin)
         if q.dtype != v.dtype:
             if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
                 # FlashAttention requires fp16/bf16, xformers require same dtype; only cast when autocast is active.
@@ -435,6 +394,7 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         self.h_ntk_factor = h_extrapolation_ratio ** (dim_h / (dim_h - 2))
         self.w_ntk_factor = w_extrapolation_ratio ** (dim_w / (dim_w - 2))
         self.t_ntk_factor = t_extrapolation_ratio ** (dim_t / (dim_t - 2))
+        self._cos_sin_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -445,6 +405,10 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         self.dim_spatial_range = torch.arange(0, dim_h, 2)[: (dim_h // 2)].float().to(self.dim_spatial_range.device) / dim_h
         self.dim_temporal_range = torch.arange(0, dim_t, 2)[: (dim_t // 2)].float().to(self.dim_spatial_range.device) / dim_t
 
+    def _cache_key(self, T: int, H: int, W: int, fps: Optional[torch.Tensor]) -> tuple:
+        fps_val = None if fps is None else fps[:1].item()
+        return (T, H, W, fps_val)
+
     def generate_embeddings(
         self,
         B_T_H_W_C: torch.Size,
@@ -452,7 +416,17 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         h_ntk_factor: Optional[float] = None,
         w_ntk_factor: Optional[float] = None,
         t_ntk_factor: Optional[float] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, T, H, W, _ = B_T_H_W_C
+
+        # Cache lookup (skip during compilation to avoid dict guard failures)
+        if not torch.compiler.is_compiling():
+            if h_ntk_factor is None and w_ntk_factor is None and t_ntk_factor is None:
+                key = self._cache_key(T, H, W, fps)
+                cached = self._cos_sin_cache.get(key)
+                if cached is not None:
+                    return cached
+
         h_ntk_factor = h_ntk_factor if h_ntk_factor is not None else self.h_ntk_factor
         w_ntk_factor = w_ntk_factor if w_ntk_factor is not None else self.w_ntk_factor
         t_ntk_factor = t_ntk_factor if t_ntk_factor is not None else self.t_ntk_factor
@@ -465,18 +439,17 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         w_spatial_freqs = 1.0 / (w_theta**self.dim_spatial_range)
         temporal_freqs = 1.0 / (t_theta**self.dim_temporal_range)
 
-        B, T, H, W, _ = B_T_H_W_C
-        assert (
-            H <= self.max_h and W <= self.max_w
-        ), f"Input dimensions (H={H}, W={W}) exceed the maximum dimensions (max_h={self.max_h}, max_w={self.max_w})"
+        assert H <= self.max_h and W <= self.max_w, (
+            f"Input dimensions (H={H}, W={W}) exceed the maximum dimensions (max_h={self.max_h}, max_w={self.max_w})"
+        )
         half_emb_h = torch.outer(self.seq[:H], h_spatial_freqs)
         half_emb_w = torch.outer(self.seq[:W], w_spatial_freqs)
 
         if self.enable_fps_modulation:
             uniform_fps = (fps is None) or (fps.min() == fps.max())
-            assert (
-                uniform_fps or B == 1 or T == 1
-            ), "For video batch, batch size should be 1 for non-uniform fps. For image batch, T should be 1"
+            assert uniform_fps or B == 1 or T == 1, (
+                "For video batch, batch size should be 1 for non-uniform fps. For image batch, T should be 1"
+            )
 
             if fps is None:
                 assert T == 1, "T should be 1 for image batch."
@@ -496,7 +469,20 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
             dim=-1,
         )
 
-        return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
+        freqs = em_T_H_W_D.flatten(0, 2).unsqueeze(1).unsqueeze(1).float()
+        result = (torch.cos(freqs), torch.sin(freqs))
+
+        # Cache store
+        if not torch.compiler.is_compiling():
+            if (
+                h_ntk_factor == self.h_ntk_factor
+                and w_ntk_factor == self.w_ntk_factor
+                and t_ntk_factor == self.t_ntk_factor
+            ):
+                key = self._cache_key(T, H, W, fps)
+                self._cos_sin_cache[key] = result
+
+        return result
 
     @property
     def seq_dim(self) -> int:
@@ -577,7 +563,7 @@ class Timesteps(nn.Module):
         cos_emb = torch.cos(emb)
         emb = torch.cat([cos_emb, sin_emb], dim=-1)
 
-        return rearrange(emb.to(dtype=in_dtype), "(b t) d -> b t d", b=timesteps_B_T.shape[0], t=timesteps_B_T.shape[1])
+        return emb.to(dtype=in_dtype).reshape(timesteps_B_T.shape[0], timesteps_B_T.shape[1], -1)
 
 
 class TimestepEmbedding(nn.Module):
@@ -748,8 +734,8 @@ class FinalLayer(nn.Module):
             else:
                 shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
 
-        shift_B_T_1_1_D = rearrange(shift_B_T_D, "b t d -> b t 1 1 d")
-        scale_B_T_1_1_D = rearrange(scale_B_T_D, "b t d -> b t 1 1 d")
+        shift_B_T_1_1_D = shift_B_T_D[:, :, None, None, :]
+        scale_B_T_1_1_D = scale_B_T_D[:, :, None, None, :]
 
         x_B_T_H_W_D = self.layer_norm(x_B_T_H_W_D) * (1 + scale_B_T_1_1_D) + shift_B_T_1_1_D
         x_B_T_H_W_O = self.linear(x_B_T_H_W_D)
@@ -862,7 +848,7 @@ class Block(nn.Module):
         crossattn_emb: torch.Tensor,
         attn_params: attention.AttentionParams,
         use_fp32: bool = False,
-        rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+        rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -882,9 +868,9 @@ class Block(nn.Module):
                 shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
                     self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
                 ).chunk(3, dim=-1)
-                shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D).chunk(
-                    3, dim=-1
-                )
+                shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
+                    self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
+                ).chunk(3, dim=-1)
             else:
                 shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
                     emb_B_T_D
@@ -895,17 +881,17 @@ class Block(nn.Module):
                 shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
 
         # Reshape for broadcasting: (B, T, D) -> (B, T, 1, 1, D)
-        shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
-        scale_self_attn_B_T_1_1_D = rearrange(scale_self_attn_B_T_D, "b t d -> b t 1 1 d")
-        gate_self_attn_B_T_1_1_D = rearrange(gate_self_attn_B_T_D, "b t d -> b t 1 1 d")
+        shift_self_attn_B_T_1_1_D = shift_self_attn_B_T_D[:, :, None, None, :]
+        scale_self_attn_B_T_1_1_D = scale_self_attn_B_T_D[:, :, None, None, :]
+        gate_self_attn_B_T_1_1_D = gate_self_attn_B_T_D[:, :, None, None, :]
 
-        shift_cross_attn_B_T_1_1_D = rearrange(shift_cross_attn_B_T_D, "b t d -> b t 1 1 d")
-        scale_cross_attn_B_T_1_1_D = rearrange(scale_cross_attn_B_T_D, "b t d -> b t 1 1 d")
-        gate_cross_attn_B_T_1_1_D = rearrange(gate_cross_attn_B_T_D, "b t d -> b t 1 1 d")
+        shift_cross_attn_B_T_1_1_D = shift_cross_attn_B_T_D[:, :, None, None, :]
+        scale_cross_attn_B_T_1_1_D = scale_cross_attn_B_T_D[:, :, None, None, :]
+        gate_cross_attn_B_T_1_1_D = gate_cross_attn_B_T_D[:, :, None, None, :]
 
-        shift_mlp_B_T_1_1_D = rearrange(shift_mlp_B_T_D, "b t d -> b t 1 1 d")
-        scale_mlp_B_T_1_1_D = rearrange(scale_mlp_B_T_D, "b t d -> b t 1 1 d")
-        gate_mlp_B_T_1_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 1 d")
+        shift_mlp_B_T_1_1_D = shift_mlp_B_T_D[:, :, None, None, :]
+        scale_mlp_B_T_1_1_D = scale_mlp_B_T_D[:, :, None, None, :]
+        gate_mlp_B_T_1_1_D = gate_mlp_B_T_D[:, :, None, None, :]
 
         B, T, H, W, D = x_B_T_H_W_D.shape
 
@@ -914,34 +900,23 @@ class Block(nn.Module):
 
         # 1. Self-attention
         normalized_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm_self_attn, scale_self_attn_B_T_1_1_D, shift_self_attn_B_T_1_1_D)
-        result = rearrange(
-            self.self_attn(
-                rearrange(normalized_x, "b t h w d -> b (t h w) d"),
-                attn_params,
-                None,
-                rope_emb=rope_emb_L_1_1_D,
-            ),
-            "b (t h w) d -> b t h w d",
-            t=T,
-            h=H,
-            w=W,
-        )
+        x_flat = normalized_x.flatten(1, 3)
+        result = self.self_attn(
+            x_flat,
+            attn_params,
+            None,
+            rope_cos_sin=rope_cos_sin,
+        ).unflatten(1, (T, H, W))
         x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result
 
         # 2. Cross-attention
         normalized_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm_cross_attn, scale_cross_attn_B_T_1_1_D, shift_cross_attn_B_T_1_1_D)
-        result = rearrange(
-            self.cross_attn(
-                rearrange(normalized_x, "b t h w d -> b (t h w) d"),
-                attn_params,
-                crossattn_emb,
-                rope_emb=rope_emb_L_1_1_D,
-            ),
-            "b (t h w) d -> b t h w d",
-            t=T,
-            h=H,
-            w=W,
-        )
+        result = self.cross_attn(
+            normalized_x.flatten(1, 3),
+            attn_params,
+            crossattn_emb,
+            rope_cos_sin=rope_cos_sin,
+        ).unflatten(1, (T, H, W))
         x_B_T_H_W_D = result * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
 
         # 3. MLP
@@ -958,11 +933,11 @@ class Block(nn.Module):
         crossattn_emb: torch.Tensor,
         attn_params: attention.AttentionParams,
         use_fp32: bool = False,
-        rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+        rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.training and self.gradient_checkpointing:
+        if torch.is_grad_enabled() and self.training and self.gradient_checkpointing:
             if self.unsloth_offload_checkpointing:
                 # Unsloth: async non-blocking CPU RAM offload (fastest offload method)
                 return unsloth_checkpoint(
@@ -972,7 +947,7 @@ class Block(nn.Module):
                     crossattn_emb,
                     attn_params,
                     use_fp32,
-                    rope_emb_L_1_1_D,
+                    rope_cos_sin,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
                 )
@@ -994,7 +969,7 @@ class Block(nn.Module):
                     crossattn_emb,
                     attn_params,
                     use_fp32,
-                    rope_emb_L_1_1_D,
+                    rope_cos_sin,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
                     use_reentrant=False,
@@ -1008,7 +983,7 @@ class Block(nn.Module):
                     crossattn_emb,
                     attn_params,
                     use_fp32,
-                    rope_emb_L_1_1_D,
+                    rope_cos_sin,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
                     use_reentrant=False,
@@ -1020,7 +995,7 @@ class Block(nn.Module):
                 crossattn_emb,
                 attn_params,
                 use_fp32,
-                rope_emb_L_1_1_D,
+                rope_cos_sin,
                 adaln_lora_B_T_3D,
                 extra_per_block_pos_emb,
             )
@@ -1218,13 +1193,19 @@ class Anima(nn.Module):
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        from torchvision import transforms
-
         if self.concat_padding_mask:
-            padding_mask = transforms.functional.resize(
-                padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
-            )
-            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1)
+            if padding_mask is None:
+                raise ValueError("padding_mask must be provided when concat_padding_mask is True")
+            if padding_mask.ndim != 4:
+                raise ValueError(f"padding_mask must be 4D (B, 1, H, W), got shape {tuple(padding_mask.shape)}")
+            if padding_mask.shape[-2:] != x_B_C_T_H_W.shape[-2:]:
+                from torchvision import transforms
+                padding_mask = transforms.functional.resize(
+                    padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
+                )
+            # (B, 1, H, W) -> (B, 1, T, H, W) without materializing a repeated tensor
+            padding_mask_B_1_T_H_W = padding_mask.unsqueeze(2).expand(-1, -1, x_B_C_T_H_W.shape[2], -1, -1)
+            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask_B_1_T_H_W], dim=1)
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
 
         if self.extra_per_block_abs_pos_emb:
@@ -1239,12 +1220,17 @@ class Anima(nn.Module):
         return x_B_T_H_W_D, None, extra_pos_emb
 
     def unpatchify(self, x_B_T_H_W_M: torch.Tensor) -> torch.Tensor:
-        x_B_C_Tt_Hp_Wp = rearrange(
-            x_B_T_H_W_M,
-            "B T H W (p1 p2 t C) -> B C (T t) (H p1) (W p2)",
-            p1=self.patch_spatial,
-            p2=self.patch_spatial,
-            t=self.patch_temporal,
+        B, T, H, W, M = x_B_T_H_W_M.shape
+        p1 = self.patch_spatial
+        p2 = self.patch_spatial
+        pt = self.patch_temporal
+        C = M // (p1 * p2 * pt)
+        # (B,T,H,W, p1*p2*pt*C) → (B,T,H,W, p1,p2,pt,C) → (B,C, T,pt, H,p1, W,p2)
+        #                                                    → (B,C, T*pt, H*p1, W*p2)
+        x_B_C_Tt_Hp_Wp = (
+            x_B_T_H_W_M.unflatten(-1, (p1, p2, pt, C))
+            .permute(0, 7, 1, 6, 2, 4, 3, 5)
+            .reshape(B, C, T * pt, H * p1, W * p2)
         )
         return x_B_C_Tt_Hp_Wp
 
@@ -1283,10 +1269,10 @@ class Anima(nn.Module):
         self.prepare_block_swap_before_forward()
         print(f"Anima: Block swap set to forward and backward.")
 
-    def prepare_block_swap_before_forward(self):
+    def prepare_block_swap_before_forward(self, free_cache: bool = True):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
-        self.offloader.prepare_block_devices_before_forward(self.blocks)
+        self.offloader.prepare_block_devices_before_forward(self.blocks, free_cache=free_cache)
 
     def forward_mini_train_dit(
         self,
@@ -1321,7 +1307,7 @@ class Anima(nn.Module):
             if t5_attn_mask is not None:
                 crossattn_emb[~t5_attn_mask.bool()] = 0
 
-        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb = self.prepare_embedded_sequence(
+        x_B_T_H_W_D, rope_cos_sin, extra_pos_emb = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
             fps=fps,
             padding_mask=padding_mask,
@@ -1332,8 +1318,17 @@ class Anima(nn.Module):
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
+        # Cast RoPE cos/sin to the block compute dtype once. Without this, every
+        # block's apply_rotary_pos_emb_qk re-materializes the fp32 cache in bf16.
+        if rope_cos_sin is not None:
+            compute_dtype = x_B_T_H_W_D.dtype
+            rope_cos_sin = (
+                rope_cos_sin[0].to(compute_dtype),
+                rope_cos_sin[1].to(compute_dtype),
+            )
+
         block_kwargs = {
-            "rope_emb_L_1_1_D": rope_emb_L_1_1_D,
+            "rope_cos_sin": rope_cos_sin,
             "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
             "extra_per_block_pos_emb": extra_pos_emb,
         }
@@ -1399,10 +1394,7 @@ class LLMAdapterRMSNorm(nn.Module):
     def forward(self, hidden_states):
         variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-
-        if self.weight.dtype in [torch.float16, torch.bfloat16]:
-            hidden_states = hidden_states.to(self.weight.dtype)
-
+        hidden_states = hidden_states.to(self.weight.dtype)
         return self.weight * hidden_states
 
 
