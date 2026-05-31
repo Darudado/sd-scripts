@@ -4,9 +4,7 @@
 import math
 from typing import Any, Optional, Tuple
 
-import numpy as np
 import torch
-from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
 import torch.nn.functional as F
@@ -461,9 +459,9 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
 
         em_T_H_W_D = torch.cat(
             [
-                repeat(half_emb_t, "t d -> t h w d", h=H, w=W),
-                repeat(half_emb_h, "h d -> t h w d", t=T, w=W),
-                repeat(half_emb_w, "w d -> t h w d", t=T, h=H),
+                half_emb_t[:, None, None, :].expand(-1, H, W, -1),
+                half_emb_h[None, :, None, :].expand(T, -1, W, -1),
+                half_emb_w[None, None, :, :].expand(T, H, -1, -1),
             ]
             * 2,
             dim=-1,
@@ -527,16 +525,16 @@ class LearnablePosEmbAxis(VideoPositionEmb):
             emb_w_W = self.pos_emb_w[:W]
             emb_t_T = self.pos_emb_t[:T]
             emb = (
-                repeat(emb_t_T, "t d-> b t h w d", b=B, h=H, w=W)
-                + repeat(emb_h_H, "h d-> b t h w d", b=B, t=T, w=W)
-                + repeat(emb_w_W, "w d-> b t h w d", b=B, t=T, h=H)
+                emb_t_T[None, :, None, None, :].expand(B, -1, H, W, -1)
+                + emb_h_H[None, None, :, None, :].expand(B, T, -1, W, -1)
+                + emb_w_W[None, None, None, :, :].expand(B, T, H, -1, -1)
             )
             assert list(emb.shape)[:4] == [B, T, H, W], f"bad shape: {list(emb.shape)[:4]} != {B, T, H, W}"
         else:
             raise ValueError(f"Unknown interpolation method {self.interpolation}")
 
         norm = torch.linalg.vector_norm(emb, dim=-1, keepdim=True, dtype=torch.float32)
-        norm = torch.add(1e-6, norm, alpha=np.sqrt(norm.numel() / emb.numel()))
+        norm = torch.add(1e-6, norm, alpha=math.sqrt(norm.numel() / emb.numel()))
         return emb / norm.to(emb.dtype)
 
 
@@ -557,7 +555,7 @@ class Timesteps(nn.Module):
         exponent = exponent / (half_dim - 0.0)
 
         emb = torch.exp(exponent)
-        emb = timesteps[:, None].float() * emb[None, :]
+        emb = timesteps[:, None] * emb[None, :]
 
         sin_emb = torch.sin(emb)
         cos_emb = torch.cos(emb)
@@ -602,33 +600,6 @@ class TimestepEmbedding(nn.Module):
             emb_B_T_D = emb
 
         return emb_B_T_D, adaln_lora_B_T_3D
-
-
-# Commented out Fourier Features (not used in Anima). Kept for reference.
-# class FourierFeatures(nn.Module):
-#     """Fourier feature transform: [B] -> [B, D]."""
-
-#     def __init__(self, num_channels: int, bandwidth: int = 1, normalize: bool = False):
-#         super().__init__()
-#         self.register_buffer("freqs", 2 * np.pi * bandwidth * torch.randn(num_channels), persistent=True)
-#         self.register_buffer("phases", 2 * np.pi * torch.rand(num_channels), persistent=True)
-#         self.gain = np.sqrt(2) if normalize else 1
-#         self.bandwidth = bandwidth
-#         self.num_channels = num_channels
-#         self.reset_parameters()
-
-#     def reset_parameters(self) -> None:
-#         generator = torch.Generator()
-#         generator.manual_seed(0)
-#         self.freqs = 2 * np.pi * self.bandwidth * torch.randn(self.num_channels, generator=generator).to(self.freqs.device)
-#         self.phases = 2 * np.pi * torch.rand(self.num_channels, generator=generator).to(self.freqs.device)
-
-#     def forward(self, x: torch.Tensor, gain: float = 1.0) -> torch.Tensor:
-#         in_dtype = x.dtype
-#         x = x.to(torch.float32).ger(self.freqs.to(torch.float32)).add(self.phases.to(torch.float32))
-#         x = x.cos().mul(self.gain * gain).to(in_dtype)
-#         return x
-
 
 # Patch Embedding
 class PatchEmbed(nn.Module):
@@ -904,7 +875,7 @@ class Block(nn.Module):
         result = self.self_attn(
             x_flat,
             attn_params,
-            None,
+            x_flat,
             rope_cos_sin=rope_cos_sin,
         ).unflatten(1, (T, H, W))
         x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result
@@ -1457,27 +1428,110 @@ class LLMAdapterAttention(nn.Module):
 
         self.o_proj = nn.Linear(inner_dim, query_dim, bias=False)
 
-    def forward(self, x, mask=None, context=None, position_embeddings=None, position_embeddings_context=None):
+    def forward(
+        self,
+        x,
+        q_mask=None,
+        kv_mask=None,
+        context=None,
+        position_embeddings=None,
+        position_embeddings_context=None,
+    ):
+        """
+        Args:
+            x: Query input [B, L_q, D].
+            q_mask: Optional 2-D bool mask [B, L_q] — True = valid token.
+            kv_mask: Optional 2-D bool mask [B, L_kv] — True = valid token.
+            context: Key/Value input [B, L_kv, D]. Defaults to x (self-attention).
+            position_embeddings: (cos, sin) for query RoPE.
+            position_embeddings_context: (cos, sin) for key RoPE.
+        """
         context = x if context is None else context
         input_shape = x.shape[:-1]
         q_shape = (*input_shape, self.n_heads, self.head_dim)
         context_shape = context.shape[:-1]
         kv_shape = (*context_shape, self.n_heads, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(x).view(q_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(context).view(kv_shape)).transpose(1, 2)
-        value_states = self.v_proj(context).view(kv_shape).transpose(1, 2)
+        # [B, L, H, D] layout — native for flash_attn
+        query_states = self.q_norm(self.q_proj(x).view(q_shape))
+        key_states = self.k_norm(self.k_proj(context).view(kv_shape))
+        value_states = self.v_proj(context).view(kv_shape)
 
         if position_embeddings is not None:
             assert position_embeddings_context is not None
+            # RoPE expects [B, H, L, D] layout
             cos, sin = position_embeddings
-            query_states = _adapter_apply_rotary_pos_emb(query_states, cos, sin)
+            query_states = _adapter_apply_rotary_pos_emb(
+                query_states.transpose(1, 2), cos, sin
+            ).transpose(1, 2)
             cos, sin = position_embeddings_context
-            key_states = _adapter_apply_rotary_pos_emb(key_states, cos, sin)
+            key_states = _adapter_apply_rotary_pos_emb(
+                key_states.transpose(1, 2), cos, sin
+            ).transpose(1, 2)
 
-        attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
+        can_use_flash = (
+            attention.flash_attn_varlen_func is not None
+            and query_states.dtype in (torch.float16, torch.bfloat16)
+        )
 
-        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        if can_use_flash and q_mask is None and kv_mask is None:
+            # No masking — simple flash attention, [B, L, H, D] layout
+            attn_output = attention.flash_attn_func(
+                query_states, key_states, value_states
+            )
+        elif can_use_flash:
+            # Varlen flash attention: pack valid tokens, attend, unpack
+            B, L_q = query_states.shape[:2]
+            L_kv = key_states.shape[1]
+
+            eff_q_mask = (
+                q_mask
+                if q_mask is not None
+                else query_states.new_ones(B, L_q, dtype=torch.bool)
+            )
+            eff_kv_mask = (
+                kv_mask
+                if kv_mask is not None
+                else key_states.new_ones(B, L_kv, dtype=torch.bool)
+            )
+
+            q_seqlens = eff_q_mask.sum(dim=1, dtype=torch.int32)
+            kv_seqlens = eff_kv_mask.sum(dim=1, dtype=torch.int32)
+
+            cu_seqlens_q = F.pad(q_seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+            cu_seqlens_kv = F.pad(kv_seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+
+            # Pack by removing padding: [B, L, H, D] -> [total_valid, H, D]
+            q_packed = query_states[eff_q_mask]
+            k_packed = key_states[eff_kv_mask]
+            v_packed = value_states[eff_kv_mask]
+
+            out_packed = attention.flash_attn_varlen_func(
+                q_packed,
+                k_packed,
+                v_packed,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                L_q,
+                L_kv,
+            )
+
+            # Unpack: [total_valid_q, H, D] -> [B, L_q, H, D]
+            attn_output = query_states.new_zeros(B, L_q, self.n_heads, self.head_dim)
+            attn_output[eff_q_mask] = out_packed
+        else:
+            # Fallback to PyTorch SDPA: needs [B, H, L, D] layout
+            # Expand kv_mask to 4D for SDPA broadcasting: [B, L] -> [B, 1, 1, L]
+            sdpa_mask = kv_mask[:, None, None, :] if kv_mask is not None else None
+            attn_output = F.scaled_dot_product_attention(
+                query_states.transpose(1, 2),
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                attn_mask=sdpa_mask,
+            )
+            attn_output = attn_output.transpose(1, 2)
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
 
@@ -1525,7 +1579,8 @@ class LLMAdapterTransformerBlock(nn.Module):
             normed = self.norm_self_attn(x)
             attn_out = self.self_attn(
                 normed,
-                mask=target_attention_mask,
+                q_mask=target_attention_mask,
+                kv_mask=target_attention_mask,
                 position_embeddings=position_embeddings,
                 position_embeddings_context=position_embeddings,
             )
@@ -1534,7 +1589,8 @@ class LLMAdapterTransformerBlock(nn.Module):
         normed = self.norm_cross_attn(x)
         attn_out = self.cross_attn(
             normed,
-            mask=source_attention_mask,
+            q_mask=target_attention_mask,
+            kv_mask=source_attention_mask,
             context=context,
             position_embeddings=position_embeddings,
             position_embeddings_context=position_embeddings_context,
@@ -1577,15 +1633,17 @@ class LLMAdapter(nn.Module):
         self.norm = LLMAdapterRMSNorm(target_dim)
 
     def forward(self, source_hidden_states, target_input_ids, target_attention_mask=None, source_attention_mask=None):
+        # Keep masks as 2D [B, L] bool tensors — the attention layer handles
+        # expansion to 4D for SDPA or packing for flash_attn_varlen_func.
         if target_attention_mask is not None:
             target_attention_mask = target_attention_mask.to(torch.bool)
-            if target_attention_mask.ndim == 2:
-                target_attention_mask = target_attention_mask.unsqueeze(1).unsqueeze(1)
+            if target_attention_mask.ndim == 4:
+                target_attention_mask = target_attention_mask.squeeze(1).squeeze(1)
 
         if source_attention_mask is not None:
             source_attention_mask = source_attention_mask.to(torch.bool)
-            if source_attention_mask.ndim == 2:
-                source_attention_mask = source_attention_mask.unsqueeze(1).unsqueeze(1)
+            if source_attention_mask.ndim == 4:
+                source_attention_mask = source_attention_mask.squeeze(1).squeeze(1)
 
         x = self.in_proj(self.embed(target_input_ids))
         context = source_hidden_states
@@ -1604,57 +1662,3 @@ class LLMAdapter(nn.Module):
             )
         return self.norm(self.out_proj(x))
 
-
-# Not used currently, but kept for reference
-
-# def get_dit_config(state_dict, key_prefix=""):
-#     """Derive DiT configuration from state_dict weight shapes."""
-#     dit_config = {}
-#     dit_config["max_img_h"] = 512
-#     dit_config["max_img_w"] = 512
-#     dit_config["max_frames"] = 128
-#     concat_padding_mask = True
-#     dit_config["in_channels"] = (state_dict["{}x_embedder.proj.1.weight".format(key_prefix)].shape[1] // 4) - int(
-#         concat_padding_mask
-#     )
-#     dit_config["out_channels"] = 16
-#     dit_config["patch_spatial"] = 2
-#     dit_config["patch_temporal"] = 1
-#     dit_config["model_channels"] = state_dict["{}x_embedder.proj.1.weight".format(key_prefix)].shape[0]
-#     dit_config["concat_padding_mask"] = concat_padding_mask
-#     dit_config["crossattn_emb_channels"] = 1024
-#     dit_config["pos_emb_cls"] = "rope3d"
-#     dit_config["pos_emb_learnable"] = True
-#     dit_config["pos_emb_interpolation"] = "crop"
-#     dit_config["min_fps"] = 1
-#     dit_config["max_fps"] = 30
-
-#     dit_config["use_adaln_lora"] = True
-#     dit_config["adaln_lora_dim"] = 256
-#     if dit_config["model_channels"] == 2048:
-#         dit_config["num_blocks"] = 28
-#         dit_config["num_heads"] = 16
-#     elif dit_config["model_channels"] == 5120:
-#         dit_config["num_blocks"] = 36
-#         dit_config["num_heads"] = 40
-#     elif dit_config["model_channels"] == 1280:
-#         dit_config["num_blocks"] = 20
-#         dit_config["num_heads"] = 20
-
-#     if dit_config["in_channels"] == 16:
-#         dit_config["extra_per_block_abs_pos_emb"] = False
-#         dit_config["rope_h_extrapolation_ratio"] = 4.0
-#         dit_config["rope_w_extrapolation_ratio"] = 4.0
-#         dit_config["rope_t_extrapolation_ratio"] = 1.0
-#     elif dit_config["in_channels"] == 17:
-#         dit_config["extra_per_block_abs_pos_emb"] = False
-#         dit_config["rope_h_extrapolation_ratio"] = 3.0
-#         dit_config["rope_w_extrapolation_ratio"] = 3.0
-#         dit_config["rope_t_extrapolation_ratio"] = 1.0
-
-#     dit_config["extra_h_extrapolation_ratio"] = 1.0
-#     dit_config["extra_w_extrapolation_ratio"] = 1.0
-#     dit_config["extra_t_extrapolation_ratio"] = 1.0
-#     dit_config["rope_enable_fps_modulation"] = False
-
-#     return dit_config

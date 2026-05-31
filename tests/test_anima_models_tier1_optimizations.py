@@ -16,6 +16,7 @@ import inspect
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -33,7 +34,7 @@ from library.anima_models import (
     Anima,
     LLMAdapter,
 )
-from einops import rearrange
+from einops import rearrange, repeat
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -596,6 +597,425 @@ class TestJointRoPEAndCaching:
 
         # Both calls should produce identical output (caching ensures same RoPE)
         torch.testing.assert_close(out1, out2)
+
+
+# ──────────────────────────────────────────────────────────────
+# Tier 2: Native torch ops replace einops repeat
+# ──────────────────────────────────────────────────────────────
+class TestRepeatReplacement:
+    """Verify einops repeat replaced with native unsqueeze+expand."""
+
+    def test_generate_embeddings_no_repeat(self):
+        """VideoRopePosition3DEmb.generate_embeddings should not use einops repeat."""
+        src = inspect.getsource(VideoRopePosition3DEmb.generate_embeddings)
+        lines = [
+            l for l in src.split("\n")
+            if "repeat(" in l and not l.strip().startswith("#")
+        ]
+        assert len(lines) == 0, (
+            f"generate_embeddings should use unsqueeze/expand, not repeat. Found: {lines}"
+        )
+
+    def test_rope_expand_matches_repeat(self):
+        """unsqueeze+expand should produce the same result as einops repeat for RoPE."""
+        T, H, W, D = 2, 4, 6, 8
+        half_emb_t = torch.randn(T, D, device=DEVICE, dtype=DTYPE)
+        half_emb_h = torch.randn(H, D, device=DEVICE, dtype=DTYPE)
+        half_emb_w = torch.randn(W, D, device=DEVICE, dtype=DTYPE)
+
+        # einops reference
+        ref_t = repeat(half_emb_t, "t d -> t h w d", h=H, w=W)
+        ref_h = repeat(half_emb_h, "h d -> t h w d", t=T, w=W)
+        ref_w = repeat(half_emb_w, "w d -> t h w d", t=T, h=H)
+
+        # Native ops (matching the implementation)
+        opt_t = half_emb_t[:, None, None, :].expand(-1, H, W, -1)
+        opt_h = half_emb_h[None, :, None, :].expand(T, -1, W, -1)
+        opt_w = half_emb_w[None, None, :, :].expand(T, H, -1, -1)
+
+        torch.testing.assert_close(opt_t, ref_t)
+        torch.testing.assert_close(opt_h, ref_h)
+        torch.testing.assert_close(opt_w, ref_w)
+
+    def test_rope_expand_shape(self):
+        """Expanded tensors should have shape (T, H, W, D)."""
+        T, H, W, D = 3, 5, 7, 12
+        half_emb_t = torch.randn(T, D, device=DEVICE, dtype=DTYPE)
+        opt_t = half_emb_t[:, None, None, :].expand(-1, H, W, -1)
+        assert opt_t.shape == (T, H, W, D), f"Expected {(T, H, W, D)}, got {opt_t.shape}"
+
+    def test_rope_expand_is_view(self):
+        """expand should return a view, not a copy (no extra memory)."""
+        T, H, W, D = 2, 4, 6, 8
+        half_emb_t = torch.randn(T, D, device=DEVICE, dtype=DTYPE)
+        opt_t = half_emb_t[:, None, None, :].expand(-1, H, W, -1)
+        # expand returns a view: storage should be shared
+        assert opt_t.storage().data_ptr() == half_emb_t.storage().data_ptr(), (
+            "expand should return a view sharing the same storage"
+        )
+
+    def test_generate_embeddings_with_expand_matches_reference(self):
+        """Full generate_embeddings output should be numerically identical after repeat→expand."""
+        model = VideoRopePosition3DEmb(
+            head_dim=64, len_h=16, len_w=16, len_t=4,
+            base_fps=24, enable_fps_modulation=False,
+        ).to(DEVICE, DTYPE)
+
+        shape = torch.Size([1, 4, 8, 8, 64])
+
+        # Clear cache so the computation runs fresh
+        model._cos_sin_cache.clear()
+
+        # Get the optimized result
+        cos_opt, sin_opt = model.generate_embeddings(shape)
+
+        # Reconstruct using einops repeat as reference
+        model._cos_sin_cache.clear()
+
+        # Manually compute reference
+        B, T, H, W, _ = shape
+        h_spatial_freqs = 1.0 / (10000.0 ** model.dim_spatial_range)
+        w_spatial_freqs = 1.0 / (10000.0 ** model.dim_spatial_range)
+        temporal_freqs = 1.0 / (10000.0 ** model.dim_temporal_range)
+
+        half_emb_h = torch.outer(model.seq[:H], h_spatial_freqs)
+        half_emb_w = torch.outer(model.seq[:W], w_spatial_freqs)
+        half_emb_t = torch.outer(model.seq[:T], temporal_freqs)
+
+        ref_em = torch.cat(
+            [
+                repeat(half_emb_t, "t d -> t h w d", h=H, w=W),
+                repeat(half_emb_h, "h d -> t h w d", t=T, w=W),
+                repeat(half_emb_w, "w d -> t h w d", t=T, h=H),
+            ]
+            * 2,
+            dim=-1,
+        )
+        ref_freqs = ref_em.flatten(0, 2).unsqueeze(1).unsqueeze(1).float()
+        ref_cos = torch.cos(ref_freqs)
+        ref_sin = torch.sin(ref_freqs)
+
+        torch.testing.assert_close(cos_opt, ref_cos)
+        torch.testing.assert_close(sin_opt, ref_sin)
+
+
+class TestLearnablePosEmbRepeatReplacement:
+    """Verify LearnablePosEmbAxis uses native ops instead of einops repeat."""
+
+    def test_learnable_pos_emb_no_repeat(self):
+        """LearnablePosEmbAxis.generate_embeddings should not use einops repeat."""
+        src = inspect.getsource(Anima)
+        # Check generate_embeddings in the source (it's defined in LearnablePosEmbAxis)
+        from library.anima_models import LearnablePosEmbAxis
+        src = inspect.getsource(LearnablePosEmbAxis.generate_embeddings)
+        lines = [
+            l for l in src.split("\n")
+            if "repeat(" in l and not l.strip().startswith("#")
+        ]
+        assert len(lines) == 0, (
+            f"LearnablePosEmbAxis.generate_embeddings should use unsqueeze/expand, not repeat. Found: {lines}"
+        )
+
+    def test_learnable_pos_emb_expand_matches_repeat(self):
+        """unsqueeze+expand should produce the same result as einops repeat for learnable pos emb."""
+        B, T, H, W, D = 2, 3, 4, 5, 16
+        emb_t_T = torch.randn(T, D, device=DEVICE, dtype=DTYPE)
+        emb_h_H = torch.randn(H, D, device=DEVICE, dtype=DTYPE)
+        emb_w_W = torch.randn(W, D, device=DEVICE, dtype=DTYPE)
+
+        # einops reference
+        ref = (
+            repeat(emb_t_T, "t d-> b t h w d", b=B, h=H, w=W)
+            + repeat(emb_h_H, "h d-> b t h w d", b=B, t=T, w=W)
+            + repeat(emb_w_W, "w d-> b t h w d", b=B, t=T, h=H)
+        )
+
+        # Native ops (matching the implementation)
+        opt = (
+            emb_t_T[None, :, None, None, :].expand(B, -1, H, W, -1)
+            + emb_h_H[None, None, :, None, :].expand(B, T, -1, W, -1)
+            + emb_w_W[None, None, None, :, :].expand(B, T, H, -1, -1)
+        )
+
+        torch.testing.assert_close(opt, ref)
+        assert opt.shape == (B, T, H, W, D)
+
+
+class TestNoEinopsRepeatImport:
+    """Verify einops repeat is no longer imported in the module."""
+
+    def test_no_repeat_in_module_imports(self):
+        """library.anima_models should not import repeat from einops."""
+        import library.anima_models as mod
+        src = inspect.getsource(mod)
+        # Check top-level imports only (not inside functions/comments)
+        import_lines = [
+            l for l in src.split("\n")
+            if l.strip().startswith(("from einops import", "import einops"))
+            and "repeat" in l
+            and not l.strip().startswith("#")
+        ]
+        assert len(import_lines) == 0, (
+            f"anima_models should not import repeat from einops. Found: {import_lines}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# Tier 2: Self-attention passes explicit context
+# ──────────────────────────────────────────────────────────────
+class TestSelfAttnExplicitContext:
+    """Verify Block._forward passes x_flat as self-attention context instead of None."""
+
+    def test_self_attn_receives_explicit_context(self):
+        """Block._forward should pass x_flat, not None, as context to self_attn."""
+        src = inspect.getsource(Block._forward)
+        # Find the self_attn call
+        in_self_attn_block = False
+        found_none_context = False
+        for line in src.split("\n"):
+            if "self.self_attn(" in line:
+                in_self_attn_block = True
+            if in_self_attn_block:
+                stripped = line.strip().rstrip(",")
+                # Check for 'None' as a positional arg (context) after x_flat
+                if stripped == "None":
+                    found_none_context = True
+                if ")" in line:
+                    break
+        assert not found_none_context, (
+            "Block._forward should pass x_flat as context to self_attn, not None"
+        )
+
+    def test_self_attn_explicit_context_matches_none_fallback(self):
+        """Passing x_flat explicitly should produce the same output as passing None."""
+        from library.anima_models import Attention
+
+        B, L, D, H = 1, 16, 32, 4
+        head_dim = D // H
+        attn = Attention(D, None, H, head_dim, qkv_format="bshd").to(DEVICE, DTYPE)
+        attn.eval()
+
+        x = torch.randn(B, L, D, device=DEVICE, dtype=DTYPE)
+        from library import attention
+        attn_params = attention.AttentionParams.create_attention_params("torch", False)
+
+        with torch.no_grad():
+            # With None context (old way)
+            q1, k1, v1 = attn.compute_qkv(x, None)
+            # With explicit context (new way)
+            q2, k2, v2 = attn.compute_qkv(x, x)
+
+        torch.testing.assert_close(q1, q2)
+        torch.testing.assert_close(k1, k2)
+        torch.testing.assert_close(v1, v2)
+
+
+# ──────────────────────────────────────────────────────────────
+# Tier 2: LLMAdapter flash_attn support
+# ──────────────────────────────────────────────────────────────
+class TestLLMAdapterFlashAttn:
+    """Verify LLMAdapterAttention supports flash_attn with varlen packing."""
+
+    def test_attention_signature_uses_q_mask_kv_mask(self):
+        """LLMAdapterAttention.forward should accept q_mask and kv_mask parameters."""
+        from library.anima_models import LLMAdapterAttention
+        sig = inspect.signature(LLMAdapterAttention.forward)
+        param_names = list(sig.parameters.keys())
+        assert "q_mask" in param_names, f"Expected 'q_mask' parameter, got {param_names}"
+        assert "kv_mask" in param_names, f"Expected 'kv_mask' parameter, got {param_names}"
+        # Old 'mask' parameter should be gone
+        assert "mask" not in param_names, f"Old 'mask' parameter should be removed, got {param_names}"
+
+    def test_no_mask_sdpa_output_shape(self):
+        """LLMAdapterAttention should produce correct output shape without masks."""
+        from library.anima_models import LLMAdapterAttention
+        B, L, D, H = 2, 16, 32, 4
+        head_dim = D // H
+        attn = LLMAdapterAttention(D, D, H, head_dim).to(DEVICE, DTYPE)
+        attn.eval()
+
+        x = torch.randn(B, L, D, device=DEVICE, dtype=DTYPE)
+        with torch.no_grad():
+            out = attn(x)
+        assert out.shape == (B, L, D), f"Expected {(B, L, D)}, got {out.shape}"
+
+    def test_2d_mask_forward_shape(self):
+        """LLMAdapterAttention should accept 2D bool masks and produce correct output."""
+        from library.anima_models import LLMAdapterAttention
+        B, L_q, L_kv, D, H = 2, 16, 20, 32, 4
+        head_dim = D // H
+        attn = LLMAdapterAttention(D, D, H, head_dim).to(DEVICE, DTYPE)
+        attn.eval()
+
+        x = torch.randn(B, L_q, D, device=DEVICE, dtype=DTYPE)
+        context = torch.randn(B, L_kv, D, device=DEVICE, dtype=DTYPE)
+        q_mask = torch.ones(B, L_q, device=DEVICE, dtype=torch.bool)
+        kv_mask = torch.ones(B, L_kv, device=DEVICE, dtype=torch.bool)
+        # Mask out last 5 tokens of KV
+        kv_mask[:, -5:] = False
+
+        with torch.no_grad():
+            out = attn(x, q_mask=q_mask, kv_mask=kv_mask, context=context)
+        assert out.shape == (B, L_q, D), f"Expected {(B, L_q, D)}, got {out.shape}"
+
+    def test_2d_mask_with_rope(self):
+        """LLMAdapterAttention with RoPE and 2D masks should produce correct output."""
+        from library.anima_models import LLMAdapterAttention, AdapterRotaryEmbedding
+        B, L_q, L_kv, D, H = 2, 16, 20, 32, 4
+        head_dim = D // H
+        attn = LLMAdapterAttention(D, D, H, head_dim).to(DEVICE, DTYPE)
+        rope = AdapterRotaryEmbedding(head_dim).to(DEVICE, DTYPE)
+        attn.eval()
+
+        x = torch.randn(B, L_q, D, device=DEVICE, dtype=DTYPE)
+        context = torch.randn(B, L_kv, D, device=DEVICE, dtype=DTYPE)
+
+        pos_ids_q = torch.arange(L_q, device=DEVICE).unsqueeze(0)
+        pos_ids_kv = torch.arange(L_kv, device=DEVICE).unsqueeze(0)
+        pos_emb_q = rope(x, pos_ids_q)
+        pos_emb_kv = rope(x, pos_ids_kv)
+
+        q_mask = torch.ones(B, L_q, device=DEVICE, dtype=torch.bool)
+        kv_mask = torch.ones(B, L_kv, device=DEVICE, dtype=torch.bool)
+        kv_mask[:, -3:] = False
+
+        with torch.no_grad():
+            out = attn(
+                x, q_mask=q_mask, kv_mask=kv_mask, context=context,
+                position_embeddings=pos_emb_q,
+                position_embeddings_context=pos_emb_kv,
+            )
+        assert out.shape == (B, L_q, D)
+
+    def test_self_attention_with_q_mask_kv_mask(self):
+        """Self-attention (context=None) with masks should work."""
+        from library.anima_models import LLMAdapterAttention
+        B, L, D, H = 2, 16, 32, 4
+        head_dim = D // H
+        attn = LLMAdapterAttention(D, D, H, head_dim).to(DEVICE, DTYPE)
+        attn.eval()
+
+        x = torch.randn(B, L, D, device=DEVICE, dtype=DTYPE)
+        mask = torch.ones(B, L, device=DEVICE, dtype=torch.bool)
+        mask[:, -4:] = False
+
+        with torch.no_grad():
+            out = attn(x, q_mask=mask, kv_mask=mask)
+        assert out.shape == (B, L, D)
+
+    def test_mask_zeroing_effect(self):
+        """Masked-out KV tokens should produce same result as manual SDPA masking."""
+        from library.anima_models import LLMAdapterAttention
+        B, L_q, L_kv, D, H = 1, 4, 8, 32, 4
+        head_dim = D // H
+        attn = LLMAdapterAttention(D, D, H, head_dim).to(DEVICE, DTYPE)
+        attn.eval()
+
+        x = torch.randn(B, L_q, D, device=DEVICE, dtype=DTYPE)
+        context = torch.randn(B, L_kv, D, device=DEVICE, dtype=DTYPE)
+        kv_mask = torch.ones(B, L_kv, device=DEVICE, dtype=torch.bool)
+        kv_mask[:, -2:] = False  # mask out last 2 tokens
+
+        with torch.no_grad():
+            # Optimized path: uses q_mask/kv_mask with SDPA fallback
+            out_optimized = attn(x, kv_mask=kv_mask, context=context)
+
+            # Reference: compute manually with SDPA using the same 4D mask
+            q = attn.q_norm(attn.q_proj(x).view(B, L_q, H, head_dim)).transpose(1, 2)
+            k = attn.k_norm(attn.k_proj(context).view(B, L_kv, H, head_dim)).transpose(1, 2)
+            v = attn.v_proj(context).view(B, L_kv, H, head_dim).transpose(1, 2)
+            sdpa_mask_4d = kv_mask[:, None, None, :]  # [B, 1, 1, L_kv]
+            ref_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=sdpa_mask_4d)
+            ref_out = ref_out.transpose(1, 2).reshape(B, L_q, D).contiguous()
+            ref_out = attn.o_proj(ref_out)
+
+        torch.testing.assert_close(out_optimized, ref_out, atol=1e-5, rtol=1e-4)
+
+
+class TestLLMAdapterTransformerBlockMaskParams:
+    """Verify LLMAdapterTransformerBlock passes q_mask/kv_mask correctly."""
+
+    def test_block_uses_q_mask_kv_mask(self):
+        """LLMAdapterTransformerBlock.forward should pass q_mask and kv_mask to attention."""
+        from library.anima_models import LLMAdapterTransformerBlock
+        src = inspect.getsource(LLMAdapterTransformerBlock.forward)
+        assert "q_mask=" in src, "Expected q_mask= parameter in forward"
+        assert "kv_mask=" in src, "Expected kv_mask= parameter in forward"
+        # Old 'mask=' should not appear as keyword argument to attention calls.
+        # Only check lines that are attention method calls (self.self_attn or self.cross_attn).
+        import re
+        call_lines = [
+            l.strip() for l in src.split("\n")
+            if re.search(r'\bmask=', l)
+            and "q_mask" not in l
+            and "kv_mask" not in l
+            and not l.strip().startswith("#")
+            and not l.strip().startswith("def ")
+            and not l.strip().endswith("None,")  # exclude function def default params
+            and not l.strip().endswith("None")    # exclude function def default params
+        ]
+        assert len(call_lines) == 0, f"Old 'mask=' keyword arg in attention calls should be removed. Found: {call_lines}"
+
+
+class TestLLMAdapterMaskHandling:
+    """Verify LLMAdapter keeps masks as 2D bool tensors."""
+
+    def test_adapter_keeps_masks_2d(self):
+        """LLMAdapter.forward should keep masks as 2D, not expand to 4D."""
+        from library.anima_models import LLMAdapter
+        src = inspect.getsource(LLMAdapter.forward)
+        # Should not have unsqueeze(1).unsqueeze(1) pattern
+        assert "unsqueeze(1).unsqueeze(1)" not in src, (
+            "LLMAdapter should not expand masks to 4D — keep them as 2D bool tensors"
+        )
+
+    def test_adapter_squeezes_4d_to_2d(self):
+        """LLMAdapter.forward should squeeze 4D masks to 2D for compatibility."""
+        from library.anima_models import LLMAdapter
+        src = inspect.getsource(LLMAdapter.forward)
+        assert "squeeze(1).squeeze(1)" in src, (
+            "LLMAdapter should squeeze 4D masks to 2D for backward compatibility"
+        )
+
+    def test_adapter_forward_with_2d_masks(self):
+        """Full LLMAdapter forward with 2D bool masks should produce correct output."""
+        from library.anima_models import LLMAdapter
+        B, L_target, L_source, D = 2, 12, 20, 32
+        adapter = LLMAdapter(
+            source_dim=D, target_dim=D, model_dim=D,
+            num_layers=2, num_heads=4, self_attn=True,
+        ).to(DEVICE, DTYPE)
+        adapter.eval()
+
+        source = torch.randn(B, L_source, D, device=DEVICE, dtype=DTYPE)
+        target_ids = torch.randint(0, 32128, (B, L_target), device=DEVICE)
+        target_mask = torch.ones(B, L_target, device=DEVICE, dtype=torch.bool)
+        source_mask = torch.ones(B, L_source, device=DEVICE, dtype=torch.bool)
+        source_mask[:, -5:] = False
+
+        with torch.no_grad():
+            out = adapter(source, target_ids, target_mask, source_mask)
+        assert out.shape == (B, L_target, D), f"Expected {(B, L_target, D)}, got {out.shape}"
+
+    def test_adapter_forward_with_4d_masks_compat(self):
+        """LLMAdapter should handle 4D masks (backward compatibility) by squeezing."""
+        from library.anima_models import LLMAdapter
+        B, L_target, L_source, D = 1, 8, 16, 32
+        adapter = LLMAdapter(
+            source_dim=D, target_dim=D, model_dim=D,
+            num_layers=2, num_heads=4, self_attn=True,
+        ).to(DEVICE, DTYPE)
+        adapter.eval()
+
+        source = torch.randn(B, L_source, D, device=DEVICE, dtype=DTYPE)
+        target_ids = torch.randint(0, 32128, (B, L_target), device=DEVICE)
+        # 4D masks (old format)
+        target_mask_4d = torch.ones(B, 1, 1, L_target, device=DEVICE, dtype=torch.bool)
+        source_mask_4d = torch.ones(B, 1, 1, L_source, device=DEVICE, dtype=torch.bool)
+
+        with torch.no_grad():
+            out = adapter(source, target_ids, target_mask_4d, source_mask_4d)
+        assert out.shape == (B, L_target, D)
 
 
 if __name__ == "__main__":
