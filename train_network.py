@@ -42,6 +42,7 @@ from library.config_util import (
 )
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
+from library.adaptive_timestep_sampler import TimestepSamplerNetwork, AdaptiveTimestepManager
 from library.custom_train_functions import (
     apply_snr_weight,
     get_weighted_text_embeddings,
@@ -97,6 +98,13 @@ class NetworkTrainer:
         # LoRA² adaptive rank regularization config
         self.lora2_enabled = False
         self.lora2_lambda_r = 1e-4
+
+        # Adaptive Non-uniform Timestep Sampling
+        self.adaptive_manager = None
+        self._adaptive_last_latents = None
+        self._adaptive_last_noise = None
+        self._adaptive_last_text_conds = None
+        self._adaptive_losses_before = None
 
         # Focal Frequency Loss config
         self.ffl_enabled = False
@@ -371,8 +379,18 @@ class NetworkTrainer:
         if hasattr(self, "get_flow_pixel_counts"):
             pixel_counts = self.get_flow_pixel_counts(args, batch, latents.device)
 
+        # Adaptive timestep sampling: use Beta distribution sampler if enabled
+        adaptive_fixed_timesteps = fixed_timesteps
+        if is_train and self.adaptive_manager is not None and fixed_timesteps is None:
+            adaptive_fixed_timesteps = self.adaptive_manager.sample_timesteps(
+                latents, noise_scheduler.config.num_train_timesteps
+            )
+            # Store data for Algorithm 2 (delta computation after optimizer step)
+            self._adaptive_last_latents = latents.detach()
+            self._adaptive_last_noise = noise.detach()
+
         noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
-            args, noise_scheduler, latents, fixed_timesteps=fixed_timesteps, is_train=is_train, pixel_counts=pixel_counts
+            args, noise_scheduler, latents, fixed_timesteps=adaptive_fixed_timesteps, is_train=is_train, pixel_counts=pixel_counts
         )
 
         # Store noisy latents for LWD wavelet masking (used in process_batch)
@@ -471,6 +489,88 @@ class NetworkTrainer:
         if args.debiased_estimation_loss:
             loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
         return loss
+
+
+    def compute_adaptive_delta_before_step(self, unet, noise_scheduler, weight_dtype, accelerator, global_step):
+        """Compute per-timestep losses with theta_k (before optimizer step) for Algorithm 2.
+
+        For a single x_0 (used to build the queue), compute losses at ALL T timesteps.
+        For the full batch, cache losses at the current |S| timesteps so the post-step
+        hook can compute the full-batch delta at those same |S| timesteps.
+        """
+        if self.adaptive_manager is None:
+            return
+        if not self.adaptive_manager.should_update(global_step):
+            return
+
+        latents = self._adaptive_last_latents
+        noise = self._adaptive_last_noise
+        text_conds = self._adaptive_last_text_conds
+        if latents is None or noise is None or text_conds is None:
+            return
+
+        text_masks = text_conds[1] if len(text_conds) > 1 else None
+
+        def model_fn(noisy_latents, timesteps, wdtype):
+            noisy_latents_in = noisy_latents.to(wdtype)
+            encoder_mask_bias = text_masks
+            return self.call_unet(
+                None, accelerator, unet, noisy_latents_in, timesteps,
+                text_conds, encoder_mask_bias, {}, wdtype,
+            )
+
+        # Compute per-timestep losses for a single x_0 at all T timesteps (for the queue)
+        self._adaptive_losses_before = self.adaptive_manager.compute_per_timestep_losses(
+            latents, noise, model_fn, weight_dtype
+        )
+
+        # Cache per-timestep losses for the FULL batch at the current |S| timesteps,
+        # so that after the optimizer step we can compute the delta for the full batch
+        # at those same |S| timesteps (Algorithm 2, line 7).
+        self.adaptive_manager.cache_batch_losses_at_S(
+            latents, noise, model_fn, weight_dtype
+        )
+
+    def compute_adaptive_delta_after_step(self, unet, noise_scheduler, weight_dtype, accelerator, network):
+        """Run Algorithm 2 after optimizer step: compute delta and update sampler.
+
+        Uses the full batch at the |S| selected timesteps (if a previous selection
+        exists) to compute the delta, falling back to the single x_0 otherwise.
+        """
+        if self.adaptive_manager is None or self._adaptive_losses_before is None:
+            return
+
+        latents = self._adaptive_last_latents
+        noise = self._adaptive_last_noise
+        text_conds = self._adaptive_last_text_conds
+        if latents is None or noise is None or text_conds is None:
+            return
+
+        text_masks = text_conds[1] if len(text_conds) > 1 else None
+
+        def model_fn(noisy_latents, timesteps, wdtype):
+            noisy_latents_in = noisy_latents.to(wdtype)
+            encoder_mask_bias = text_masks
+            return self.call_unet(
+                None, accelerator, unet, noisy_latents_in, timesteps,
+                text_conds, encoder_mask_bias, {}, wdtype,
+            )
+
+        # Algorithm 2: compute delta approximation. When a previous |S| selection
+        # exists, the full batch at those timesteps is used (paper Algorithm 2 line 7).
+        delta_approx, selected_indices = self.adaptive_manager.compute_delta_approximation(
+            model_fn, latents, noise, weight_dtype, self._adaptive_losses_before,
+            full_batch_latents=latents, full_batch_noise=noise,
+        )
+
+        # Update sampler via policy gradient (Algorithm 1, line 8)
+        self.adaptive_manager.update_sampler(delta_approx, latents[:1])
+
+        # Clear cached data
+        self._adaptive_losses_before = None
+        self._adaptive_last_latents = None
+        self._adaptive_last_noise = None
+        self._adaptive_last_text_conds = None
 
     def get_sai_model_spec(self, args):
         return train_util.get_sai_model_spec(None, args, self.is_sdxl, True, False)
@@ -725,6 +825,10 @@ class NetworkTrainer:
                 for i in range(len(encoded_text_encoder_conds)):
                     if encoded_text_encoder_conds[i] is not None:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
+
+        # Store text encoder conditions for adaptive Algorithm 2
+        if self.adaptive_manager is not None and is_train:
+            self._adaptive_last_text_conds = [c.detach() if isinstance(c, torch.Tensor) else c for c in text_encoder_conds]
 
         # sample noise, call unet, get target
         noise_pred, target, timesteps, weighting, noise = self.get_noise_pred_and_target(
@@ -2243,6 +2347,28 @@ class NetworkTrainer:
 
         edm2_model, edm2_optimizer, edm2_lr_scheduler = prepare_edm2_loss_weighting(args, noise_scheduler, accelerator)
 
+        # Initialize Adaptive Timestep Sampler
+        if getattr(args, "adaptive_timestep_sampling", False):
+            unet_config = getattr(unet, "config", None)
+            in_channels = getattr(unet_config, "in_channels", 4) if unet_config else 4
+            sampler_net = TimestepSamplerNetwork(
+                in_channels=in_channels,
+                hidden_channels=args.adaptive_sampler_hidden_channels,
+                hidden_depth=args.adaptive_sampler_hidden_depth,
+            ).to(accelerator.device)
+            self.adaptive_manager = AdaptiveTimestepManager(
+                sampler_network=sampler_net,
+                noise_scheduler=noise_scheduler,
+                device=accelerator.device,
+                dtype=weight_dtype,
+                learning_rate=args.adaptive_sampler_lr,
+                entropy_coeff=args.adaptive_sampler_entropy_coeff,
+                update_freq=args.adaptive_sampler_update_freq,
+                queue_size=args.adaptive_sampler_queue_size,
+                num_selected=args.adaptive_sampler_num_selected,
+            )
+            logger.info("Adaptive non-uniform timestep sampling enabled")
+
         train_util.init_trackers(accelerator, args, "network_train")
 
         loss_recorder = train_util.EMARecorder()
@@ -2480,6 +2606,10 @@ class NetworkTrainer:
                     loss = pre_scaling_loss
 
                     # Accumulate loss for step_func optimizer (Polyak step size needs function value)
+                    # Adaptive timestep sampling: compute per-timestep losses with theta_k (before optimizer step)
+                    if self.adaptive_manager is not None and accelerator.sync_gradients:
+                        self.compute_adaptive_delta_before_step(unet, noise_scheduler, weight_dtype, accelerator, global_step)
+
                     if _use_step_func:
                         _step_func_loss_accum += loss.detach().item()
 
@@ -2561,6 +2691,12 @@ class NetworkTrainer:
                         edm2_lr_scheduler.step()
                         # swap to pre_scaling_loss for logging
                         edm2_optimizer.zero_grad(set_to_none=True)
+
+                    # Adaptive timestep sampling: run Algorithm 2 after optimizer step
+                    if self.adaptive_manager is not None and accelerator.sync_gradients:
+                        self.compute_adaptive_delta_after_step(unet, noise_scheduler, weight_dtype, accelerator, network)
+
+
 
                 if args.scale_weight_norms and accelerator.sync_gradients:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(

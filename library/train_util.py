@@ -4576,6 +4576,56 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="Stddev for the logit normal distribution. Only used if --timestep_distribution is 'logit_normal'.",
     )
 
+    # Adaptive Non-uniform Timestep Sampling (arXiv:2411.09998)
+    parser.add_argument(
+        "--adaptive_timestep_sampling",
+        action="store_true",
+        help="Enable adaptive non-uniform timestep sampling using a learned Beta distribution sampler.",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_lr",
+        type=float,
+        default=1e-2,
+        help="Learning rate for the adaptive timestep sampler network",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_entropy_coeff",
+        type=float,
+        default=1e-2,
+        help="Entropy coefficient for sampler regularization",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_update_freq",
+        type=int,
+        default=40,
+        help="Frequency f_S: update the timestep sampler every this many gradient steps",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_queue_size",
+        type=int,
+        default=20,
+        help="Queue size for delta approximation history",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_num_selected",
+        type=int,
+        default=3,
+        help="Number of timesteps used to approximate Delta",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_hidden_channels",
+        type=int,
+        default=128,
+        help="Hidden channels in the timestep sampler network",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_hidden_depth",
+        type=int,
+        default=2,
+        help="Hidden depth of the timestep sampler network",
+    )
+
+
     parser.add_argument(
         "--loss_type",
         type=str,
