@@ -12,7 +12,13 @@ from PIL import Image, ImageCms
 # Allow running from repo root or tests/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from library.image_utils import to_srgb, _TRANSFORM_ATTEMPTS, _log_profile_failure
+from library.image_utils import (
+    to_srgb,
+    _TRANSFORM_ATTEMPTS,
+    _log_profile_failure,
+    _extract_icc_color_space,
+    _mode_matches_profile,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +369,134 @@ class TestLogProfileFailure:
         with caplog.at_level("WARNING", logger="library.image_utils"):
             _log_profile_failure(im, broken_profile)
         assert "falling back" in caplog.text
+
+
+class TestProactiveMismatch:
+    """Tests for the proactive mode/profile mismatch detection."""
+
+    def test_greyscale_with_srgb_profile_converts_silently(self, caplog):
+        """A greyscale image carrying an sRGB profile should convert
+        directly to RGB without emitting a WARNING — the mismatch is
+        known and expected."""
+        im = _make_solid("L", color=128)
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        with caplog.at_level("DEBUG", logger="library.image_utils"):
+            result = to_srgb(im)
+
+        assert result.mode == "RGB"
+        assert result.size == im.size
+        # Should log at DEBUG, not WARNING.
+        assert "incompatible" in caplog.text.lower() or "skipping" in caplog.text.lower()
+        assert "WARNING" not in caplog.text
+
+    def test_greyscale_with_srgb_profile_uses_plain_convert(self):
+        """Fallback path should produce the same pixels as im.convert('RGB')."""
+        im = _make_solid("L", color=200)
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        result = to_srgb(im)
+        expected = im.convert("RGB")
+        np.testing.assert_array_equal(np.array(result), np.array(expected))
+
+    def test_la_with_srgb_profile_converts_silently(self, caplog):
+        """LA (greyscale + alpha) with an sRGB profile should also be
+        detected as a mismatch and converted silently."""
+        im = _make_solid("LA", color=(128, 255))
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        with caplog.at_level("DEBUG", logger="library.image_utils"):
+            result = to_srgb(im)
+
+        assert result.mode == "RGB"
+        assert "WARNING" not in caplog.text
+
+    def test_rgb_with_srgb_profile_still_uses_icc_pipeline(self):
+        """An RGB image with an sRGB profile should still go through the
+        ICC pipeline (sRGB→sRGB is identity, but the pipeline should run)."""
+        im = _make_solid("RGB", color=(128, 64, 32))
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        with patch("library.image_utils.ImageCms.profileToProfile", wraps=ImageCms.profileToProfile) as mock_ptp:
+            result = to_srgb(im)
+
+        mock_ptp.assert_called_once()
+        assert result.mode == "RGB"
+
+    def test_corrupt_profile_bytes_converts_directly(self):
+        """Corrupt ICC bytes that cannot even be parsed should still
+        produce an RGB result via plain convert."""
+        im = _make_solid("L", color=100)
+        im.info["icc_profile"] = b"not-a-valid-icc-profile"
+
+        result = to_srgb(im)
+        assert result.mode == "RGB"
+        expected = im.convert("RGB")
+        np.testing.assert_array_equal(np.array(result), np.array(expected))
+
+    def test_no_warning_for_known_mismatch(self, caplog):
+        """The proactive detection should suppress the WARNING that would
+        otherwise be emitted by _log_profile_failure."""
+        im = _make_solid("L", color=128)
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        with caplog.at_level("WARNING", logger="library.image_utils"):
+            to_srgb(im)
+
+        # No WARNING should appear at all.
+        assert caplog.text.count("WARNING") == 0
+
+
+class TestExtractIccColorSpace:
+    """Tests for the _extract_icc_color_space helper."""
+
+    def test_extracts_rgb_from_profile(self):
+        """An sRGB profile should yield colour-space 'RGB '."""
+        src = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+        cs = _extract_icc_color_space(src)
+        assert "RGB" in cs
+
+    def test_extracts_from_raw_bytes_fallback(self):
+        """When the ImageCms API fails, should fall back to raw header."""
+        srgb_bytes = _make_srgb_profile_bytes()
+        # Pass a mock that makes getColorSpace fail
+        mock_profile = MagicMock()
+        cs = _extract_icc_color_space(mock_profile, srgb_bytes)
+        assert "RGB" in cs
+
+    def test_returns_empty_for_no_data(self):
+        """No profile and no bytes → empty string."""
+        cs = _extract_icc_color_space(MagicMock(), None)
+        assert cs == ""
+
+
+class TestModeMatchesProfile:
+    """Tests for the _mode_matches_profile helper."""
+
+    def test_rgb_matches_rgb_space(self):
+        assert _mode_matches_profile("RGB", "RGB ") is True
+
+    def test_rgba_matches_rgb_space(self):
+        assert _mode_matches_profile("RGBA", "RGB ") is True
+
+    def test_l_does_not_match_rgb_space(self):
+        assert _mode_matches_profile("L", "RGB ") is False
+
+    def test_la_does_not_match_rgb_space(self):
+        assert _mode_matches_profile("LA", "RGB ") is False
+
+    def test_l_matches_gray_space(self):
+        assert _mode_matches_profile("L", "GRAY") is True
+
+    def test_cmyk_matches_cmyk_space(self):
+        assert _mode_matches_profile("CMYK", "CMYK") is True
+
+    def test_unknown_space_returns_true(self):
+        """Unrecognised colour-space should not block the attempt."""
+        assert _mode_matches_profile("L", "XYZ ") is True
+
+    def test_rgb_does_not_match_gray_space(self):
+        assert _mode_matches_profile("RGB", "GRAY") is False
 
 
 if __name__ == "__main__":

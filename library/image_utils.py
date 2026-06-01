@@ -28,6 +28,59 @@ _TRANSFORM_ATTEMPTS = [
     (0, ImageCms.Intent.RELATIVE_COLORIMETRIC),
 ]
 
+# Maps ICC colour-space signatures (bytes 16-19 of the ICC header) to
+# the PIL image modes that are *compatible* with that colour-space.
+# littlecms cannot build a transform when the image mode and the ICC
+# colour-space are fundamentally incompatible (e.g. greyscale pixel
+# data with an RGB profile).
+_CS_TO_MODES = {
+    "RGB ": ("RGB", "RGBA"),
+    "GRAY": ("L", "LA"),
+    "CMYK": ("CMYK",),
+}
+
+
+def _extract_icc_color_space(src_profile, icc_bytes: bytes | None = None) -> str:
+    """Return the ICC colour-space signature, or ``""`` if unknown.
+
+    Tries the ``ImageCms`` API first, then falls back to reading the
+    4-byte colour-space field directly from the raw ICC header (bytes
+    16-19 per ICC.1:2022 §7.2.6).
+    """
+    try:
+        cs = ImageCms.getColorSpace(src_profile)
+        if cs:
+            return cs.strip()
+    except Exception:
+        pass
+
+    # Fallback: raw ICC header from bytes or from profile object.
+    raw = icc_bytes
+    if raw is None and src_profile is not None:
+        try:
+            raw = src_profile.tobytes()
+        except Exception:
+            pass
+    if raw is not None and len(raw) >= 20:
+        try:
+            return raw[16:20].decode("ascii", errors="replace")
+        except Exception:
+            pass
+
+    return ""
+
+
+def _mode_matches_profile(im_mode: str, color_space: str) -> bool:
+    """Return ``True`` if *im_mode* is compatible with *color_space*.
+
+    If *color_space* is unrecognised the function returns ``True``
+    (benefit of the doubt — we'll let littlecms try).
+    """
+    expected = _CS_TO_MODES.get(color_space)
+    if expected is None:
+        return True  # unknown colour-space → don't block the attempt
+    return im_mode in expected
+
 
 def _log_profile_failure(im: Image.Image, src_profile=None) -> None:
     """Log diagnostic information about a failed ICC conversion.
@@ -45,7 +98,8 @@ def _log_profile_failure(im: Image.Image, src_profile=None) -> None:
 
     # --- ICC profile details (each call independent so one failure
     #     doesn't suppress the others) ---
-    profile_name = profile_class = color_space = "<unavailable>"
+    profile_name = profile_class = "<unavailable>"
+    color_space = ""
     icc_size = 0
     if src_profile is not None:
         try:
@@ -57,45 +111,22 @@ def _log_profile_failure(im: Image.Image, src_profile=None) -> None:
         except Exception:
             pass
         try:
-            color_space = ImageCms.getColorSpace(src_profile).strip()
-        except Exception:
-            pass
-        try:
             icc_size = len(src_profile.tobytes())
         except Exception:
             pass
 
-    # --- detect the likely cause ---
-    reason = ""
     icc_bytes = im.info.get("icc_profile")
+    color_space = _extract_icc_color_space(src_profile, icc_bytes) or "<unavailable>"
     if icc_bytes:
         icc_size = icc_size or len(icc_bytes)
 
-        # Fallback: if the ImageCms API didn't yield a colour-space,
-        # read it directly from the ICC header (bytes 16-19 are the
-        # colour-space signature in the ICC spec).
-        if color_space == "<unavailable>" and len(icc_bytes) >= 20:
-            try:
-                color_space = icc_bytes[16:20].decode("ascii", errors="replace")
-            except Exception:
-                pass
-
-        # Check for a common mismatch: e.g. greyscale/LA image carrying
-        # an RGB profile (or vice-versa).  littlecms cannot build a
-        # transform when the image mode and the ICC colour-space are
-        # fundamentally incompatible.
-        _CS_TO_MODES = {
-            "RGB ": ("RGB", "RGBA"),
-            "GRAY": ("L", "LA"),
-            "CMYK": ("CMYK",),
-        }
-        expected_modes = _CS_TO_MODES.get(color_space, ())
-        if color_space != "<unavailable>" and im.mode not in expected_modes:
-            reason = (
-                f" — likely cause: image mode={im.mode} does not match "
-                f"ICC profile colour-space={color_space!r}; "
-                f"littlecms cannot build a transform across these types"
-            )
+    reason = ""
+    if color_space != "<unavailable>" and not _mode_matches_profile(im.mode, color_space):
+        reason = (
+            f" — likely cause: image mode={im.mode} does not match "
+            f"ICC profile colour-space={color_space!r}; "
+            f"littlecms cannot build a transform across these types"
+        )
 
     logger.warning(
         "ICC-aware colour conversion failed for image mode=%s, size=%s, "
@@ -139,6 +170,10 @@ def to_srgb(im: Image.Image, assume: str = "sRGB") -> Image.Image:
       CMYK profile is present (or the *assume* fallback).  PIL's
       ``profileToProfile`` handles the CMYK → RGB channel reduction
       natively when ``outputMode="RGB"``.
+    * If the image mode and the embedded ICC profile colour-space are
+      incompatible (e.g. a greyscale image carrying an sRGB profile),
+      the ICC pipeline is skipped entirely and a plain
+      ``im.convert("RGB")`` is returned without logging a warning.
     * The function tries several (flags, rendering-intent) combinations
       before falling back, so that images carrying unusual ICC profiles
       (V4, wide-gamut, etc.) still get correct colour conversion when
@@ -150,16 +185,35 @@ def to_srgb(im: Image.Image, assume: str = "sRGB") -> Image.Image:
     if im.mode == "RGB" and not im.info.get("icc_profile"):
         return im
 
-    src = None  # ensure defined for the except clause
-    try:
-        # --- determine source profile ---
-        icc_bytes = im.info.get("icc_profile")
-        if icc_bytes:
-            src = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
-        else:
-            src = ImageCms.createProfile(assume)
+    icc_bytes = im.info.get("icc_profile")
 
-        # --- convert via the ICC pipeline ---
+    # --- proactive mismatch check ---
+    # If the image carries an ICC profile whose colour-space is
+    # incompatible with the image mode (e.g. greyscale pixels + sRGB
+    # profile), littlecms will *never* be able to build a transform.
+    # Detect this and convert silently rather than trying all four
+    # fallback combos and emitting a noisy warning.
+    if icc_bytes:
+        try:
+            src = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+        except Exception:
+            # Profile bytes are corrupt — plain convert is the only option.
+            return im.convert("RGB")
+
+        cs = _extract_icc_color_space(src, icc_bytes)
+        if cs and not _mode_matches_profile(im.mode, cs):
+            logger.debug(
+                "Image mode=%s is incompatible with ICC colour-space=%r; "
+                "skipping ICC pipeline and converting directly to RGB",
+                im.mode,
+                cs,
+            )
+            return im.convert("RGB")
+    else:
+        src = ImageCms.createProfile(assume)
+
+    # --- convert via the ICC pipeline ---
+    try:
         for flags, intent in _TRANSFORM_ATTEMPTS:
             try:
                 result = ImageCms.profileToProfile(
