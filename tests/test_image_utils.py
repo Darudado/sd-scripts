@@ -3,7 +3,7 @@
 import io
 import os
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch, call
 
 import numpy as np
 import pytest
@@ -12,7 +12,7 @@ from PIL import Image, ImageCms
 # Allow running from repo root or tests/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from library.image_utils import to_srgb
+from library.image_utils import to_srgb, _TRANSFORM_ATTEMPTS, _log_profile_failure
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +26,11 @@ def _make_solid(mode: str, size=(8, 8), color=128) -> Image.Image:
 
 def _make_srgb_profile_bytes() -> bytes:
     """Return raw ICC bytes for sRGB."""
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+
+def _make_adobe_rgb_profile_bytes() -> bytes:
+    """Return raw ICC bytes for AdobeRGB (wide-gamut)."""
     return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
 
 
@@ -167,6 +172,163 @@ class TestToSrgb:
         r2 = to_srgb(r1)
         assert r1 is im
         assert r2 is im
+
+    # -- graduated fallback --------------------------------------------------
+
+    def test_graduated_fallback_retries_with_less_flags(self):
+        """When the first attempt (BPC + perceptual) fails, the function should
+        retry with less strict flag combinations before giving up."""
+        im = _make_solid("RGB", color=(128, 64, 32))
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        # Capture the real function reference before patching.
+        _real_ptp = ImageCms.profileToProfile
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            flags = kwargs.get("flags", 0)
+            # Fail only when BLACKPOINTCOMPENSATION is requested.
+            if flags & ImageCms.Flags.BLACKPOINTCOMPENSATION:
+                raise ValueError("cannot build transform")
+            return _real_ptp(*args, **kwargs)
+
+        with patch("library.image_utils.ImageCms.profileToProfile", side_effect=side_effect):
+            result = to_srgb(im)
+
+        assert result.mode == "RGB"
+        # At least 2 calls: first with BPC (fails), second without BPC (succeeds).
+        assert call_count[0] >= 2
+
+    def test_graduated_fallback_tries_all_intent_combinations(self):
+        """When all BPC variants fail, the function should also try different
+        rendering intents before falling back."""
+        im = _make_solid("RGB", color=(128, 64, 32))
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        call_args_log = []
+
+        def side_effect(*args, **kwargs):
+            call_args_log.append(kwargs)
+            raise ValueError("cannot build transform")
+
+        with patch("library.image_utils.ImageCms.profileToProfile", side_effect=side_effect):
+            result = to_srgb(im)
+
+        # Should have tried all 4 combinations from _TRANSFORM_ATTEMPTS.
+        assert len(call_args_log) == len(_TRANSFORM_ATTEMPTS)
+        # Verify each attempt uses a different (flags, intent) pair.
+        seen = {(a.get("flags", 0), a.get("renderingIntent", 0)) for a in call_args_log}
+        assert len(seen) == len(_TRANSFORM_ATTEMPTS)
+
+    def test_graduated_fallback_ultimate_fallback_to_convert(self):
+        """When ALL ICC transform attempts fail, plain .convert('RGB') is used."""
+        im = _make_solid("L", color=128)
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        with patch("library.image_utils.ImageCms.profileToProfile", side_effect=ValueError("cannot build transform")):
+            result = to_srgb(im)
+
+        assert result.mode == "RGB"
+        expected = im.convert("RGB")
+        np.testing.assert_array_equal(np.array(result), np.array(expected))
+
+    def test_graduated_fallback_succeeds_on_first_attempt(self):
+        """When the first attempt succeeds, no retries should be made."""
+        im = _make_solid("RGB", color=(128, 64, 32))
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        with patch("library.image_utils.ImageCms.profileToProfile", wraps=ImageCms.profileToProfile) as mock_ptp:
+            result = to_srgb(im)
+
+        mock_ptp.assert_called_once()
+        assert result.mode == "RGB"
+
+    def test_graduated_fallback_succeeds_on_last_attempt(self):
+        """Even if only the last (flags, intent) combo works, conversion should succeed."""
+        im = _make_solid("RGB", color=(128, 64, 32))
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        # Capture the real function reference before patching.
+        _real_ptp = ImageCms.profileToProfile
+        last_flags, last_intent = _TRANSFORM_ATTEMPTS[-1]
+        attempt_count = [0]
+
+        def side_effect(*args, **kwargs):
+            attempt_count[0] += 1
+            flags = kwargs.get("flags", 0)
+            intent = kwargs.get("renderingIntent", 0)
+            # Only succeed on the very last combination.
+            if flags == last_flags and intent == last_intent:
+                return _real_ptp(*args, **kwargs)
+            raise ValueError("cannot build transform")
+
+        with patch("library.image_utils.ImageCms.profileToProfile", side_effect=side_effect):
+            result = to_srgb(im)
+
+        assert result.mode == "RGB"
+        assert attempt_count[0] == len(_TRANSFORM_ATTEMPTS)
+
+    def test_graduated_fallback_result_tagged_srgb(self):
+        """Successful conversion on a retry should still tag the result with sRGB ICC."""
+        im = _make_solid("RGB", color=(128, 64, 32))
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+
+        # Capture the real function reference before patching.
+        _real_ptp = ImageCms.profileToProfile
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            flags = kwargs.get("flags", 0)
+            if flags & ImageCms.Flags.BLACKPOINTCOMPENSATION:
+                raise ValueError("cannot build transform")
+            return _real_ptp(*args, **kwargs)
+
+        with patch("library.image_utils.ImageCms.profileToProfile", side_effect=side_effect):
+            result = to_srgb(im)
+
+        icc = result.info.get("icc_profile")
+        assert icc is not None
+        profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+        assert "sRGB" in ImageCms.getProfileName(profile)
+
+
+class TestLogProfileFailure:
+    """Test suite for the _log_profile_failure helper."""
+
+    def test_logs_image_mode_and_size(self, caplog):
+        """Log message should include the image mode and size."""
+        im = _make_solid("CMYK", size=(64, 48), color=(0, 0, 0, 0))
+        with caplog.at_level("WARNING", logger="library.image_utils"):
+            _log_profile_failure(im)
+        assert "mode=CMYK" in caplog.text
+        assert "size=(64, 48)" in caplog.text
+
+    def test_logs_profile_details_when_available(self, caplog):
+        """Log message should include profile name, class, and colour-space."""
+        im = _make_solid("RGB", color=(128, 128, 128))
+        src = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+        with caplog.at_level("WARNING", logger="library.image_utils"):
+            _log_profile_failure(im, src)
+        assert "sRGB" in caplog.text
+
+    def test_handles_none_profile_gracefully(self, caplog):
+        """Should not raise when src_profile is None."""
+        im = _make_solid("L", color=128)
+        with caplog.at_level("WARNING", logger="library.image_utils"):
+            _log_profile_failure(im, None)
+        assert "unavailable" in caplog.text
+
+    def test_handles_broken_profile_gracefully(self, caplog):
+        """Should not raise when src_profile methods throw."""
+        im = _make_solid("RGB", color=(128, 128, 128))
+        broken_profile = MagicMock()
+        broken_profile.tobytes.side_effect = Exception("broken")
+        # ImageCms functions may raise on a mock object — that's fine.
+        with caplog.at_level("WARNING", logger="library.image_utils"):
+            _log_profile_failure(im, broken_profile)
+        assert "falling back" in caplog.text
 
 
 if __name__ == "__main__":

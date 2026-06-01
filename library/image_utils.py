@@ -18,6 +18,40 @@ logger = logging.getLogger(__name__)
 _SRGB_PROFILE = ImageCms.createProfile("sRGB")
 _SRGB_CMS = ImageCms.ImageCmsProfile(_SRGB_PROFILE)
 
+# Progressively less strict (flags, rendering-intent) pairs.  Some ICC
+# profiles (V4, wide-gamut, CMYK, etc.) reject BLACKPOINTCOMPENSATION
+# or only define certain rendering intents, so we try several combos
+# before giving up.
+_TRANSFORM_ATTEMPTS = [
+    (ImageCms.Flags.BLACKPOINTCOMPENSATION, ImageCms.Intent.PERCEPTUAL),
+    (0, ImageCms.Intent.PERCEPTUAL),
+    (ImageCms.Flags.BLACKPOINTCOMPENSATION, ImageCms.Intent.RELATIVE_COLORIMETRIC),
+    (0, ImageCms.Intent.RELATIVE_COLORIMETRIC),
+]
+
+
+def _log_profile_failure(im: Image.Image, src_profile=None) -> None:
+    """Log diagnostic information about a failed ICC conversion."""
+    profile_name = profile_class = color_space = "<unavailable>"
+    try:
+        if src_profile is not None:
+            profile_name = ImageCms.getProfileName(src_profile).strip()
+            profile_class = ImageCms.getProfileInfo(src_profile, "header/flags", 0).strip()
+            color_space = ImageCms.getColorSpace(src_profile).strip()
+    except Exception:
+        pass
+
+    logger.warning(
+        "ICC-aware colour conversion failed for image mode=%s, size=%s; "
+        "profile name=%r, class=%r, colour-space=%r — "
+        "falling back to plain .convert('RGB')",
+        im.mode,
+        im.size,
+        profile_name,
+        profile_class,
+        color_space,
+    )
+
 
 def to_srgb(im: Image.Image, assume: str = "sRGB") -> Image.Image:
     """Convert *im* to sRGB, respecting any embedded ICC profile.
@@ -44,6 +78,10 @@ def to_srgb(im: Image.Image, assume: str = "sRGB") -> Image.Image:
       CMYK profile is present (or the *assume* fallback).  PIL's
       ``profileToProfile`` handles the CMYK → RGB channel reduction
       natively when ``outputMode="RGB"``.
+    * The function tries several (flags, rendering-intent) combinations
+      before falling back, so that images carrying unusual ICC profiles
+      (V4, wide-gamut, etc.) still get correct colour conversion when
+      possible.
     * On any failure a plain ``im.convert("RGB")`` is returned so
       callers never need to handle exceptions.
     """
@@ -51,6 +89,7 @@ def to_srgb(im: Image.Image, assume: str = "sRGB") -> Image.Image:
     if im.mode == "RGB" and not im.info.get("icc_profile"):
         return im
 
+    src = None  # ensure defined for the except clause
     try:
         # --- determine source profile ---
         icc_bytes = im.info.get("icc_profile")
@@ -60,22 +99,26 @@ def to_srgb(im: Image.Image, assume: str = "sRGB") -> Image.Image:
             src = ImageCms.createProfile(assume)
 
         # --- convert via the ICC pipeline ---
-        im = ImageCms.profileToProfile(
-            im,
-            src,
-            _SRGB_PROFILE,
-            outputMode="RGB",
-            renderingIntent=0,
-            flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
-        )
+        for flags, intent in _TRANSFORM_ATTEMPTS:
+            try:
+                result = ImageCms.profileToProfile(
+                    im,
+                    src,
+                    _SRGB_PROFILE,
+                    outputMode="RGB",
+                    renderingIntent=intent,
+                    flags=flags,
+                )
+                # Tag the result so downstream consumers know the colour space.
+                result.info["icc_profile"] = _SRGB_CMS.tobytes()
+                return result
+            except Exception:
+                continue
 
-        # Tag the result so downstream consumers know the colour space.
-        im.info["icc_profile"] = _SRGB_CMS.tobytes()
-        return im
+        # All ICC transform attempts failed — fall back.
+        _log_profile_failure(im, src)
+        return im.convert("RGB")
 
     except Exception:
-        logger.warning(
-            "ICC-aware colour conversion failed; falling back to plain .convert('RGB')",
-            exc_info=True,
-        )
+        _log_profile_failure(im, src)
         return im.convert("RGB")
