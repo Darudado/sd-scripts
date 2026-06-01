@@ -1472,6 +1472,8 @@ class LLMAdapterAttention(nn.Module):
         can_use_flash = (
             attention.flash_attn_varlen_func is not None
             and query_states.dtype in (torch.float16, torch.bfloat16)
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability(query_states.device) >= (8, 0)
         )
 
         if can_use_flash and q_mask is None and kv_mask is None:

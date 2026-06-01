@@ -19,6 +19,7 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 
+import logging
 import math
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
@@ -31,12 +32,29 @@ import torch.nn.functional as F
 
 from library import custom_offloading_utils
 
+_logger = logging.getLogger(__name__)
+
 try:
     from flash_attn import flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 except ImportError:
     # flash_attn may not be available but it is not required
     pass
+
+# Verify flash_attn GPU compatibility: requires Ampere (sm_80) or newer.
+if "flash_attn_varlen_func" in dir():
+    try:
+        if torch.cuda.is_available():
+            _capability = torch.cuda.get_device_capability()
+            if _capability < (8, 0):
+                _logger.warning(
+                    "flash_attn is installed but requires Ampere GPU (sm_80) or newer. "
+                    f"Current GPU compute capability: {_capability[0]}.{_capability[1]}. "
+                    "Disabling flash_attn for lumina models."
+                )
+                flash_attn_varlen_func = None
+    except Exception:
+        _logger.debug("Could not determine GPU capability for flash_attn compatibility check")
 
 try:
     from sageattention import sageattn
@@ -317,6 +335,21 @@ class JointAttention(nn.Module):
         else:
             self.q_norm = self.k_norm = nn.Identity()
 
+        # Disable flash_attn if not importable or GPU doesn't support it (requires Ampere+)
+        # flash_attn_varlen_func is a module-level name; access it via the global scope.
+        # Three states: (1) import failed -> NameError, (2) GPU unsupported -> None, (3) available -> function
+        try:
+            _flash_available = flash_attn_varlen_func is not None
+        except NameError:
+            _flash_available = False
+
+        if use_flash_attn and not _flash_available:
+            _logger.warning(
+                "Flash attention requested but not available (not installed or GPU does not support it). "
+                "Falling back to standard attention."
+            )
+            use_flash_attn = False
+
         self.use_flash_attn = use_flash_attn
         self.use_sage_attn = use_sage_attn
 
@@ -544,9 +577,10 @@ class JointAttention(nn.Module):
             # end var_len_flash_attn
 
             return output
-        except NameError as e:
+        except (NameError, TypeError) as e:
             raise RuntimeError(
-                f"Could not load flash attention. Please install flash_attn. / フラッシュアテンションを読み込めませんでした。flash_attn をインストールしてください。 / {e}"
+                f"Could not load flash attention. Please install flash_attn (requires Ampere GPU or newer). / "
+                f"フラッシュアテンションを読み込めませんでした。flash_attn をインストールしてください（Ampere GPU以降が必要です）。 / {e}"
             )
 
 

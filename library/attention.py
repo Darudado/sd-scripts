@@ -1,8 +1,11 @@
 # Unified attention function supporting various implementations
 
+import logging
 from dataclasses import dataclass
 import torch
 from typing import Optional, Union
+
+_logger = logging.getLogger(__name__)
 
 try:
     import flash_attn
@@ -14,6 +17,39 @@ except ImportError:
     flash_attn_varlen_func = None
     _flash_attn_forward = None
     flash_attn_func = None
+
+# Verify flash_attn GPU compatibility: requires Ampere (sm_80, compute capability 8.0) or newer.
+# T4 (Turing, sm_75) and older GPUs will hit "FlashAttention only supports Ampere GPUs or newer"
+# at runtime. Detect this early and disable flash_attn so callers fall back gracefully.
+if flash_attn is not None:
+    try:
+        if torch.cuda.is_available():
+            _capability = torch.cuda.get_device_capability()
+            if _capability < (8, 0):
+                _logger.warning(
+                    "flash_attn is installed but requires Ampere GPU (sm_80) or newer. "
+                    f"Current GPU compute capability: {_capability[0]}.{_capability[1]}. "
+                    "Disabling flash_attn and falling back to other attention implementations."
+                )
+                flash_attn = None
+                flash_attn_varlen_func = None
+                _flash_attn_forward = None
+                flash_attn_func = None
+    except Exception:
+        _logger.debug("Could not determine GPU capability for flash_attn compatibility check")
+
+
+def is_flash_attn_supported() -> bool:
+    """Return True if flash_attn is importable AND the current GPU supports it (Ampere+)."""
+    if flash_attn_varlen_func is None:
+        return False
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_capability() >= (8, 0)
+    except Exception:
+        pass
+    return False
+
 
 try:
     from sageattention import sageattn_varlen, sageattn
