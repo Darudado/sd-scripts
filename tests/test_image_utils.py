@@ -305,13 +305,47 @@ class TestLogProfileFailure:
         assert "mode=CMYK" in caplog.text
         assert "size=(64, 48)" in caplog.text
 
+    def test_logs_format_and_filename(self, caplog):
+        """Log message should include image format and filename when available."""
+        im = _make_solid("RGB", color=(128, 128, 128))
+        im.format = "JPEG"
+        im.filename = "/tmp/test_image.jpg"
+        with caplog.at_level("WARNING", logger="library.image_utils"):
+            _log_profile_failure(im)
+        assert "format=JPEG" in caplog.text
+        assert "test_image.jpg" in caplog.text
+
+    def test_logs_format_unknown_when_not_set(self, caplog):
+        """Log message should show <unknown> when format/filename are not set."""
+        im = _make_solid("RGB", color=(128, 128, 128))
+        # _make_solid doesn't set format or filename
+        with caplog.at_level("WARNING", logger="library.image_utils"):
+            _log_profile_failure(im)
+        assert "format=<unknown>" in caplog.text
+        assert "filename=<unknown>" in caplog.text
+
     def test_logs_profile_details_when_available(self, caplog):
-        """Log message should include profile name, class, and colour-space."""
+        """Log message should include profile name, class, colour-space, and byte size."""
         im = _make_solid("RGB", color=(128, 128, 128))
         src = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
         with caplog.at_level("WARNING", logger="library.image_utils"):
             _log_profile_failure(im, src)
         assert "sRGB" in caplog.text
+        assert "bytes=" in caplog.text
+        assert "class=" in caplog.text
+        assert "colour-space=" in caplog.text
+
+    def test_logs_mismatch_reason_for_greyscale_with_rgb_profile(self, caplog):
+        """Should detect and log the mode/profile mismatch for L mode + sRGB profile."""
+        im = _make_solid("L", color=128)
+        src = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+        # Attach ICC bytes so mismatch detection triggers
+        im.info["icc_profile"] = _make_srgb_profile_bytes()
+        with caplog.at_level("WARNING", logger="library.image_utils"):
+            _log_profile_failure(im, src)
+        assert "likely cause" in caplog.text
+        assert "mode=L" in caplog.text
+        assert "does not match" in caplog.text
 
     def test_handles_none_profile_gracefully(self, caplog):
         """Should not raise when src_profile is None."""
