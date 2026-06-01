@@ -604,7 +604,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         if args.min_snr_gamma:
             # Convert timesteps (in [0, 1000] range) to flow matching sigmas (in [0, 1] range)
             sigmas = timesteps / noise_scheduler.config.num_train_timesteps
-            loss = apply_snr_weight_for_flow_matching(loss, sigmas, args.min_snr_gamma)
+            loss = apply_snr_weight_for_flow_matching(loss, sigmas, args.min_snr_gamma, soft=args.min_snr_gamma_soft)
         return loss
 
     def get_sai_model_spec(self, args):

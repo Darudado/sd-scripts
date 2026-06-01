@@ -278,7 +278,7 @@ def main():
                 loss = loss.mean(dim=(1, 2, 3))
                 if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
                     timesteps = torch.full((loss.shape[0],), current_timestep_index, device=loss.device, dtype=torch.long)
-                    loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
+                    loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization, soft=args.min_snr_gamma_soft)
                 loss = loss.mean() * setting.weight
 
             accelerator.backward(loss)

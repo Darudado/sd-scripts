@@ -77,38 +77,65 @@ def fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler):
     noise_scheduler.alphas = alphas
     noise_scheduler.alphas_cumprod = alphas_cumprod
 
+def apply_snr_weight(
+    loss: torch.Tensor,
+    timesteps: torch.IntTensor,
+    noise_scheduler,
+    gamma: float,
+    v_prediction: bool = False,
+    soft: bool = False,
+):
+    """Apply Min-SNR or Soft Min-SNR weighting to the loss.
 
-def apply_snr_weight(loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler, gamma: Number, v_prediction=False):
-    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
-    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
-    if v_prediction:
-        snr_weight = torch.div(min_snr_gamma, snr + 1)
+    Args:
+        loss: Per-element loss tensor.
+        timesteps: Timesteps for each sample in the batch.
+        noise_scheduler: DDPMScheduler containing the precomputed SNR values.
+        gamma: Min-SNR clipping value (typically 4.0 or 5.0).
+        v_prediction: Set to True if the model predicts velocity (v).
+        soft: Set to True to use the smooth Soft Min-SNR transition from the paper.
+    """
+    # Retrieve SNR values and move to the correct device
+    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps]).to(device=loss.device)
+
+    if soft:
+        if v_prediction:
+            snr_weight = (snr * gamma) / ((snr + gamma) * (snr + 1))
+        else:
+            snr_weight = gamma / (snr + gamma)
     else:
-        snr_weight = torch.div(min_snr_gamma, snr)
+        min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
+        if v_prediction:
+            snr_weight = torch.div(min_snr_gamma, snr + 1)
+        else:
+            snr_weight = torch.div(min_snr_gamma, snr)
 
-    snr_weight = snr_weight.to(dtype=loss.dtype, device=loss.device)
+    snr_weight = snr_weight.to(dtype=loss.dtype)
 
-    loss = loss * snr_weight
-    return loss
+    # Ensure snr_weight dimensions match loss for proper broadcasting
+    while snr_weight.ndim < loss.ndim:
+        snr_weight = snr_weight.unsqueeze(-1)
+
+    return loss * snr_weight
 
 
-def apply_snr_weight_for_flow_matching(loss: torch.Tensor, sigmas: torch.Tensor, gamma: float) -> torch.Tensor:
-    """Apply Min-SNR-γ weighting for flow matching (rectified flow) models.
+def apply_snr_weight_for_flow_matching(
+    loss: torch.Tensor, 
+    sigmas: torch.Tensor, 
+    gamma: float, 
+    soft: bool = False
+) -> torch.Tensor:
+    """Apply Min-SNR-γ or Soft Min-SNR-γ weighting for flow matching models.
 
     Computes the signal-to-noise ratio from sigma: SNR = (1 - σ)² / σ²
-    and applies the velocity-prediction weight: min(SNR, γ) / (SNR + 1).
-
-    This is the flow-matching analog of apply_snr_weight for DDPM models.
-    Flow matching velocity prediction (v = ε - x₀) is mathematically analogous
-    to v-prediction in DDPM, so the v-prediction formula is used.
-
-    Reference: https://arxiv.org/abs/2303.09556
+    and applies the velocity-prediction weight.
 
     Args:
         loss: Per-element loss tensor (any shape, e.g. (B,) or (B, C, H, W)).
         sigmas: Noise levels from the flow matching scheduler.
             Can be shape (B, 1, 1, 1), (B,), or broadcastable with loss.
-        gamma: Min-SNR gamma value. 5.0 is recommended by the paper.
+        gamma: Min-SNR gamma value.
+        soft: Set to True to use the smooth Soft Min-SNR transition from the paper.
 
     Returns:
         Weighted loss tensor (same shape as input loss).
@@ -119,11 +146,14 @@ def apply_snr_weight_for_flow_matching(loss: torch.Tensor, sigmas: torch.Tensor,
     # SNR in flow matching: (1 - σ)² / σ²
     snr = ((1.0 - sigma) / sigma) ** 2
 
-    # Cap SNR at gamma
-    min_snr = torch.minimum(snr, torch.full_like(snr, gamma))
-
-    # Velocity prediction weight: min(SNR, γ) / (SNR + 1)
-    snr_weight = min_snr / (snr + 1)
+    if soft:
+        # Velocity prediction weight using Soft Min-SNR
+        snr_weight = (snr * gamma) / ((snr + gamma) * (snr + 1))
+    else:
+        # Cap SNR at gamma
+        min_snr = torch.minimum(snr, torch.full_like(snr, gamma))
+        # Velocity prediction weight: min(SNR, γ) / (SNR + 1)
+        snr_weight = min_snr / (snr + 1)
 
     snr_weight = snr_weight.to(dtype=loss.dtype, device=loss.device)
 
@@ -173,6 +203,13 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         default=None,
         help="gamma for reducing the weight of high loss timesteps. Lower numbers have stronger effect. 5 is recommended by paper. / 低いタイムステップでの高いlossに対して重みを減らすためのgamma値、低いほど効果が強く、論文では5が推奨",
     )
+
+    parser.add_argument(
+        "--min_snr_gamma_soft",
+        action="store_true",
+        help="Controls if min_snr_gamma uses soft implementation from https://arxiv.org/abs/2401.11605.",
+    )
+
     parser.add_argument(
         "--scale_v_pred_loss_like_noise_pred",
         action="store_true",

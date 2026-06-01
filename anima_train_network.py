@@ -1126,7 +1126,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if args.min_snr_gamma:
             # Anima timesteps are already in [0, 1] range (sigmas) — they are divided by 1000
             # in get_noise_pred_and_target before being returned
-            loss = apply_snr_weight_for_flow_matching(loss, timesteps, args.min_snr_gamma)
+            loss = apply_snr_weight_for_flow_matching(loss, timesteps, args.min_snr_gamma, soft=args.min_snr_gamma_soft)
         return loss
 
     def get_sai_model_spec(self, args):

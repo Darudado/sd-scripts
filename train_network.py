@@ -463,7 +463,7 @@ class NetworkTrainer:
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
         if args.min_snr_gamma:
-            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
+            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization, soft=args.min_snr_gamma_soft)
         if args.scale_v_pred_loss_like_noise_pred:
             loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
         if args.v_pred_like_loss:

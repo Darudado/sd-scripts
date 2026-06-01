@@ -777,7 +777,7 @@ def train(args):
 
                 # Min-SNR-γ for flow matching
                 if args.min_snr_gamma:
-                    loss = apply_snr_weight_for_flow_matching(loss, sigmas, args.min_snr_gamma)
+                    loss = apply_snr_weight_for_flow_matching(loss, sigmas, args.min_snr_gamma, soft=args.min_snr_gamma_soft)
 
                 if args.masked_loss or (
                     "alpha_masks" in batch and batch["alpha_masks"] is not None
