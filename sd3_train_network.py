@@ -30,6 +30,9 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.sample_prompts_te_outputs = None
 
+    def get_adaptive_model_type(self, args) -> str:
+        return "flow_matching"
+
     def assert_extra_args(
         self,
         args,

@@ -315,6 +315,9 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         self.is_swapping_blocks: bool = False
         self.rotary_pos_emb_cache = {}
 
+    def get_adaptive_model_type(self, args) -> str:
+        return "flow_matching"
+
     def assert_extra_args(
         self,
         args,

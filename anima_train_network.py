@@ -45,6 +45,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self.ileco_prompt_pairs = None
         self.addift_pair_settings = None
 
+    def get_adaptive_model_type(self, args) -> str:
+        return "flow_matching"
+
     def assert_extra_args(
         self,
         args,

@@ -104,6 +104,8 @@ class NetworkTrainer:
         self._adaptive_last_latents = None
         self._adaptive_last_noise = None
         self._adaptive_last_text_conds = None
+        self._adaptive_last_args = None
+        self._adaptive_last_batch = None
         self._adaptive_losses_before = None
 
         # Focal Frequency Loss config
@@ -388,6 +390,7 @@ class NetworkTrainer:
             # Store data for Algorithm 2 (delta computation after optimizer step)
             self._adaptive_last_latents = latents.detach()
             self._adaptive_last_noise = noise.detach()
+            self._adaptive_last_args = args
 
         noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
             args, noise_scheduler, latents, fixed_timesteps=adaptive_fixed_timesteps, is_train=is_train, pixel_counts=pixel_counts
@@ -511,12 +514,15 @@ class NetworkTrainer:
 
         text_masks = text_conds[1] if len(text_conds) > 1 else None
 
+        adaptive_args = self._adaptive_last_args
+        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
+
         def model_fn(noisy_latents, timesteps, wdtype):
             noisy_latents_in = noisy_latents.to(wdtype)
             encoder_mask_bias = text_masks
             return self.call_unet(
-                None, accelerator, unet, noisy_latents_in, timesteps,
-                text_conds, encoder_mask_bias, {}, wdtype,
+                adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
+                text_conds, encoder_mask_bias, adaptive_batch, wdtype,
             )
 
         # Compute per-timestep losses for a single x_0 at all T timesteps (for the queue)
@@ -548,12 +554,15 @@ class NetworkTrainer:
 
         text_masks = text_conds[1] if len(text_conds) > 1 else None
 
+        adaptive_args = self._adaptive_last_args
+        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
+
         def model_fn(noisy_latents, timesteps, wdtype):
             noisy_latents_in = noisy_latents.to(wdtype)
             encoder_mask_bias = text_masks
             return self.call_unet(
-                None, accelerator, unet, noisy_latents_in, timesteps,
-                text_conds, encoder_mask_bias, {}, wdtype,
+                adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
+                text_conds, encoder_mask_bias, adaptive_batch, wdtype,
             )
 
         # Algorithm 2: compute delta approximation. When a previous |S| selection
@@ -571,6 +580,16 @@ class NetworkTrainer:
         self._adaptive_last_latents = None
         self._adaptive_last_noise = None
         self._adaptive_last_text_conds = None
+        self._adaptive_last_args = None
+        self._adaptive_last_batch = None
+
+    def get_adaptive_model_type(self, args) -> str:
+        """Return the model type for the adaptive timestep sampler.
+
+        Subclasses should override this to return 'flow_matching' for
+        flow-matching architectures (Flux, SD3, Lumina, Anima, etc.).
+        """
+        return "ddpm"
 
     def get_sai_model_spec(self, args):
         return train_util.get_sai_model_spec(None, args, self.is_sdxl, True, False)
@@ -826,9 +845,10 @@ class NetworkTrainer:
                     if encoded_text_encoder_conds[i] is not None:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
-        # Store text encoder conditions for adaptive Algorithm 2
+        # Store text encoder conditions and batch for adaptive Algorithm 2
         if self.adaptive_manager is not None and is_train:
             self._adaptive_last_text_conds = [c.detach() if isinstance(c, torch.Tensor) else c for c in text_encoder_conds]
+            self._adaptive_last_batch = batch
 
         # sample noise, call unet, get target
         noise_pred, target, timesteps, weighting, noise = self.get_noise_pred_and_target(
@@ -1952,12 +1972,32 @@ class NetworkTrainer:
                         weights.pop(i)
                 # print(f"save model hook: {len(weights)} weights will be saved")
 
-            # save current ecpoch and step
+            # save current epoch and step
             train_state_file = os.path.join(output_dir, "train_state.json")
             # +1 is needed because the state is saved before current_step is set from global_step
             logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
             with open(train_state_file, "w", encoding="utf-8") as f:
                 json.dump({"current_epoch": current_epoch.value, "current_step": current_step.value + 1}, f)
+
+            # save adaptive timestep sampler state if enabled
+            if self.adaptive_manager is not None:
+                adaptive_state_file = os.path.join(output_dir, "adaptive_sampler_state.json")
+                logger.info(f"save adaptive sampler state to {adaptive_state_file}")
+                adaptive_state = self.adaptive_manager.state_dict()
+                # Convert tensors to lists for JSON serialization
+                adaptive_state_serializable = {
+                    "sampler_network": {k: v.tolist() if isinstance(v, torch.Tensor) else v for k, v in adaptive_state["sampler_network"].items()},
+                    "optimizer": adaptive_state["optimizer"],
+                    "queue": [q.tolist() if isinstance(q, torch.Tensor) else q for q in adaptive_state["queue"]],
+                    "learning_rate": adaptive_state["learning_rate"],
+                    "entropy_coeff": adaptive_state["entropy_coeff"],
+                    "f_s": adaptive_state["f_s"],
+                    "queue_size": adaptive_state["queue_size"],
+                    "num_selected": adaptive_state["num_selected"],
+                    "v_parameterization": adaptive_state.get("v_parameterization", False),
+                }
+                with open(adaptive_state_file, "w", encoding="utf-8") as f:
+                    json.dump(adaptive_state_serializable, f)
 
         steps_from_state = None
 
@@ -1979,6 +2019,26 @@ class NetworkTrainer:
                     data = json.load(f)
                 steps_from_state = data["current_step"]
                 logger.info(f"load train state from {train_state_file}: {data}")
+
+            # load adaptive timestep sampler state if available
+            if self.adaptive_manager is not None:
+                adaptive_state_file = os.path.join(input_dir, "adaptive_sampler_state.json")
+                if os.path.exists(adaptive_state_file):
+                    logger.info(f"load adaptive sampler state from {adaptive_state_file}")
+                    with open(adaptive_state_file, "r", encoding="utf-8") as f:
+                        adaptive_state_serializable = json.load(f)
+                    # Convert lists back to tensors
+                    adaptive_state = {
+                        "sampler_network": {k: torch.tensor(v, device=accelerator.device) if isinstance(v, list) else v for k, v in adaptive_state_serializable["sampler_network"].items()},
+                        "optimizer": adaptive_state_serializable["optimizer"],
+                        "queue": [torch.tensor(q, device=accelerator.device) if isinstance(q, list) else q for q in adaptive_state_serializable["queue"]],
+                        "learning_rate": adaptive_state_serializable["learning_rate"],
+                        "entropy_coeff": adaptive_state_serializable["entropy_coeff"],
+                        "f_s": adaptive_state_serializable["f_s"],
+                        "queue_size": adaptive_state_serializable["queue_size"],
+                        "num_selected": adaptive_state_serializable["num_selected"],
+                    }
+                    self.adaptive_manager.load_state_dict(adaptive_state)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -2056,6 +2116,10 @@ class NetworkTrainer:
             "ss_caption_tag_dropout_rate": args.caption_tag_dropout_rate,
             "ss_face_crop_aug_range": args.face_crop_aug_range,
             "ss_prior_loss_weight": args.prior_loss_weight,
+            "ss_adaptive_timestep_sampling": bool(getattr(args, "adaptive_timestep_sampling", False)),
+            "ss_adaptive_sampler_lr": args.adaptive_sampler_lr if getattr(args, "adaptive_timestep_sampling", False) else None,
+            "ss_adaptive_sampler_entropy_coeff": args.adaptive_sampler_entropy_coeff if getattr(args, "adaptive_timestep_sampling", False) else None,
+            "ss_adaptive_sampler_update_freq": args.adaptive_sampler_update_freq if getattr(args, "adaptive_timestep_sampling", False) else None,
             "ss_min_snr_gamma": args.min_snr_gamma,
             "ss_scale_weight_norms": args.scale_weight_norms,
             "ss_ip_noise_gamma": args.ip_noise_gamma,
@@ -2356,6 +2420,7 @@ class NetworkTrainer:
                 hidden_channels=args.adaptive_sampler_hidden_channels,
                 hidden_depth=args.adaptive_sampler_hidden_depth,
             ).to(accelerator.device)
+            adaptive_model_type = self.get_adaptive_model_type(args)
             self.adaptive_manager = AdaptiveTimestepManager(
                 sampler_network=sampler_net,
                 noise_scheduler=noise_scheduler,
@@ -2366,8 +2431,10 @@ class NetworkTrainer:
                 update_freq=args.adaptive_sampler_update_freq,
                 queue_size=args.adaptive_sampler_queue_size,
                 num_selected=args.adaptive_sampler_num_selected,
+                v_parameterization=args.v_parameterization,
+                model_type=adaptive_model_type,
             )
-            logger.info("Adaptive non-uniform timestep sampling enabled")
+            logger.info(f"Adaptive non-uniform timestep sampling enabled (model_type={adaptive_model_type})")
 
         train_util.init_trackers(accelerator, args, "network_train")
 

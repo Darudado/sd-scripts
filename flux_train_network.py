@@ -23,6 +23,7 @@ from library import (
     train_util,
 )
 from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.adaptive_timestep_sampler import TimestepSamplerNetwork, AdaptiveTimestepManager
 from library import utils
 from library.utils import setup_logging
 
@@ -39,6 +40,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_schnell: Optional[bool] = None
         self.is_swapping_blocks: bool = False
         self.model_type: Optional[str] = None
+
+    def get_adaptive_model_type(self, args) -> str:
+        return "flow_matching"
 
     def assert_extra_args(
         self,
@@ -457,6 +461,113 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
         return model_pred, target, timesteps, weighting, noise
+
+    def _create_flux_model_fn(self, unet, accelerator, text_conds, text_masks, batch, weight_dtype, args):
+        """Create a model_fn for the adaptive timestep sampler that handles the Flux pipeline.
+
+        This model_fn:
+        1. Packs the noisy latents
+        2. Runs the Flux DiT
+        3. Unpacks the output
+        4. Applies model_prediction_type preconditioning
+
+        Returns a function(noisy_latents, timesteps, weight_dtype) -> model_pred
+        """
+        l_pooled, t5_out, txt_ids, t5_attn_mask = text_conds
+        if not args.apply_t5_attn_mask:
+            t5_attn_mask = None
+
+        def model_fn(noisy_latents, timesteps, wdtype):
+            noisy_latents = noisy_latents.to(wdtype)
+            bsz = noisy_latents.shape[0]
+            packed_latent_height, packed_latent_width = noisy_latents.shape[2] // 2, noisy_latents.shape[3] // 2
+            packed_input = flux_utils.pack_latents(noisy_latents)
+            img_ids = flux_utils.prepare_img_ids(bsz, packed_latent_height, packed_latent_width).to(device=noisy_latents.device)
+            guidance_vec = torch.full((bsz,), float(args.guidance_scale), device=noisy_latents.device)
+
+            with torch.no_grad(), accelerator.autocast():
+                mod_vectors = unet.get_mod_vectors(timesteps=timesteps / 1000, guidance=guidance_vec, batch_size=bsz)
+                model_pred = unet(
+                    img=packed_input,
+                    img_ids=img_ids,
+                    txt=t5_out,
+                    txt_ids=txt_ids,
+                    y=l_pooled,
+                    timesteps=timesteps / 1000,
+                    guidance=guidance_vec,
+                    txt_attention_mask=t5_attn_mask,
+                    mod_vectors=mod_vectors,
+                )
+            model_pred = flux_utils.unpack_latents(model_pred, packed_latent_height, packed_latent_width)
+
+            # Apply model prediction type (sigma_scaled, additive, etc.)
+            sigmas = timesteps.float().to(noisy_latents.device) / args.num_timesteps if hasattr(args, 'num_timesteps') else timesteps.float().to(noisy_latents.device) / 1000
+            sigmas = sigmas.view(-1, 1, 1, 1)
+            model_pred, _ = flux_train_utils.apply_model_prediction_type(args, model_pred, noisy_latents, sigmas)
+            return model_pred
+
+        return model_fn
+
+    def compute_adaptive_delta_before_step(self, unet, noise_scheduler, weight_dtype, accelerator, global_step):
+        """Override for Flux: create a Flux-specific model_fn for Algorithm 2."""
+        if self.adaptive_manager is None:
+            return
+        if not self.adaptive_manager.should_update(global_step):
+            return
+
+        latents = self._adaptive_last_latents
+        noise = self._adaptive_last_noise
+        text_conds = self._adaptive_last_text_conds
+        adaptive_args = self._adaptive_last_args
+        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
+        if latents is None or noise is None or text_conds is None or adaptive_args is None:
+            return
+
+        text_masks = text_conds[1] if len(text_conds) > 1 else None
+        model_fn = self._create_flux_model_fn(unet, accelerator, text_conds, text_masks, adaptive_batch, weight_dtype, adaptive_args)
+
+        # Compute per-timestep losses for a single x_0 at all T timesteps (for the queue)
+        self._adaptive_losses_before = self.adaptive_manager.compute_per_timestep_losses(
+            latents, noise, model_fn, weight_dtype
+        )
+
+        # Cache per-timestep losses for the FULL batch at the current |S| timesteps
+        self.adaptive_manager.cache_batch_losses_at_S(
+            latents, noise, model_fn, weight_dtype
+        )
+
+    def compute_adaptive_delta_after_step(self, unet, noise_scheduler, weight_dtype, accelerator, network):
+        """Override for Flux: create a Flux-specific model_fn for Algorithm 2."""
+        if self.adaptive_manager is None or self._adaptive_losses_before is None:
+            return
+
+        latents = self._adaptive_last_latents
+        noise = self._adaptive_last_noise
+        text_conds = self._adaptive_last_text_conds
+        adaptive_args = self._adaptive_last_args
+        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
+        if latents is None or noise is None or text_conds is None or adaptive_args is None:
+            return
+
+        text_masks = text_conds[1] if len(text_conds) > 1 else None
+        model_fn = self._create_flux_model_fn(unet, accelerator, text_conds, text_masks, adaptive_batch, weight_dtype, adaptive_args)
+
+        # Algorithm 2: compute delta approximation
+        delta_approx, selected_indices = self.adaptive_manager.compute_delta_approximation(
+            model_fn, latents, noise, weight_dtype, self._adaptive_losses_before,
+            full_batch_latents=latents, full_batch_noise=noise,
+        )
+
+        # Update sampler via policy gradient (Algorithm 1, line 8)
+        self.adaptive_manager.update_sampler(delta_approx, latents[:1])
+
+        # Clear cached data
+        self._adaptive_losses_before = None
+        self._adaptive_last_latents = None
+        self._adaptive_last_noise = None
+        self._adaptive_last_text_conds = None
+        self._adaptive_last_args = None
+        self._adaptive_last_batch = None
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         if args.min_snr_gamma:

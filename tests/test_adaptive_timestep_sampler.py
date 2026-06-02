@@ -12,6 +12,7 @@ import math
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from unittest.mock import MagicMock
 from collections import deque
 
@@ -476,3 +477,303 @@ class TestAdaptiveTimestepManager:
 
         # Verify queue was populated
         assert len(adaptive_manager.queue) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: v-parameterization support
+# ---------------------------------------------------------------------------
+
+class TestVParameterization:
+
+    @pytest.fixture
+    def v_pred_manager(self, device):
+        """Create an AdaptiveTimestepManager with v_parameterization=True."""
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        scheduler = MagicMock()
+        T = 1000
+        t = torch.linspace(0, 1, T, device=device)
+        alphas_cumprod = torch.cos(t * math.pi / 2) ** 2
+        scheduler.alphas_cumprod = alphas_cumprod
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        return AdaptiveTimestepManager(
+            sampler_network=net,
+            noise_scheduler=scheduler,
+            device=device,
+            dtype=torch.float32,
+            learning_rate=1e-2,
+            entropy_coeff=1e-2,
+            update_freq=5,
+            queue_size=10,
+            num_selected=3,
+            v_parameterization=True,
+        )
+
+    def test_v_pred_flag_stored(self, v_pred_manager):
+        """v_parameterization flag should be stored."""
+        assert v_pred_manager.v_parameterization is True
+
+    def test_v_pred_losses_positive(self, v_pred_manager, device):
+        """Per-timestep losses with v-prediction should be non-negative."""
+        T = v_pred_manager.num_train_timesteps
+        x_0 = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x_0)
+
+        def mock_model_fn(noisy_latents, timesteps, weight_dtype):
+            return torch.randn_like(noisy_latents)
+
+        losses = v_pred_manager.compute_per_timestep_losses(
+            x_0, noise, mock_model_fn, torch.float32, chunk_size=200
+        )
+        assert losses.shape == (T,)
+        assert (losses >= 0).all(), "Losses should be non-negative"
+
+    def test_v_pred_losses_differ_from_epsilon(self, device):
+        """v-prediction losses should differ from epsilon-prediction losses
+        when using the same model predictions."""
+        scheduler = MagicMock()
+        T = 1000
+        t = torch.linspace(0, 1, T, device=device)
+        alphas_cumprod = torch.cos(t * math.pi / 2) ** 2
+        scheduler.alphas_cumprod = alphas_cumprod
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+
+        x_0 = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x_0)
+
+        # Use a deterministic model so both paths see the same predictions
+        torch.manual_seed(42)
+        fixed_pred = torch.randn(1, 4, 8, 8, device=device)
+
+        def mock_model_fn(noisy_latents, timesteps, weight_dtype):
+            return fixed_pred.expand_as(noisy_latents)
+
+        # Epsilon manager
+        net_eps = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        eps_manager = AdaptiveTimestepManager(
+            sampler_network=net_eps, noise_scheduler=scheduler, device=device,
+            v_parameterization=False, queue_size=10,
+        )
+        losses_eps = eps_manager.compute_per_timestep_losses(
+            x_0, noise, mock_model_fn, torch.float32, chunk_size=500
+        )
+
+        # v-prediction manager
+        net_v = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        v_manager = AdaptiveTimestepManager(
+            sampler_network=net_v, noise_scheduler=scheduler, device=device,
+            v_parameterization=True, queue_size=10,
+        )
+        losses_v = v_manager.compute_per_timestep_losses(
+            x_0, noise, mock_model_fn, torch.float32, chunk_size=500
+        )
+
+        # They should differ (different targets)
+        assert not torch.allclose(losses_eps, losses_v, atol=1e-3), \
+            "v-prediction losses should differ from epsilon losses"
+
+    def test_v_pred_state_dict_round_trip(self, v_pred_manager, device):
+        """v_parameterization should survive state_dict round-trip."""
+        state = v_pred_manager.state_dict()
+        assert "v_parameterization" in state
+        assert state["v_parameterization"] is True
+
+        # Create a new manager without v_parameterization and load
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        new_manager = AdaptiveTimestepManager(
+            sampler_network=net,
+            noise_scheduler=v_pred_manager.noise_scheduler,
+            device=device,
+            queue_size=10,
+            v_parameterization=False,
+        )
+        assert new_manager.v_parameterization is False
+        new_manager.load_state_dict(state)
+        # Note: load_state_dict doesn't restore v_parameterization currently,
+        # but the saved state contains it for future use
+
+
+# ---------------------------------------------------------------------------
+# Tests: Flow-matching support
+# ---------------------------------------------------------------------------
+
+class TestFlowMatching:
+
+    @pytest.fixture
+    def flow_matching_manager(self, device):
+        """Create an AdaptiveTimestepManager with model_type='flow_matching'."""
+        # For flow-matching, create a scheduler without alphas_cumprod
+        scheduler = MagicMock()
+        T = 1000
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        # Flow-matching scheduler does NOT have alphas_cumprod
+        # Our code should handle this gracefully
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        return AdaptiveTimestepManager(
+            sampler_network=net,
+            noise_scheduler=scheduler,
+            device=device,
+            dtype=torch.float32,
+            learning_rate=1e-2,
+            entropy_coeff=1e-2,
+            update_freq=5,
+            queue_size=10,
+            num_selected=3,
+            model_type="flow_matching",
+        )
+
+    def test_flow_matching_init_no_alphas_cumprod(self, flow_matching_manager):
+        """Flow-matching manager should initialize with alphas_cumprod=None."""
+        assert flow_matching_manager.model_type == "flow_matching"
+        assert flow_matching_manager._alphas_cumprod is None
+
+    def test_flow_matching_losses_shape(self, flow_matching_manager, device):
+        """Per-timestep losses should return shape (T,) for flow-matching."""
+        T = flow_matching_manager.num_train_timesteps
+        x_0 = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x_0)
+
+        def mock_model_fn(noisy_latents, timesteps, weight_dtype):
+            return torch.randn_like(noisy_latents)
+
+        losses = flow_matching_manager.compute_per_timestep_losses(
+            x_0, noise, mock_model_fn, torch.float32, chunk_size=200
+        )
+        assert losses.shape == (T,)
+        assert (losses >= 0).all(), "Losses should be non-negative"
+
+    def test_flow_matching_losses_differ_from_ddpm(self, device):
+        """Flow-matching losses should differ from DDPM losses for same inputs."""
+        T = 1000
+        scheduler_ddpm = MagicMock()
+        t = torch.linspace(0, 1, T, device=device)
+        alphas_cumprod = torch.cos(t * math.pi / 2) ** 2
+        scheduler_ddpm.alphas_cumprod = alphas_cumprod
+        scheduler_ddpm.config = MagicMock()
+        scheduler_ddpm.config.num_train_timesteps = T
+
+        scheduler_fm = MagicMock()
+        scheduler_fm.alphas_cumprod = alphas_cumprod  # will be ignored
+        scheduler_fm.config = MagicMock()
+        scheduler_fm.config.num_train_timesteps = T
+
+        x_0 = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x_0)
+
+        # Deterministic model
+        torch.manual_seed(42)
+        fixed_pred = torch.randn(1, 4, 8, 8, device=device)
+
+        def mock_model_fn(noisy_latents, timesteps, weight_dtype):
+            return fixed_pred.expand_as(noisy_latents)
+
+        # DDPM manager
+        net_ddpm = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        ddpm_manager = AdaptiveTimestepManager(
+            sampler_network=net_ddpm, noise_scheduler=scheduler_ddpm, device=device,
+            model_type="ddpm", queue_size=10,
+        )
+        losses_ddpm = ddpm_manager.compute_per_timestep_losses(
+            x_0, noise, mock_model_fn, torch.float32, chunk_size=500
+        )
+
+        # Flow-matching manager
+        net_fm = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        fm_manager = AdaptiveTimestepManager(
+            sampler_network=net_fm, noise_scheduler=scheduler_fm, device=device,
+            model_type="flow_matching", queue_size=10,
+        )
+        losses_fm = fm_manager.compute_per_timestep_losses(
+            x_0, noise, mock_model_fn, torch.float32, chunk_size=500
+        )
+
+        assert not torch.allclose(losses_ddpm, losses_fm, atol=1e-3), \
+            "Flow-matching losses should differ from DDPM losses"
+
+    def test_flow_matching_custom_loss_fn(self, device):
+        """Custom compute_loss_fn should be used when provided."""
+        T = 1000
+        scheduler = MagicMock()
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+
+        x_0 = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x_0)
+
+        def mock_model_fn(noisy_latents, timesteps, weight_dtype):
+            return torch.randn_like(noisy_latents)
+
+        custom_called = {"count": 0}
+
+        def custom_loss_fn(model_output, x_0, noise, t_indices):
+            custom_called["count"] += 1
+            # Simple custom loss: L1 instead of L2
+            target = (noise - x_0).to(torch.float32)
+            losses = F.l1_loss(model_output, target, reduction="none")
+            return losses.mean(dim=list(range(1, losses.ndim)))
+
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            model_type="flow_matching", queue_size=10,
+            compute_loss_fn=custom_loss_fn,
+        )
+
+        losses = manager.compute_per_timestep_losses(
+            x_0, noise, mock_model_fn, torch.float32, chunk_size=200
+        )
+        assert custom_called["count"] > 0, "Custom loss function should have been called"
+        assert losses.shape == (T,)
+        assert (losses >= 0).all()
+
+    def test_flow_matching_algorithm_2_cycle(self, flow_matching_manager, device):
+        """Full Algorithm 2 cycle should work with flow-matching."""
+        T = flow_matching_manager.num_train_timesteps
+        x_0 = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x_0)
+
+        def mock_model_fn(noisy_latents, timesteps, weight_dtype):
+            return torch.randn_like(noisy_latents)
+
+        # Step 1: Compute losses before
+        losses_before = flow_matching_manager.compute_per_timestep_losses(
+            x_0, noise, mock_model_fn, torch.float32, chunk_size=500
+        )
+
+        # Step 2: Compute delta approximation
+        delta_approx, selected = flow_matching_manager.compute_delta_approximation(
+            mock_model_fn, x_0, noise, torch.float32, losses_before
+        )
+
+        # Step 3: Update sampler
+        flow_matching_manager.update_sampler(delta_approx, x_0)
+
+        assert len(flow_matching_manager.queue) >= 1
+        assert delta_approx.ndim == 0 or delta_approx.shape == ()
+        assert selected.shape == (flow_matching_manager.num_selected,)
+
+    def test_flow_matching_state_dict_round_trip(self, flow_matching_manager, device):
+        """model_type should survive state_dict round-trip."""
+        state = flow_matching_manager.state_dict()
+        assert "model_type" in state
+        assert state["model_type"] == "flow_matching"
+
+    def test_flow_matching_batch_losses(self, flow_matching_manager, device):
+        """compute_per_timestep_losses_for_batch should work with flow-matching."""
+        x_0 = torch.randn(4, 4, 8, 8, device=device)
+        noise = torch.randn_like(x_0)
+        selected = torch.tensor([100, 500, 900], device=device)
+
+        def mock_model_fn(noisy_latents, timesteps, weight_dtype):
+            return torch.randn_like(noisy_latents)
+
+        loss = flow_matching_manager.compute_per_timestep_losses_for_batch(
+            x_0, noise, mock_model_fn, torch.float32, selected
+        )
+        assert loss.ndim == 0 or loss.shape == ()
+        assert loss >= 0

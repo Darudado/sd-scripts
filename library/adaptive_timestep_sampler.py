@@ -190,6 +190,10 @@ class AdaptiveTimestepManager:
         update_freq: int = 40,  # f_S
         queue_size: int = 20,  # |Q|
         num_selected: int = 3,  # |S|
+        v_parameterization: bool = False,
+        # Flow-matching support
+        model_type: str = "ddpm",  # "ddpm" or "flow_matching"
+        compute_loss_fn=None,  # Optional: (model_output, x_0, noise, t_indices) -> per_sample_losses
     ):
         self.sampler_network = sampler_network.to(device=device, dtype=dtype)
         self.device = device
@@ -233,13 +237,28 @@ class AdaptiveTimestepManager:
         self._prev_batch_latents: Optional[torch.Tensor] = None
         self._prev_batch_noise: Optional[torch.Tensor] = None
 
-        # Precompute alphas_cumprod on device for noise addition
-        self._alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=device, dtype=dtype)
+        # Model type: "ddpm" or "flow_matching"
+        self.model_type = model_type
+
+        # Precompute alphas_cumprod on device for noise addition (DDPM only)
+        if model_type == "ddpm":
+            self._alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=device, dtype=dtype)
+        else:
+            self._alphas_cumprod = None
+
+        # Loss target type: epsilon prediction vs v-prediction (DDPM only)
+        self.v_parameterization = v_parameterization
+
+        # Custom loss function for flow-matching models
+        # Signature: (model_output, x_0, noise, t_indices) -> per_sample_losses
+        # When provided, overrides the default DDPM/v-pred loss computation.
+        self._compute_loss_fn = compute_loss_fn
 
         logger.info(
             f"AdaptiveTimestepManager initialized: lr={learning_rate}, "
             f"entropy_coeff={entropy_coeff}, f_S={update_freq}, "
-            f"|Q|={queue_size}, |S|={num_selected}"
+            f"|Q|={queue_size}, |S|={num_selected}, v_pred={v_parameterization}, "
+            f"model_type={model_type}, custom_loss_fn={compute_loss_fn is not None}"
         )
 
     def should_update(self, global_step: int) -> bool:
@@ -296,6 +315,10 @@ class AdaptiveTimestepManager:
         This is used by Algorithm 2 to evaluate the impact of gradient updates.
         For efficiency, processes timesteps in chunks to avoid OOM.
 
+        Supports both DDPM-style and flow-matching noise addition.
+        For flow-matching models, a custom compute_loss_fn can be provided
+        at initialization to handle model-specific loss computation.
+
         Args:
             x_0_latent: Single latent, shape (1, C, H, W)
             noise: Corresponding noise, shape (1, C, H, W)
@@ -307,7 +330,6 @@ class AdaptiveTimestepManager:
             losses: Per-timestep losses, shape (T,)
         """
         T = self.num_train_timesteps
-        alphas_cumprod = self._alphas_cumprod
 
         # Expand x_0 and noise to single sample
         x_0 = x_0_latent[:1]  # (1, C, H, W)
@@ -323,29 +345,65 @@ class AdaptiveTimestepManager:
             # Create chunk of timesteps
             t_chunk = t_indices  # (chunk_len,)
 
-            # Add noise at each timestep: x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
-            alpha_bar_t = alphas_cumprod[t_indices].view(-1, 1, 1, 1)  # (chunk_len, 1, 1, 1)
-            sqrt_alpha = torch.sqrt(alpha_bar_t)
-            sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_bar_t)
+            if self.model_type == "flow_matching":
+                # Flow-matching noise addition: x_t = sigma * noise + (1 - sigma) * x_0
+                # where sigma = t / T (continuous in [0, 1])
+                sigmas = t_indices.float().to(self.device) / T  # (chunk_len,)
+                sigmas_view = sigmas.view(-1, 1, 1, 1)  # (chunk_len, 1, 1, 1)
 
-            # Expand x_0 and noise to match chunk size
-            x_0_expanded = x_0.expand(chunk_len, -1, -1, -1)
-            eps_expanded = eps.expand(chunk_len, -1, -1, -1)
+                x_0_expanded = x_0.expand(chunk_len, -1, -1, -1)
+                eps_expanded = eps.expand(chunk_len, -1, -1, -1)
 
-            x_t = sqrt_alpha * x_0_expanded + sqrt_one_minus_alpha * eps_expanded
-            x_t = x_t.to(weight_dtype)
+                x_t = sigmas_view * eps_expanded + (1.0 - sigmas_view) * x_0_expanded
+                x_t = x_t.to(weight_dtype)
 
-            # Forward pass through the model
-            with torch.no_grad():
-                noise_pred = model_fn(x_t, t_chunk, weight_dtype)
+                # Forward pass through the model
+                with torch.no_grad():
+                    model_output = model_fn(x_t, t_chunk, weight_dtype)
 
-            # Compute MSE loss for each timestep
-            # Target is noise (epsilon prediction)
-            noise_pred = noise_pred.to(torch.float32)
-            eps_target = eps_expanded.to(torch.float32)
-            chunk_losses = F.mse_loss(noise_pred, eps_target, reduction="none")
-            # Mean over all dims except batch (which is per-timestep here)
-            chunk_losses = chunk_losses.mean(dim=list(range(1, chunk_losses.ndim)))
+                # Compute loss
+                model_output = model_output.to(torch.float32)
+                if self._compute_loss_fn is not None:
+                    # Custom loss function for model-specific loss computation
+                    chunk_losses = self._compute_loss_fn(model_output, x_0_expanded, eps_expanded, t_indices)
+                else:
+                    # Default flow-matching: velocity prediction target v = noise - x_0
+                    target = (eps_expanded - x_0_expanded).to(torch.float32)
+                    chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                    chunk_losses = chunk_losses.mean(dim=list(range(1, chunk_losses.ndim)))
+            else:
+                # DDPM noise addition: x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
+                alphas_cumprod = self._alphas_cumprod
+                alpha_bar_t = alphas_cumprod[t_indices].view(-1, 1, 1, 1)  # (chunk_len, 1, 1, 1)
+                sqrt_alpha = torch.sqrt(alpha_bar_t)
+                sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_bar_t)
+
+                # Expand x_0 and noise to match chunk size
+                x_0_expanded = x_0.expand(chunk_len, -1, -1, -1)
+                eps_expanded = eps.expand(chunk_len, -1, -1, -1)
+
+                x_t = sqrt_alpha * x_0_expanded + sqrt_one_minus_alpha * eps_expanded
+                x_t = x_t.to(weight_dtype)
+
+                # Forward pass through the model
+                with torch.no_grad():
+                    model_output = model_fn(x_t, t_chunk, weight_dtype)
+
+                # Compute MSE loss for each timestep
+                model_output = model_output.to(torch.float32)
+                if self._compute_loss_fn is not None:
+                    chunk_losses = self._compute_loss_fn(model_output, x_0_expanded, eps_expanded, t_indices)
+                elif self.v_parameterization:
+                    # v-prediction target: v = sqrt(alpha_bar) * eps - sqrt(1 - alpha_bar) * x_0
+                    target = sqrt_alpha * eps_expanded - sqrt_one_minus_alpha * x_0_expanded
+                    target = target.to(torch.float32)
+                    chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                    chunk_losses = chunk_losses.mean(dim=list(range(1, chunk_losses.ndim)))
+                else:
+                    # epsilon prediction target
+                    target = eps_expanded.to(torch.float32)
+                    chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                    chunk_losses = chunk_losses.mean(dim=list(range(1, chunk_losses.ndim)))
 
             losses[start:end] = chunk_losses
 
@@ -492,35 +550,71 @@ class AdaptiveTimestepManager:
         Returns:
             delta_approx: Scalar approximation of Δ̃_k^t averaged over batch and timesteps
         """
-        alphas_cumprod = self._alphas_cumprod
+        T = self.num_train_timesteps
         B = x_0_latent.shape[0]
         S = selected_indices.shape[0]
-
-        # Get alpha_bar for selected timesteps
-        alpha_bar_t = alphas_cumprod[selected_indices].view(S, 1, 1, 1)  # (S, 1, 1, 1)
-        sqrt_alpha = torch.sqrt(alpha_bar_t)
-        sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_bar_t)
 
         # Expand: (B, C, H, W) -> (B*S, C, H, W) by repeating
         x_0_exp = x_0_latent.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, *x_0_latent.shape[1:])
         eps_exp = noise.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, *noise.shape[1:])
 
-        # Expand timestep parameters to match: (S,) -> (B*S,)
-        sqrt_alpha_exp = sqrt_alpha.expand(-1, -1, -1, -1).repeat(B, 1, 1, 1).reshape(B * S, 1, 1, 1)
-        sqrt_one_minus_exp = sqrt_one_minus_alpha.expand(-1, -1, -1, -1).repeat(B, 1, 1, 1).reshape(B * S, 1, 1, 1)
-
-        x_t = sqrt_alpha_exp * x_0_exp + sqrt_one_minus_exp * eps_exp
-        x_t = x_t.to(weight_dtype)
-
         timesteps_exp = selected_indices.unsqueeze(0).expand(B, -1).reshape(B * S)
 
-        with torch.no_grad():
-            noise_pred = model_fn(x_t, timesteps_exp, weight_dtype)
+        if self.model_type == "flow_matching":
+            # Flow-matching noise addition: x_t = sigma * noise + (1 - sigma) * x_0
+            sigmas = selected_indices.float().to(self.device) / T  # (S,)
+            sigmas_exp = sigmas.unsqueeze(0).expand(B, -1).reshape(B * S)  # (B*S,)
+            sigmas_view = sigmas_exp.view(-1, 1, 1, 1)  # (B*S, 1, 1, 1)
 
-        noise_pred = noise_pred.to(torch.float32)
-        eps_target = eps_exp.to(torch.float32)
-        losses = F.mse_loss(noise_pred, eps_target, reduction="none")
-        losses = losses.mean(dim=list(range(1, losses.ndim)))  # (B*S,)
+            x_t = sigmas_view * eps_exp + (1.0 - sigmas_view) * x_0_exp
+            x_t = x_t.to(weight_dtype)
+
+            with torch.no_grad():
+                model_output = model_fn(x_t, timesteps_exp, weight_dtype)
+
+            model_output = model_output.to(torch.float32)
+            if self._compute_loss_fn is not None:
+                # Custom loss function
+                losses = self._compute_loss_fn(model_output, x_0_exp, eps_exp, selected_indices)
+                if losses.ndim > 1:
+                    losses = losses.mean(dim=list(range(1, losses.ndim)))
+            else:
+                # Default flow-matching: velocity prediction target v = noise - x_0
+                target = (eps_exp - x_0_exp).to(torch.float32)
+                losses = F.mse_loss(model_output, target, reduction="none")
+                losses = losses.mean(dim=list(range(1, losses.ndim)))
+        else:
+            # DDPM noise addition
+            alphas_cumprod = self._alphas_cumprod
+            alpha_bar_t = alphas_cumprod[selected_indices].view(S, 1, 1, 1)
+            sqrt_alpha = torch.sqrt(alpha_bar_t)
+            sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_bar_t)
+
+            sqrt_alpha_exp = sqrt_alpha.expand(-1, -1, -1, -1).repeat(B, 1, 1, 1).reshape(B * S, 1, 1, 1)
+            sqrt_one_minus_exp = sqrt_one_minus_alpha.expand(-1, -1, -1, -1).repeat(B, 1, 1, 1).reshape(B * S, 1, 1, 1)
+
+            x_t = sqrt_alpha_exp * x_0_exp + sqrt_one_minus_exp * eps_exp
+            x_t = x_t.to(weight_dtype)
+
+            with torch.no_grad():
+                model_output = model_fn(x_t, timesteps_exp, weight_dtype)
+
+            model_output = model_output.to(torch.float32)
+            if self._compute_loss_fn is not None:
+                losses = self._compute_loss_fn(model_output, x_0_exp, eps_exp, selected_indices)
+                if losses.ndim > 1:
+                    losses = losses.mean(dim=list(range(1, losses.ndim)))
+            elif self.v_parameterization:
+                # v-prediction target: v = sqrt(alpha_bar) * eps - sqrt(1 - alpha_bar) * x_0
+                target = sqrt_alpha_exp * eps_exp - sqrt_one_minus_exp * x_0_exp
+                target = target.to(torch.float32)
+                losses = F.mse_loss(model_output, target, reduction="none")
+                losses = losses.mean(dim=list(range(1, losses.ndim)))
+            else:
+                # epsilon prediction target
+                target = eps_exp.to(torch.float32)
+                losses = F.mse_loss(model_output, target, reduction="none")
+                losses = losses.mean(dim=list(range(1, losses.ndim)))
 
         # Reshape to (B, S) and average
         losses = losses.reshape(B, S)
@@ -606,6 +700,8 @@ class AdaptiveTimestepManager:
             "f_s": self.f_s,
             "queue_size": self.queue_size,
             "num_selected": self.num_selected,
+            "v_parameterization": self.v_parameterization,
+            "model_type": self.model_type,
         }
 
     def load_state_dict(self, state_dict: Dict):

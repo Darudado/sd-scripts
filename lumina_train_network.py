@@ -38,6 +38,9 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         self.sample_prompts_te_outputs = None
         self.is_swapping_blocks: bool = False
 
+    def get_adaptive_model_type(self, args) -> str:
+        return "flow_matching"
+
     def assert_extra_args(self, args, train_dataset_group, val_dataset_group):
         super().assert_extra_args(args, train_dataset_group, val_dataset_group)
 
