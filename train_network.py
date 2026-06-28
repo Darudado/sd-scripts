@@ -905,11 +905,18 @@ class NetworkTrainer:
             if self.wavelet_masking_enabled and self._noisy_latents is not None:
                 with torch.no_grad():
                     A = train_util.compute_wavelet_attention_map(self._noisy_latents, self.wavelet_dwt)
+                    # Flow-matching trainers (Flux/SD3/Anima/Lumina/Hunyuan) return
+                    # timesteps in [0, 1]; DDPM trainers return them in [0, T].
+                    # get_adaptive_model_type() is the explicit discriminator
+                    # (overridden to "flow_matching" by all flow trainers, defaults
+                    # to "ddpm" in the base class).
+                    is_flow_matching = self.get_adaptive_model_type(args) == "flow_matching"
                     M = train_util.get_wavelet_mask(
                         A,
                         l=float(getattr(args, "wavelet_mask_l_bound", 0.3)),
                         T=noise_scheduler.config.num_train_timesteps,
                         timesteps=timesteps,
+                        flow_matching=is_flow_matching,
                     )
                 # M shape: (B, 1, H, W), loss shape: (B, C, H, W) or (B, seq_len)
                 if loss.ndim == 4 and loss.shape[2:] == M.shape[2:]:

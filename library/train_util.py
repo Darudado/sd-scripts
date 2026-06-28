@@ -8416,6 +8416,7 @@ def get_wavelet_mask(
     l: float,
     T: int,
     timesteps: torch.Tensor,
+    flow_matching: bool = False,
 ) -> torch.Tensor:
     """
     Compute the time-dependent binary mask for LWD wavelet masking.
@@ -8429,11 +8430,25 @@ def get_wavelet_mask(
     - High-frequency regions (A close to 1) receive up to (1+l)*T steps
     - Smooth regions (A close to 0) receive l*T steps (the minimum)
 
+    Timestep scale handling:
+    Eq. 6 is scale-invariant (M_t = 1 iff (A+l) >= t/T). Flow-matching
+    trainers (Flux/SD3/Anima/Lumina/Hunyuan) divide timesteps by 1000 before
+    returning them (t in [0, 1]), whereas DDPM trainers keep them in [0, T].
+    The caller must pass ``flow_matching=True`` when timesteps are in [0, 1]
+    so they are rescaled to [0, T] before the comparison. Without this,
+    flow-matching trainers would always produce an all-ones mask
+    (wavelet_mask_ratio stuck at 1.0).
+
     Args:
         A: Wavelet attention map of shape (B, H, W), values in [0, 1]
         l: Lower bound on supervision fraction (paper optimal: 0.3)
         T: Total number of diffusion timesteps (e.g., 1000)
-        timesteps: Current timestep per sample, shape (B,)
+        timesteps: Current timestep per sample, shape (B,). In [0, T] for
+            DDPM trainers, or [0, 1] for flow-matching trainers (when
+            ``flow_matching=True``).
+        flow_matching: If True, timesteps are in [0, 1] and are rescaled
+            to [0, T] before applying Eq. 6. Defaults to False (DDPM
+            convention, timesteps already in [0, T]).
 
     Returns:
         mask: Binary mask of shape (B, 1, H, W), values {0.0, 1.0}
@@ -8445,8 +8460,21 @@ def get_wavelet_mask(
     original_dtype = A.dtype
     A_f32 = A.to(dtype=torch.float32, device=device)
 
+    # Normalize timesteps to the [0, T] scale.
+    # Flow-matching trainers (Flux/SD3/Anima/Lumina/Hunyuan) divide timesteps by
+    # 1000 before returning them (t in [0, 1]), whereas DDPM trainers keep them in
+    # [0, T]. Eq. 6 is scale-invariant: M_t = 1 iff T*(A+l) >= t, i.e. iff
+    # (A+l) >= t/T. When flow_matching=True, rescale t from [0, 1] to [0, T] so
+    # the comparison is correct. Without this, flow-matching trainers would
+    # always produce an all-ones mask (wavelet_mask_ratio stuck at 1.0).
+    t_f32 = timesteps.to(dtype=torch.float32, device=device)
+    if flow_matching:
+        t_scaled = t_f32 * float(T)
+    else:
+        t_scaled = t_f32
+
     # Broadcast timesteps to spatial dims: (B, 1, 1) -> (B, H, W)
-    t_matrix = timesteps.to(dtype=torch.float32, device=device).view(B, 1, 1).expand(B, H, W)
+    t_matrix = t_scaled.view(B, 1, 1).expand(B, H, W)
 
     # Compute threshold: T * (A + l)  (Eq. 6)
     thresholds = T * (A_f32 + l)  # (B, H, W)
