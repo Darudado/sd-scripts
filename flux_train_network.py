@@ -53,12 +53,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         super().assert_extra_args(args, train_dataset_group, val_dataset_group)
         # sdxl_train_util.verify_sdxl_training_args(args)
 
-        self.model_type = args.model_type  # "flux" or "chroma"
-        if self.model_type != "chroma":
+        self.model_type = args.model_type  # "flux", "chroma", or "chroma_radiance"
+        if self.model_type not in ("chroma", "chroma_radiance"):
             self.use_clip_l = True
         else:
-            self.use_clip_l = False  # Chroma does not use CLIP-L
-            assert args.apply_t5_attn_mask, "apply_t5_attn_mask must be True for Chroma / Chromaではapply_t5_attn_maskを指定する必要があります"
+            self.use_clip_l = False  # Chroma / ChromaRadiance do not use CLIP-L
+            assert args.apply_t5_attn_mask, "apply_t5_attn_mask must be True for Chroma / ChromaRadiance / Chromaではapply_t5_attn_maskを指定する必要があります"
 
         if args.fp8_base_unet:
             args.fp8_base = True  # if fp8_base_unet is enabled, fp8_base is also enabled for FLUX.1
@@ -109,7 +109,11 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         # currently offload to cpu for some models
 
         # if the file is fp8 and we are using fp8_base, we can load it as is (fp8)
-        loading_dtype = None if args.fp8_base else weight_dtype
+        # keep_unet_dtype: always load in native dtype
+        if args.keep_unet_dtype:
+            loading_dtype = None
+        else:
+            loading_dtype = None if args.fp8_base else weight_dtype
 
         # if we load to cpu, flux.to(fp8) takes a long time, so we should load to gpu in future
         _, model = flux_utils.load_flow_model(
@@ -119,7 +123,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             disable_mmap=args.disable_mmap_load_safetensors,
             model_type=self.model_type,
         )
-        if args.fp8_base:
+        if args.fp8_base and not args.keep_unet_dtype:
             # check dtype of model
             if model.dtype == torch.float8_e4m3fnuz or model.dtype == torch.float8_e5m2 or model.dtype == torch.float8_e5m2fnuz:
                 raise ValueError(f"Unsupported fp8 model dtype: {model.dtype}")
@@ -131,6 +135,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                     " / FLUXモデルをfp8に変換しています。これには時間がかかる場合があります。fp8チェックポイントを使用することで時間を短縮できます。"
                 )
                 model.to(torch.float8_e4m3fn)
+        elif args.keep_unet_dtype:
+            logger.info(f"Keeping FLUX model in its loaded dtype: {model.dtype}")
+
+        if self.model_type == "chroma_radiance" and hasattr(args, "nerf_tile_size") and args.nerf_tile_size > 0:
+            model.params.nerf_tile_size = args.nerf_tile_size
+            logger.info(f"NeRF head tiling enabled with tile_size={args.nerf_tile_size}")
 
         # if args.split_mode:
         #     model = self.prepare_split_model(model, weight_dtype, accelerator)
@@ -148,7 +158,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         if self.use_clip_l:
             clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
         else:
-            clip_l = flux_utils.dummy_clip_l()  # dummy CLIP-L for Chroma, which does not use CLIP-L
+            clip_l = flux_utils.dummy_clip_l()  # dummy CLIP-L for Chroma / ChromaRadiance, which does not use CLIP-L
         clip_l.eval()
 
         # if the file is fp8 and we are using fp8_base (not unet), we can load it as is (fp8)
@@ -163,23 +173,32 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         if args.fp8_base and not args.fp8_base_unet:
             # check dtype of model
             if t5xxl.dtype == torch.float8_e4m3fnuz or t5xxl.dtype == torch.float8_e5m2 or t5xxl.dtype == torch.float8_e5m2fnuz:
-                raise ValueError(f"Unsupported fp8 model dtype: {t5xxl.dtype}")
+                raise ValueError(f"Unsupported fp8 t5xxl dtype: {t5xxl.dtype}")
             elif t5xxl.dtype == torch.float8_e4m3fn:
                 logger.info("Loaded fp8 T5XXL model")
 
-        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
+        if self.model_type == "chroma_radiance":
+            # Pixel-space model doesn't need a real VAE
+            ae = flux_utils._DummyVAE(weight_dtype, "cpu")
+        else:
+            ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
 
         if args.use_ramtorch and not args.cache_text_encoder_outputs:
             clip_l = apply_ramtorch_to_module(clip_l, "clip_l", accelerator.device, weight_dtype)
             t5xxl = apply_ramtorch_to_module(t5xxl, "t5xxl", accelerator.device, t5xxl.dtype)
 
-        model_version = flux_utils.MODEL_VERSION_FLUX_V1 if self.model_type != "chroma" else flux_utils.MODEL_VERSION_CHROMA
+        if self.model_type == "chroma_radiance":
+            model_version = flux_utils.MODEL_VERSION_CHROMA_RADIANCE
+        elif self.model_type == "chroma":
+            model_version = flux_utils.MODEL_VERSION_CHROMA
+        else:
+            model_version = flux_utils.MODEL_VERSION_FLUX_V1
         return model_version, [clip_l, t5xxl], ae, model
 
     def get_tokenize_strategy(self, args):
         # This method is called before `assert_extra_args`, so we cannot use `self.is_schnell` here.
         # Instead, we analyze the checkpoint state to determine if it is schnell.
-        if args.model_type != "chroma":
+        if args.model_type not in ("chroma", "chroma_radiance"):
             _, is_schnell, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
         else:
             is_schnell = False
@@ -200,6 +219,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         return [tokenize_strategy.clip_l, tokenize_strategy.t5xxl]
 
     def get_latents_caching_strategy(self, args):
+        if self.model_type == "chroma_radiance":
+            return None  # pixel-space model, no latent caching needed
         latents_caching_strategy = strategy_flux.FluxLatentsCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, False)
         return latents_caching_strategy
 
@@ -312,7 +333,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         text_encoders = self.get_models_for_text_encoding(args, accelerator, text_encoders)
 
         flux_train_utils.sample_images(
-            accelerator, args, epoch, global_step, flux, ae, text_encoders, self.sample_prompts_te_outputs
+            accelerator, args, epoch, global_step, flux, ae, text_encoders, self.sample_prompts_te_outputs,
+            is_chroma_radiance=(self.model_type == "chroma_radiance"),
         )
 
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
@@ -321,6 +343,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         return noise_scheduler
 
     def encode_images_to_latents(self, args, vae, images):
+        if self.model_type == "chroma_radiance":
+            return images  # pixel-space model, no VAE encoding needed
         return vae.encode(images)
 
     def shift_scale_latents(self, args, latents):
@@ -355,6 +379,31 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_model_input.detach()
 
+        # --- ChromaRadiance: pixel-space forward (no pack/unpack) ---
+        if self.model_type == "chroma_radiance":
+            l_pooled, t5_out, txt_ids, t5_attn_mask = text_encoder_conds
+            if not args.apply_t5_attn_mask:
+                t5_attn_mask = None
+
+            self.apply_tlora_mask(timesteps)
+
+            with torch.set_grad_enabled(is_train), accelerator.autocast():
+                model_pred = unet(
+                    x=noisy_model_input,
+                    t=timesteps / 1000,
+                    txt=t5_out,
+                    txt_mask=t5_attn_mask,
+                )
+
+            self.clear_tlora_mask_if_needed()
+
+            model_pred, weighting = flux_train_utils.apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas)
+
+            target = noise - latents
+
+            return model_pred, target, timesteps, weighting, noise
+
+        # --- Standard Flux/Chroma latent-space path ---
         # pack latents and get img_ids
         packed_noisy_model_input = flux_utils.pack_latents(noisy_model_input)  # b, c, h*2, w*2 -> b, h*w, c*4
         packed_latent_height, packed_latent_width = noisy_model_input.shape[2] // 2, noisy_model_input.shape[3] // 2
@@ -577,7 +626,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         return loss
 
     def get_sai_model_spec(self, args):
-        if self.model_type != "chroma":
+        if self.model_type == "chroma_radiance":
+            model_description = "chroma_radiance"
+        elif self.model_type != "chroma":
             model_description = "schnell" if self.is_schnell else "dev"
         else:
             model_description = "chroma"
@@ -672,6 +723,13 @@ def setup_parser() -> argparse.ArgumentParser:
         # + "/[実験的] Fluxモデルの分割モードを使用する。ネットワーク引数`train_blocks=single`が必要",
         help="[Deprecated] This option is deprecated. Please use `--blocks_to_swap` instead."
         " / このオプションは非推奨です。代わりに`--blocks_to_swap`を使用してください。",
+    )
+    parser.add_argument(
+        "--nerf_tile_size",
+        type=int,
+        default=0,
+        help="tile size for NeRF head processing in Chroma Radiance (0=disabled, 128=process 128 patches at a time) "
+        "/ Chroma RadianceのNeRFヘッドのタイルサイズ（0=無効、128=128パッチずつ処理）",
     )
     return parser
 

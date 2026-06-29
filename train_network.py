@@ -1698,10 +1698,13 @@ class NetworkTrainer:
             # logger.info(f"set U-Net weight dtype to {unet_weight_dtype}, device to {accelerator.device}")
             # unet.to(accelerator.device, dtype=unet_weight_dtype)  # this seems to be safer than above
             logger.info(f"set U-Net weight dtype to {unet_weight_dtype}")
-            unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
+            if not args.keep_unet_dtype:
+                unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
+            else:
+                accelerator.print(f"keeping U-Net in its loaded dtype (skip fp8 cast)")
 
         unet.requires_grad_(False)
-        if self.cast_unet(args):
+        if self.cast_unet(args) and not args.keep_unet_dtype:
             unet.to(dtype=unet_weight_dtype)
         for i, t_enc in enumerate(text_encoders):
             t_enc.requires_grad_(False)
