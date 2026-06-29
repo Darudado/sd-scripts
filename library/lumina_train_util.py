@@ -864,6 +864,16 @@ def get_noisy_model_input_and_timesteps(
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))  # we are pre-packed so must adjust for packed size
         sigmas = time_shift(mu, 1.0, sigmas)
         timesteps = sigmas * num_timesteps
+    elif args.timestep_sampling == "hump":
+        # Inverted parabola distribution centered at hump_center
+        num_points = num_timesteps
+        x = torch.linspace(0, 1, num_points, device=device)
+        probabilities = -7.7 * ((x - args.hump_center) ** 2) + 2
+        probabilities = probabilities.clamp(min=0)
+        probabilities /= probabilities.sum()
+        indices = torch.multinomial(probabilities.unsqueeze(0).expand(bsz, -1), 1).squeeze(-1)
+        sigmas = x[indices]
+        timesteps = sigmas * num_timesteps
     else:
         # Sample a random timestep for each image
         # for weighting schemes where we sample timesteps non-uniformly
@@ -1066,7 +1076,7 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "nextdit_shift", "flux_shift"],
+        choices=["sigma", "uniform", "sigmoid", "shift", "nextdit_shift", "flux_shift", "hump"],
         default="shift",
         help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, Flux.1 and NextDIT.1 shifting. Default is 'shift'."
         " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、Flux.1、NextDIT.1のシフト。デフォルトは'shift'です。",
@@ -1076,6 +1086,12 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
         type=float,
         default=1.0,
         help='Scale factor for sigmoid timestep sampling (only used when timestep-sampling is "sigmoid"). / sigmoidタイムステップサンプリングの倍率（timestep-samplingが"sigmoid"の場合のみ有効）。',
+    )
+    parser.add_argument(
+        "--hump_center",
+        type=float,
+        default=0.5,
+        help='Center position for "hump" timestep sampling distribution (0.0-1.0). / "hump"タイムステップサンプリング分布の中心位置（0.0-1.0）。',
     )
     parser.add_argument(
         "--model_prediction_type",
