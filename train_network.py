@@ -3508,6 +3508,12 @@ def setup_parser() -> argparse.ArgumentParser:
         "l*T supervision steps. Paper ablation shows 0.3 is optimal. Range: [0.0, 1.0].",
     )
 
+    parser.add_argument(
+        "--keep_unet_dtype",
+        action="store_true",
+        help="TBD",
+    )
+
     return parser
 
 
