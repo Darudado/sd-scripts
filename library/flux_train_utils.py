@@ -327,14 +327,18 @@ def sample_image_inference_chroma_radiance(
 ):
     """Sample image inference for pixel-space ChromaRadiance."""
     assert isinstance(prompt_dict, dict)
+    negative_prompt = prompt_dict.get("negative_prompt")
     sample_steps = prompt_dict.get("sample_steps", 20)
     width = prompt_dict.get("width", 512)
     height = prompt_dict.get("height", 512)
+    cfg_scale = prompt_dict.get("scale", 1.0)
     seed = prompt_dict.get("seed")
     prompt: str = prompt_dict.get("prompt", "")
 
     if prompt_replacement is not None:
         prompt = prompt.replace(prompt_replacement[0], prompt_replacement[1])
+        if negative_prompt is not None:
+            negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
 
     if seed is not None:
         torch.manual_seed(seed)
@@ -343,11 +347,19 @@ def sample_image_inference_chroma_radiance(
         torch.seed()
         torch.cuda.seed()
 
+    if negative_prompt is None:
+        negative_prompt = ""
     height = max(64, height - height % 16)
     width = max(64, width - width % 16)
     logger.info(f"prompt: {prompt}")
+    if cfg_scale != 1.0:
+        logger.info(f"negative_prompt: {negative_prompt}")
+    elif negative_prompt != "":
+        logger.info(f"negative prompt is ignored because scale is 1.0")
     logger.info(f"height: {height}, width: {width}")
     logger.info(f"sample_steps: {sample_steps}")
+    if cfg_scale != 1.0:
+        logger.info(f"CFG scale: {cfg_scale}")
     if seed is not None:
         logger.info(f"seed: {seed}")
 
@@ -373,6 +385,13 @@ def sample_image_inference_chroma_radiance(
     l_pooled, t5_out, txt_ids, t5_attn_mask = encode_prompt(prompt)
     t5_attn_mask = t5_attn_mask.to(accelerator.device) if args.apply_t5_attn_mask and t5_attn_mask is not None else None
 
+    if cfg_scale != 1.0:
+        _, neg_t5_out, _, neg_t5_attn_mask = encode_prompt(negative_prompt)
+        neg_t5_attn_mask = neg_t5_attn_mask.to(accelerator.device) if args.apply_t5_attn_mask and neg_t5_attn_mask is not None else None
+        neg_cond = (cfg_scale, neg_t5_out, neg_t5_attn_mask)
+    else:
+        neg_cond = None
+
     # Create pixel-space noise
     weight_dtype = t5_out.dtype
     noise = torch.randn(
@@ -390,6 +409,7 @@ def sample_image_inference_chroma_radiance(
             t5_out,
             timesteps=timesteps,
             t5_attn_mask=t5_attn_mask,
+            neg_cond=neg_cond,
         )
 
     # Save image (pixel-space output, no VAE decode needed)
@@ -525,20 +545,35 @@ def denoise_chroma_radiance(
     txt: torch.Tensor,          # t5_out
     timesteps: list[float],
     t5_attn_mask: Optional[torch.Tensor] = None,
+    neg_cond: Optional[Tuple[float, torch.Tensor, torch.Tensor]] = None,
 ):
     """Euler denoising loop for pixel-space ChromaRadiance."""
+    do_cfg = neg_cond is not None
     for t_curr, t_prev in zip(tqdm(timesteps[:-1]), timesteps[1:]):
         t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
         model.prepare_block_swap_before_forward()
 
-        pred = model(
-            x=img,
-            t=t_vec,
-            txt=txt,
-            txt_mask=t5_attn_mask,
-        )
+        if not do_cfg:
+            pred = model(
+                x=img,
+                t=t_vec,
+                txt=txt,
+                txt_mask=t5_attn_mask,
+            )
+            img = img + (t_prev - t_curr) * pred
+        else:
+            cfg_scale, neg_txt, neg_t5_attn_mask = neg_cond
+            nc_c_t5_attn_mask = None if t5_attn_mask is None else torch.cat([neg_t5_attn_mask, t5_attn_mask], dim=0)
 
-        img = img + (t_prev - t_curr) * pred
+            nc_c_pred = model(
+                x=torch.cat([img, img], dim=0),
+                t=t_vec.repeat(2),
+                txt=torch.cat([neg_txt, txt], dim=0),
+                txt_mask=nc_c_t5_attn_mask,
+            )
+            neg_pred, pred = torch.chunk(nc_c_pred, 2, dim=0)
+            pred = neg_pred + (pred - neg_pred) * cfg_scale
+            img = img + (t_prev - t_curr) * pred
 
     model.prepare_block_swap_before_forward()
     return img
@@ -839,7 +874,7 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["flux", "chroma"],
+        choices=["flux", "chroma", "chroma_radiance"],
         default="flux",
-        help="Model type to use for training / トレーニングに使用するモデルタイプ：flux or chroma (default: flux)",
+        help="Model type to use for training / トレーニングに使用するモデルタイプ：flux, chroma or chroma_radiance (default: flux)",
     )

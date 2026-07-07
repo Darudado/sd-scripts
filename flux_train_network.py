@@ -399,7 +399,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
             model_pred, weighting = flux_train_utils.apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas)
 
-            target = noise - latents
+            # For chroma_radiance with raw prediction, the model outputs v = (noisy - pred_x0) / (t + 0.05).
+            # The target must exactly match this formula using the true x0 (latents) to avoid a 5% noise injection bias.
+            if args.model_prediction_type == "raw":
+                target = (noisy_model_input - latents) / (timesteps.view(-1, 1, 1, 1) / 1000 + 5e-2)
+            else:
+                target = noise - latents
 
             return model_pred, target, timesteps, weighting, noise
 
