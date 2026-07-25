@@ -296,6 +296,13 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         help="Disable timestep decay weighting (1 - t) in Patch Topology Loss. / "
         "Patch Topology Lossのタイムステップ減衰重み付け（1 - t）を無効にする",
     )
+    parser.add_argument(
+        "--patch_topology_chunk_size",
+        type=int,
+        default=512,
+        help="Chunk size for spatial query patches in Patch Topology Loss to limit VRAM usage (default: 512) / "
+        "Patch Topology LossのVRAM使用量を制限するための空間クエリパッチのチャンクサイズ（デフォルト: 512）",
+    )
     if support_weighted_captions:
         parser.add_argument(
             "--weighted_captions",

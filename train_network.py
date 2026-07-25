@@ -2179,6 +2179,7 @@ class NetworkTrainer:
             "ss_patch_topology_scale_levels": getattr(args, "patch_topology_scale_levels", 2),
             "ss_patch_topology_loss_type": getattr(args, "patch_topology_loss_type", "kl"),
             "ss_patch_topology_disable_timestep_weight": bool(getattr(args, "patch_topology_disable_timestep_weight", False)),
+            "ss_patch_topology_chunk_size": getattr(args, "patch_topology_chunk_size", 512),
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -2438,6 +2439,7 @@ class NetworkTrainer:
                 scale_levels=int(getattr(args, "patch_topology_scale_levels", 2)),
                 loss_type=getattr(args, "patch_topology_loss_type", "kl"),
                 apply_timestep_weight=not getattr(args, "patch_topology_disable_timestep_weight", False),
+                chunk_size=int(getattr(args, "patch_topology_chunk_size", 512)),
             )
             self.patch_topology_loss_module.to(accelerator.device)
             logger.info(
@@ -2445,7 +2447,8 @@ class NetworkTrainer:
                 f"tau={getattr(args, 'patch_topology_tau', 0.1)}, "
                 f"scale_levels={getattr(args, 'patch_topology_scale_levels', 2)}, "
                 f"loss_type={getattr(args, 'patch_topology_loss_type', 'kl')}, "
-                f"timestep_weight={not getattr(args, 'patch_topology_disable_timestep_weight', False)}"
+                f"timestep_weight={not getattr(args, 'patch_topology_disable_timestep_weight', False)}, "
+                f"chunk_size={getattr(args, 'patch_topology_chunk_size', 512)}"
             )
 
         # Initialize Latent Wavelet Diffusion (LWD) masking if enabled

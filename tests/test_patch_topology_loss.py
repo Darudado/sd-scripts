@@ -412,6 +412,7 @@ class TestPatchTopologyCLI:
         assert args.patch_topology_scale_levels == 2
         assert args.patch_topology_loss_type == "kl"
         assert args.patch_topology_disable_timestep_weight is False
+        assert args.patch_topology_chunk_size == 512
 
     def test_patch_topology_custom_values(self):
         """Custom values should be parsed correctly."""
@@ -426,6 +427,7 @@ class TestPatchTopologyCLI:
             "--patch_topology_scale_levels", "3",
             "--patch_topology_loss_type", "cosine",
             "--patch_topology_disable_timestep_weight",
+            "--patch_topology_chunk_size", "256",
         ])
         assert args.patch_topology_loss is True
         assert args.patch_topology_weight == 0.5
@@ -433,6 +435,7 @@ class TestPatchTopologyCLI:
         assert args.patch_topology_scale_levels == 3
         assert args.patch_topology_loss_type == "cosine"
         assert args.patch_topology_disable_timestep_weight is True
+        assert args.patch_topology_chunk_size == 256
 
 
 # ──────────────────────────────────────────────
@@ -584,3 +587,138 @@ class TestPatchTopologyFunctional:
         assert torch.isfinite(weighted).all()
         # Middle sample (weight 2.0) should be largest
         assert weighted[1] > weighted[0] > weighted[2]
+
+
+# ──────────────────────────────────────────────
+# Chunked processing tests
+# ──────────────────────────────────────────────
+
+
+class TestPatchTopologyChunkedProcessing:
+    """Tests for the chunked query processing memory optimization."""
+
+    def test_chunk_size_default_is_512(self):
+        """Default chunk_size should be 512."""
+        loss_fn = PatchTopologyLoss()
+        assert loss_fn.chunk_size == 512
+
+    def test_chunk_size_constructor_parameter(self):
+        """chunk_size should be configurable via constructor."""
+        loss_fn = PatchTopologyLoss(chunk_size=128)
+        assert loss_fn.chunk_size == 128
+
+    def test_chunk_size_none_processes_all(self):
+        """chunk_size=None should process all spatial patches in one iteration (equivalent to n)."""
+        loss_fn = PatchTopologyLoss(chunk_size=None, apply_timestep_weight=False)
+        pred = torch.randn(1, 4, 8, 8)
+        target = torch.randn(1, 4, 8, 8)
+        loss = loss_fn(pred, target)
+        assert loss.shape == (1,)
+        assert torch.isfinite(loss).all()
+
+    def test_chunk_size_zero_processes_all(self):
+        """chunk_size=0 should process all spatial patches in one iteration (equivalent to n)."""
+        loss_fn = PatchTopologyLoss(chunk_size=0, apply_timestep_weight=False)
+        pred = torch.randn(1, 4, 8, 8)
+        target = torch.randn(1, 4, 8, 8)
+        loss = loss_fn(pred, target)
+        assert loss.shape == (1,)
+        assert torch.isfinite(loss).all()
+
+    def test_different_chunk_sizes_produce_equivalent_results(self):
+        """Different chunk sizes should produce the same loss (within floating point tolerance).
+
+        The chunked processing is purely a memory optimization and should not change the
+        mathematical result of the loss computation.
+        """
+        torch.manual_seed(42)
+        pred = torch.randn(2, 4, 16, 16)
+        target = torch.randn(2, 4, 16, 16)
+
+        # N = 16*16 = 256, so chunk_size=256 processes everything in one chunk
+        loss_full = PatchTopologyLoss(chunk_size=256, apply_timestep_weight=False)(pred, target)
+
+        for chunk_size in [32, 64, 128]:
+            loss_chunked = PatchTopologyLoss(chunk_size=chunk_size, apply_timestep_weight=False)(pred, target)
+            assert torch.allclose(loss_full, loss_chunked, atol=1e-5), (
+                f"chunk_size={chunk_size} should produce same result as full: "
+                f"{loss_chunked} vs {loss_full}"
+            )
+
+    def test_chunk_size_one(self):
+        """chunk_size=1 should process one spatial patch at a time (maximum chunking)."""
+        torch.manual_seed(42)
+        pred = torch.randn(1, 4, 4, 4)  # N=16, small for speed
+        target = torch.randn(1, 4, 4, 4)
+
+        loss_full = PatchTopologyLoss(chunk_size=16, apply_timestep_weight=False)(pred, target)
+        loss_chunked = PatchTopologyLoss(chunk_size=1, apply_timestep_weight=False)(pred, target)
+
+        assert torch.allclose(loss_full, loss_chunked, atol=1e-4), (
+            f"chunk_size=1 should match full processing: {loss_chunked} vs {loss_full}"
+        )
+
+    def test_chunk_size_larger_than_n(self):
+        """chunk_size larger than N should still work (processes everything in one chunk)."""
+        loss_fn = PatchTopologyLoss(chunk_size=9999, apply_timestep_weight=False)
+        pred = torch.randn(1, 4, 4, 4)  # N=16
+        target = torch.randn(1, 4, 4, 4)
+        loss = loss_fn(pred, target)
+        assert loss.shape == (1,)
+        assert torch.isfinite(loss).all()
+
+    def test_chunk_size_preserves_gradient_flow(self):
+        """Gradient flow should be preserved with chunked processing."""
+        loss_fn = PatchTopologyLoss(chunk_size=16, apply_timestep_weight=False)
+        pred = torch.randn(1, 4, 8, 8, requires_grad=True)
+        target = torch.randn(1, 4, 8, 8)
+        loss = loss_fn(pred, target).mean()
+        loss.backward()
+        assert pred.grad is not None, "Gradient should flow through pred with chunked processing"
+        assert not torch.allclose(pred.grad, torch.zeros_like(pred.grad)), (
+            "Gradient should be non-zero for different inputs"
+        )
+
+    def test_chunk_size_with_all_loss_types(self):
+        """Chunked processing should work with all loss types."""
+        torch.manual_seed(42)
+        pred = torch.randn(1, 4, 8, 8)
+        target = torch.randn(1, 4, 8, 8)
+
+        for loss_type in ["kl", "ce", "cosine", "l2"]:
+            loss_full = PatchTopologyLoss(
+                loss_type=loss_type, chunk_size=64, apply_timestep_weight=False
+            )(pred, target)
+            loss_chunked = PatchTopologyLoss(
+                loss_type=loss_type, chunk_size=8, apply_timestep_weight=False
+            )(pred, target)
+            assert torch.allclose(loss_full, loss_chunked, atol=1e-5), (
+                f"Loss type '{loss_type}' with chunk_size=8 should match chunk_size=64: "
+                f"{loss_chunked} vs {loss_full}"
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_chunk_size_cuda(self):
+        """Chunked processing should work on CUDA with different chunk sizes."""
+        device = "cuda"
+        torch.manual_seed(42)
+        pred = torch.randn(2, 4, 16, 16, device=device)
+        target = torch.randn(2, 4, 16, 16, device=device)
+
+        loss_full = PatchTopologyLoss(chunk_size=256, apply_timestep_weight=False).to(device)(pred, target)
+        loss_chunked = PatchTopologyLoss(chunk_size=32, apply_timestep_weight=False).to(device)(pred, target)
+
+        assert loss_full.device.type == "cuda"
+        assert loss_chunked.device.type == "cuda"
+        assert torch.allclose(loss_full, loss_chunked, atol=1e-4), (
+            f"CUDA chunked processing should match full: {loss_chunked} vs {loss_full}"
+        )
+
+    def test_native_dtype_preserved(self):
+        """Forward should preserve native input dtype (not always float32)."""
+        for dtype in [torch.float16, torch.bfloat16, torch.float32]:
+            loss_fn = PatchTopologyLoss(chunk_size=8, apply_timestep_weight=False)
+            pred = torch.randn(1, 4, 8, 8, dtype=dtype)
+            target = torch.randn(1, 4, 8, 8, dtype=dtype)
+            loss = loss_fn(pred, target)
+            assert loss.dtype == dtype, f"Expected {dtype} output, got {loss.dtype}"
