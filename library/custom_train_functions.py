@@ -251,6 +251,51 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "FFLのスペクトル重み行列のalphaスケーリング係数。"
         "モデルが困難な周波数にどれだけ集中するかを制御する（デフォルト: 1.0）",
     )
+    # Patch Topology Loss arguments
+    parser.add_argument(
+        "--patch_topology_loss",
+        action="store_true",
+        help="Enable VAE-Free Independent Patch Self-Similarity Topology Loss. "
+        "Computes spatial patch affinity matrices on predicted and target representations "
+        "and matches their topology across multi-scale octaves. / "
+        "VAEフリーのパッチ自己類似度トポロジー損失を有効にする。"
+        "予測表現とターゲット表現の空間パッチアフィニティ行列を計算し、"
+        "マルチスケールオクターブ間でトポロジーを一致させる",
+    )
+    parser.add_argument(
+        "--patch_topology_weight",
+        type=float,
+        default=1.0,
+        help="Overall loss weight scaling factor for Patch Topology Loss (default: 1.0) / "
+        "Patch Topology Lossの全体損失重みスケーリング係数（デフォルト: 1.0）",
+    )
+    parser.add_argument(
+        "--patch_topology_tau",
+        type=float,
+        default=0.1,
+        help="Softmax temperature scaling factor for patch affinity distributions (default: 0.1) / "
+        "パッチアフィニティ分布のSoftmax温度スケーリング係数（デフォルト: 0.1）",
+    )
+    parser.add_argument(
+        "--patch_topology_scale_levels",
+        type=int,
+        default=2,
+        help="Number of spatial pyramid octaves for Patch Topology Loss (default: 2) / "
+        "Patch Topology Lossの空間ピラミッドオクターブ数（デフォルト: 2）",
+    )
+    parser.add_argument(
+        "--patch_topology_loss_type",
+        type=str,
+        default="kl",
+        help="Distance metric between patch affinity distributions ('kl', 'ce', 'cosine', 'l2') "
+        "(default: 'kl') / パッチアフィニティ分布間の距離指標（デフォルト: 'kl'）",
+    )
+    parser.add_argument(
+        "--patch_topology_disable_timestep_weight",
+        action="store_true",
+        help="Disable timestep decay weighting (1 - t) in Patch Topology Loss. / "
+        "Patch Topology Lossのタイムステップ減衰重み付け（1 - t）を無効にする",
+    )
     if support_weighted_captions:
         parser.add_argument(
             "--weighted_captions",

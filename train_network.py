@@ -35,6 +35,7 @@ from library.strategy_sdxl import SdxlTextEncodingStrategy
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset
 from library.focal_frequency_loss import FocalFrequencyLoss
+from library.patch_topology_loss import PatchTopologyLoss
 import library.config_util as config_util
 from library.config_util import (
     ConfigSanitizer,
@@ -113,6 +114,11 @@ class NetworkTrainer:
         self.ffl_module = None
         self.ffl_loss_value = None
 
+        # Patch Topology Loss config
+        self.patch_topology_enabled = False
+        self.patch_topology_loss_module = None
+        self.patch_topology_loss_value = None
+
         # Latent Wavelet Diffusion (LWD) masking config
         self.wavelet_masking_enabled = False
         self.wavelet_dwt = None
@@ -141,6 +147,7 @@ class NetworkTrainer:
         current_val_loss=None,
         average_val_loss=None,
         current_ffl_loss=None,
+        current_patch_topology_loss=None,
         current_wav_mask_ratio=None,
         current_weight_noise_norm=None,
         it_s: float = 0.0,
@@ -157,6 +164,9 @@ class NetworkTrainer:
 
         if current_ffl_loss is not None:
             logs["loss/current_ffl"] = current_ffl_loss
+
+        if current_patch_topology_loss is not None:
+            logs["loss/current_patch_topology"] = current_patch_topology_loss
 
         if current_wav_mask_ratio is not None:
             logs["loss/wavelet_mask_ratio"] = current_wav_mask_ratio
@@ -965,6 +975,18 @@ class NetworkTrainer:
             ffl_loss = self.ffl_module(noise_pred, target)
             self.ffl_loss_value = ffl_loss.detach().item()
             final_loss = final_loss + ffl_loss
+
+        # Patch Topology Loss: VAE-free spatial self-similarity topology matching
+        self.patch_topology_loss_value = None
+        if is_train and self.patch_topology_enabled and self.patch_topology_loss_module is not None:
+            patch_topo_loss_per_sample = self.patch_topology_loss_module(
+                pred=noise_pred,
+                target=target,
+                timesteps=timesteps,
+            )
+            patch_topo_loss_mean = patch_topo_loss_per_sample.mean()
+            self.patch_topology_loss_value = patch_topo_loss_mean.detach().item()
+            final_loss = final_loss + patch_topo_loss_mean
 
         return final_loss, pre_scaling_loss, loss_scaled
     
@@ -2151,6 +2173,12 @@ class NetworkTrainer:
             "ss_focal_frequency_loss": bool(getattr(args, "focal_frequency_loss", False)),
             "ss_focal_frequency_loss_weight": getattr(args, "focal_frequency_loss_weight", 1.0),
             "ss_focal_frequency_loss_alpha": getattr(args, "focal_frequency_loss_alpha", 1.0),
+            "ss_patch_topology_loss": bool(getattr(args, "patch_topology_loss", False)),
+            "ss_patch_topology_weight": getattr(args, "patch_topology_weight", 1.0),
+            "ss_patch_topology_tau": getattr(args, "patch_topology_tau", 0.1),
+            "ss_patch_topology_scale_levels": getattr(args, "patch_topology_scale_levels", 2),
+            "ss_patch_topology_loss_type": getattr(args, "patch_topology_loss_type", "kl"),
+            "ss_patch_topology_disable_timestep_weight": bool(getattr(args, "patch_topology_disable_timestep_weight", False)),
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -2400,6 +2428,26 @@ class NetworkTrainer:
                 f"alpha={args.focal_frequency_loss_alpha}"
             )
 
+        # Initialize Patch Topology Loss if enabled
+        if getattr(args, "patch_topology_loss", False):
+            self.patch_topology_enabled = True
+            self.patch_topology_loss_module = PatchTopologyLoss(
+                loss_weight=float(getattr(args, "patch_topology_weight", 1.0)),
+                tau_latent=float(getattr(args, "patch_topology_tau", 0.1)),
+                tau_target=float(getattr(args, "patch_topology_tau", 0.1)),
+                scale_levels=int(getattr(args, "patch_topology_scale_levels", 2)),
+                loss_type=getattr(args, "patch_topology_loss_type", "kl"),
+                apply_timestep_weight=not getattr(args, "patch_topology_disable_timestep_weight", False),
+            )
+            self.patch_topology_loss_module.to(accelerator.device)
+            logger.info(
+                f"Patch Topology Loss enabled: weight={getattr(args, 'patch_topology_weight', 1.0)}, "
+                f"tau={getattr(args, 'patch_topology_tau', 0.1)}, "
+                f"scale_levels={getattr(args, 'patch_topology_scale_levels', 2)}, "
+                f"loss_type={getattr(args, 'patch_topology_loss_type', 'kl')}, "
+                f"timestep_weight={not getattr(args, 'patch_topology_disable_timestep_weight', False)}"
+            )
+
         # Initialize Latent Wavelet Diffusion (LWD) masking if enabled
         if getattr(args, "wavelet_masking", False):
             self.wavelet_masking_enabled = True
@@ -2511,6 +2559,7 @@ class NetworkTrainer:
         current_global_step_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
         average_loss_edm2 = 0.0 if args.edm2_loss_weighting else None
         current_global_step_ffl = 0.0 if self.ffl_enabled else None
+        current_global_step_patch_topo = 0.0 if self.patch_topology_enabled else None
         current_global_step_wav_mask = 0.0 if self.wavelet_masking_enabled else None
         current_global_step_wnoise = 0.0 if self.weight_noise_enabled else None
         avr_loss = 0.0
@@ -2576,6 +2625,7 @@ class NetworkTrainer:
                 current_val_loss=current_val_loss,
                 average_val_loss=average_val_loss,
                 current_ffl_loss=None,
+                current_patch_topology_loss=None,
                 it_s=rate_tracker.it_per_sec,
             )
             if val_logs:
@@ -2666,6 +2716,10 @@ class NetworkTrainer:
                     # Track FFL loss for logging
                     if self.ffl_enabled and self.ffl_loss_value is not None:
                         current_global_step_ffl = (current_global_step_ffl or 0.0) + self.ffl_loss_value
+
+                    # Track Patch Topology loss for logging
+                    if self.patch_topology_enabled and self.patch_topology_loss_value is not None:
+                        current_global_step_patch_topo = (current_global_step_patch_topo or 0.0) + self.patch_topology_loss_value
 
                     # Track wavelet mask ratio for logging
                     if self.wavelet_masking_enabled:
@@ -2933,6 +2987,7 @@ class NetworkTrainer:
                             current_val_loss=current_val_loss,
                             average_val_loss=average_val_loss,
                             current_ffl_loss=(current_global_step_ffl / accumulation_counter) if self.ffl_enabled and current_global_step_ffl is not None else None,
+                            current_patch_topology_loss=(current_global_step_patch_topo / accumulation_counter) if self.patch_topology_enabled and current_global_step_patch_topo is not None else None,
                             current_wav_mask_ratio=(current_global_step_wav_mask / accumulation_counter) if self.wavelet_masking_enabled and current_global_step_wav_mask is not None else None,
                             current_weight_noise_norm=(current_global_step_wnoise / accumulation_counter) if self.weight_noise_enabled and current_global_step_wnoise is not None else None,
                             it_s=rate_tracker.it_per_sec,
@@ -2946,6 +3001,8 @@ class NetworkTrainer:
                         current_global_step_loss_edm2 = 0.0
                     if self.ffl_enabled:
                         current_global_step_ffl = 0.0
+                    if self.patch_topology_enabled:
+                        current_global_step_patch_topo = 0.0
                     if self.wavelet_masking_enabled:
                         current_global_step_wav_mask = 0.0
                     if self.weight_noise_enabled:
