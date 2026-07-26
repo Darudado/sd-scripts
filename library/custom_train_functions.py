@@ -321,6 +321,40 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "start_step後にPatch Topology Lossの重みを0から目標重みまで線形に増加させるステップ数"
         "（デフォルト: 0 = ウォームアップなし）",
     )
+    parser.add_argument(
+        "--patch_topology_dynamic_weighting",
+        type=str,
+        default="none",
+        choices=["none", "dwa", "gradnorm"],
+        help="Dynamic multi-loss weighting strategy for Patch Topology Loss relative to the base loss. "
+        "'none': static patch_topology_weight; 'dwa': Dynamic Weight Averaging by recent loss decrease rates; "
+        "'gradnorm': direct GradNorm balancing gradient norms on trainable network parameters "
+        "(default: 'none') / "
+        "Patch Topology Lossの動的マルチ損失重み付け戦略。"
+        "'none': 静的な重み、'dwa': 最近の損失減少率による動的重み平均、"
+        "'gradnorm': 勾配ノルムに基づくGradNormバランシング（デフォルト: 'none'）",
+    )
+    parser.add_argument(
+        "--patch_topology_dwa_temperature",
+        type=float,
+        default=2.0,
+        help="Temperature T for DWA dynamic weighting; higher values produce smoother weights (default: 2.0) / "
+        "DWA動的重み付けの温度T。値が大きいほど重みが滑らかになる（デフォルト: 2.0）",
+    )
+    parser.add_argument(
+        "--patch_topology_gradnorm_alpha",
+        type=float,
+        default=1.5,
+        help="Alpha exponent controlling relative training-rate strength for GradNorm weighting (default: 1.5) / "
+        "GradNorm重み付けの相対学習率の強さを制御するalpha指数（デフォルト: 1.5）",
+    )
+    parser.add_argument(
+        "--patch_topology_dynamic_max_weight",
+        type=float,
+        default=10.0,
+        help="Maximum clamp for dynamically-computed Patch Topology Loss weights (default: 10.0) / "
+        "動的に計算されたPatch Topology Loss重みの最大クランプ値（デフォルト: 10.0）",
+    )
     if support_weighted_captions:
         parser.add_argument(
             "--weighted_captions",

@@ -652,6 +652,24 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         metadata["ss_model_prediction_type"] = args.model_prediction_type
         metadata["ss_discrete_flow_shift"] = args.discrete_flow_shift
 
+        # Patch Topology Loss config (auxiliary loss runs through the inherited
+        # NetworkTrainer.process_batch, so record its config here as well)
+        metadata["ss_patch_topology_loss"] = bool(getattr(args, "patch_topology_loss", False))
+        metadata["ss_patch_topology_weight"] = getattr(args, "patch_topology_weight", 1.0)
+        metadata["ss_patch_topology_tau"] = getattr(args, "patch_topology_tau", 0.1)
+        metadata["ss_patch_topology_scale_levels"] = getattr(args, "patch_topology_scale_levels", 2)
+        metadata["ss_patch_topology_loss_type"] = getattr(args, "patch_topology_loss_type", "kl")
+        metadata["ss_patch_topology_disable_timestep_weight"] = bool(
+            getattr(args, "patch_topology_disable_timestep_weight", False)
+        )
+        metadata["ss_patch_topology_chunk_size"] = getattr(args, "patch_topology_chunk_size", 512)
+        metadata["ss_patch_topology_start_step"] = getattr(args, "patch_topology_start_step", 0)
+        metadata["ss_patch_topology_warmup_steps"] = getattr(args, "patch_topology_warmup_steps", 0)
+        metadata["ss_patch_topology_dynamic_weighting"] = getattr(args, "patch_topology_dynamic_weighting", "none")
+        metadata["ss_patch_topology_dwa_temperature"] = getattr(args, "patch_topology_dwa_temperature", 2.0)
+        metadata["ss_patch_topology_gradnorm_alpha"] = getattr(args, "patch_topology_gradnorm_alpha", 1.5)
+        metadata["ss_patch_topology_dynamic_max_weight"] = getattr(args, "patch_topology_dynamic_max_weight", 10.0)
+
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs and not self.is_train_text_encoder(args)
 

@@ -35,7 +35,8 @@ from library.strategy_sdxl import SdxlTextEncodingStrategy
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset
 from library.focal_frequency_loss import FocalFrequencyLoss
-from library.patch_topology_loss import PatchTopologyLoss
+from library.patch_topology_loss import PatchTopologyLoss, extract_spatial_mask
+from library.dynamic_loss_weighting import DynamicLossWeighter, build_weighter_from_args
 import library.config_util as config_util
 from library.config_util import (
     ConfigSanitizer,
@@ -122,6 +123,9 @@ class NetworkTrainer:
         self.patch_topology_start_step = 0
         self.patch_topology_warmup_steps = 0
         self._patch_topology_current_step = 0
+        # Dynamic multi-loss weighting (none/dwa/gradnorm); None = static weight
+        self.patch_topology_weighter: Optional[DynamicLossWeighter] = None
+        self.patch_topology_effective_weight = None  # last effective weight applied (for logging)
 
         # Latent Wavelet Diffusion (LWD) masking config
         self.wavelet_masking_enabled = False
@@ -152,6 +156,7 @@ class NetworkTrainer:
         average_val_loss=None,
         current_ffl_loss=None,
         current_patch_topology_loss=None,
+        current_patch_topology_weight=None,
         current_wav_mask_ratio=None,
         current_weight_noise_norm=None,
         it_s: float = 0.0,
@@ -171,6 +176,9 @@ class NetworkTrainer:
 
         if current_patch_topology_loss is not None:
             logs["loss/current_patch_topology"] = current_patch_topology_loss
+
+        if current_patch_topology_weight is not None:
+            logs["loss/patch_topology_effective_weight"] = current_patch_topology_weight
 
         if current_wav_mask_ratio is not None:
             logs["loss/wavelet_mask_ratio"] = current_wav_mask_ratio
@@ -981,29 +989,72 @@ class NetworkTrainer:
             final_loss = final_loss + ffl_loss
 
         # Patch Topology Loss: VAE-free spatial self-similarity topology matching
-        # Supports delayed start (--patch_topology_start_step) and linear warmup
-        # (--patch_topology_warmup_steps). Effective weight ramps from 0 to full_weight
-        # over warmup_steps steps after start_step.
+        # Supports delayed start (--patch_topology_start_step), linear warmup
+        # (--patch_topology_warmup_steps), optional dynamic multi-loss weighting
+        # (--patch_topology_dynamic_weighting: none/dwa/gradnorm), spatial mask
+        # weighting (masked loss / alpha masks) and per-sample loss_weights for
+        # consistency with the base objective.
         self.patch_topology_loss_value = None
+        self.patch_topology_effective_weight = None
         if is_train and self.patch_topology_enabled and self.patch_topology_loss_module is not None:
-            effective_weight = 0.0
+            # Warmup gate: ramps linearly from 0 to 1 over warmup_steps after start_step.
+            warmup_gate = 0.0
             if self._patch_topology_current_step >= self.patch_topology_start_step:
                 if self.patch_topology_warmup_steps > 0:
                     steps_into_warmup = self._patch_topology_current_step - self.patch_topology_start_step
-                    warmup_progress = min(1.0, float(steps_into_warmup) / float(self.patch_topology_warmup_steps))
-                    effective_weight = self.patch_topology_full_weight * warmup_progress
+                    warmup_gate = min(1.0, float(steps_into_warmup) / float(self.patch_topology_warmup_steps))
                 else:
-                    effective_weight = self.patch_topology_full_weight
+                    warmup_gate = 1.0
 
-            if effective_weight > 0.0:
-                patch_topo_loss_per_sample = self.patch_topology_loss_module(
-                    pred=noise_pred,
-                    target=target,
-                    timesteps=timesteps,
-                )
-                patch_topo_loss_mean = patch_topo_loss_per_sample.mean()
-                self.patch_topology_loss_value = patch_topo_loss_mean.detach().item()
-                final_loss = final_loss + effective_weight * patch_topo_loss_mean
+            if warmup_gate > 0.0:
+                # Spatial mask for masked/inpainting training, mirroring apply_masked_loss.
+                topo_mask = None
+                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                    if noise_pred.ndim == 4:
+                        topo_mask = extract_spatial_mask(
+                            batch, noise_pred.shape[2:], noise_pred.device, torch.float32
+                        )
+
+                try:
+                    patch_topo_loss_per_sample = self.patch_topology_loss_module(
+                        pred=noise_pred,
+                        target=target,
+                        timesteps=timesteps,
+                        mask=topo_mask,
+                    )
+                except ValueError as e:
+                    # e.g. non-square sequence lengths from packed DiT outputs
+                    logger.warning_once(f"Patch Topology Loss skipped for this batch: {e}")
+                    patch_topo_loss_per_sample = None
+
+                if patch_topo_loss_per_sample is not None:
+                    # Per-sample loss_weights, consistent with the base loss.
+                    loss_weights = batch.get("loss_weights")
+                    if loss_weights is not None:
+                        patch_topo_loss_per_sample = patch_topo_loss_per_sample * loss_weights.to(
+                            patch_topo_loss_per_sample.dtype
+                        )
+
+                    patch_topo_loss_mean = patch_topo_loss_per_sample.mean()
+
+                    # Effective weight: dynamic multi-loss weighting (dwa/gradnorm) or static.
+                    if self.patch_topology_weighter is not None:
+                        shared_params = None
+                        if self.patch_topology_weighter.mode == "gradnorm" and network is not None:
+                            # GradNorm balances gradient norms on shared (trainable) parameters;
+                            # restrict to the last few LoRA tensors to bound the extra backward cost.
+                            trainable = [p for p in network.parameters() if p.requires_grad]
+                            shared_params = trainable[-8:] if trainable else None
+                        dynamic_weight = self.patch_topology_weighter.compute_weight(
+                            final_loss, patch_topo_loss_mean, shared_params=shared_params
+                        )
+                        effective_weight = warmup_gate * dynamic_weight
+                    else:
+                        effective_weight = warmup_gate * self.patch_topology_full_weight
+
+                    self.patch_topology_loss_value = patch_topo_loss_mean.detach().item()
+                    self.patch_topology_effective_weight = effective_weight
+                    final_loss = final_loss + effective_weight * patch_topo_loss_mean
 
         return final_loss, pre_scaling_loss, loss_scaled
     
@@ -2199,6 +2250,10 @@ class NetworkTrainer:
             "ss_patch_topology_chunk_size": getattr(args, "patch_topology_chunk_size", 512),
             "ss_patch_topology_start_step": getattr(args, "patch_topology_start_step", 0),
             "ss_patch_topology_warmup_steps": getattr(args, "patch_topology_warmup_steps", 0),
+            "ss_patch_topology_dynamic_weighting": getattr(args, "patch_topology_dynamic_weighting", "none"),
+            "ss_patch_topology_dwa_temperature": getattr(args, "patch_topology_dwa_temperature", 2.0),
+            "ss_patch_topology_gradnorm_alpha": getattr(args, "patch_topology_gradnorm_alpha", 1.5),
+            "ss_patch_topology_dynamic_max_weight": getattr(args, "patch_topology_dynamic_max_weight", 10.0),
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -2464,6 +2519,7 @@ class NetworkTrainer:
                 chunk_size=int(getattr(args, "patch_topology_chunk_size", 512)),
             )
             self.patch_topology_loss_module.to(accelerator.device)
+            self.patch_topology_weighter = build_weighter_from_args(args, self.patch_topology_full_weight)
             logger.info(
                 f"Patch Topology Loss enabled: weight={self.patch_topology_full_weight}, "
                 f"tau={getattr(args, 'patch_topology_tau', 0.1)}, "
@@ -2472,7 +2528,8 @@ class NetworkTrainer:
                 f"timestep_weight={not getattr(args, 'patch_topology_disable_timestep_weight', False)}, "
                 f"chunk_size={getattr(args, 'patch_topology_chunk_size', 512)}, "
                 f"start_step={self.patch_topology_start_step}, "
-                f"warmup_steps={self.patch_topology_warmup_steps}"
+                f"warmup_steps={self.patch_topology_warmup_steps}, "
+                f"dynamic_weighting={getattr(args, 'patch_topology_dynamic_weighting', 'none')}"
             )
 
         # Initialize Latent Wavelet Diffusion (LWD) masking if enabled
@@ -3018,6 +3075,7 @@ class NetworkTrainer:
                             average_val_loss=average_val_loss,
                             current_ffl_loss=(current_global_step_ffl / accumulation_counter) if self.ffl_enabled and current_global_step_ffl is not None else None,
                             current_patch_topology_loss=(current_global_step_patch_topo / accumulation_counter) if self.patch_topology_enabled and current_global_step_patch_topo is not None else None,
+                            current_patch_topology_weight=self.patch_topology_effective_weight if self.patch_topology_enabled else None,
                             current_wav_mask_ratio=(current_global_step_wav_mask / accumulation_counter) if self.wavelet_masking_enabled and current_global_step_wav_mask is not None else None,
                             current_weight_noise_norm=(current_global_step_wnoise / accumulation_counter) if self.weight_noise_enabled and current_global_step_wnoise is not None else None,
                             it_s=rate_tracker.it_per_sec,
