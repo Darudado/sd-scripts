@@ -118,6 +118,10 @@ class NetworkTrainer:
         self.patch_topology_enabled = False
         self.patch_topology_loss_module = None
         self.patch_topology_loss_value = None
+        self.patch_topology_full_weight = 1.0
+        self.patch_topology_start_step = 0
+        self.patch_topology_warmup_steps = 0
+        self._patch_topology_current_step = 0
 
         # Latent Wavelet Diffusion (LWD) masking config
         self.wavelet_masking_enabled = False
@@ -977,16 +981,29 @@ class NetworkTrainer:
             final_loss = final_loss + ffl_loss
 
         # Patch Topology Loss: VAE-free spatial self-similarity topology matching
+        # Supports delayed start (--patch_topology_start_step) and linear warmup
+        # (--patch_topology_warmup_steps). Effective weight ramps from 0 to full_weight
+        # over warmup_steps steps after start_step.
         self.patch_topology_loss_value = None
         if is_train and self.patch_topology_enabled and self.patch_topology_loss_module is not None:
-            patch_topo_loss_per_sample = self.patch_topology_loss_module(
-                pred=noise_pred,
-                target=target,
-                timesteps=timesteps,
-            )
-            patch_topo_loss_mean = patch_topo_loss_per_sample.mean()
-            self.patch_topology_loss_value = patch_topo_loss_mean.detach().item()
-            final_loss = final_loss + patch_topo_loss_mean
+            effective_weight = 0.0
+            if self._patch_topology_current_step >= self.patch_topology_start_step:
+                if self.patch_topology_warmup_steps > 0:
+                    steps_into_warmup = self._patch_topology_current_step - self.patch_topology_start_step
+                    warmup_progress = min(1.0, float(steps_into_warmup) / float(self.patch_topology_warmup_steps))
+                    effective_weight = self.patch_topology_full_weight * warmup_progress
+                else:
+                    effective_weight = self.patch_topology_full_weight
+
+            if effective_weight > 0.0:
+                patch_topo_loss_per_sample = self.patch_topology_loss_module(
+                    pred=noise_pred,
+                    target=target,
+                    timesteps=timesteps,
+                )
+                patch_topo_loss_mean = patch_topo_loss_per_sample.mean()
+                self.patch_topology_loss_value = patch_topo_loss_mean.detach().item()
+                final_loss = final_loss + effective_weight * patch_topo_loss_mean
 
         return final_loss, pre_scaling_loss, loss_scaled
     
@@ -2180,6 +2197,8 @@ class NetworkTrainer:
             "ss_patch_topology_loss_type": getattr(args, "patch_topology_loss_type", "kl"),
             "ss_patch_topology_disable_timestep_weight": bool(getattr(args, "patch_topology_disable_timestep_weight", False)),
             "ss_patch_topology_chunk_size": getattr(args, "patch_topology_chunk_size", 512),
+            "ss_patch_topology_start_step": getattr(args, "patch_topology_start_step", 0),
+            "ss_patch_topology_warmup_steps": getattr(args, "patch_topology_warmup_steps", 0),
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -2432,8 +2451,11 @@ class NetworkTrainer:
         # Initialize Patch Topology Loss if enabled
         if getattr(args, "patch_topology_loss", False):
             self.patch_topology_enabled = True
+            self.patch_topology_full_weight = float(getattr(args, "patch_topology_weight", 1.0))
+            self.patch_topology_start_step = int(getattr(args, "patch_topology_start_step", 0))
+            self.patch_topology_warmup_steps = int(getattr(args, "patch_topology_warmup_steps", 0))
             self.patch_topology_loss_module = PatchTopologyLoss(
-                loss_weight=float(getattr(args, "patch_topology_weight", 1.0)),
+                loss_weight=1.0,  # effective weight applied dynamically via warmup/start_step
                 tau_latent=float(getattr(args, "patch_topology_tau", 0.1)),
                 tau_target=float(getattr(args, "patch_topology_tau", 0.1)),
                 scale_levels=int(getattr(args, "patch_topology_scale_levels", 2)),
@@ -2443,12 +2465,14 @@ class NetworkTrainer:
             )
             self.patch_topology_loss_module.to(accelerator.device)
             logger.info(
-                f"Patch Topology Loss enabled: weight={getattr(args, 'patch_topology_weight', 1.0)}, "
+                f"Patch Topology Loss enabled: weight={self.patch_topology_full_weight}, "
                 f"tau={getattr(args, 'patch_topology_tau', 0.1)}, "
                 f"scale_levels={getattr(args, 'patch_topology_scale_levels', 2)}, "
                 f"loss_type={getattr(args, 'patch_topology_loss_type', 'kl')}, "
                 f"timestep_weight={not getattr(args, 'patch_topology_disable_timestep_weight', False)}, "
-                f"chunk_size={getattr(args, 'patch_topology_chunk_size', 512)}"
+                f"chunk_size={getattr(args, 'patch_topology_chunk_size', 512)}, "
+                f"start_step={self.patch_topology_start_step}, "
+                f"warmup_steps={self.patch_topology_warmup_steps}"
             )
 
         # Initialize Latent Wavelet Diffusion (LWD) masking if enabled
@@ -2696,6 +2720,9 @@ class NetworkTrainer:
 
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
+
+                    # Update patch topology current step for warmup/start_step logic
+                    self._patch_topology_current_step = global_step
 
                     loss, pre_scaling_loss, loss_scaled = self.process_batch(
                         batch,

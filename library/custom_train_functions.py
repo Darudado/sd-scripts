@@ -303,6 +303,24 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         help="Chunk size for spatial query patches in Patch Topology Loss to limit VRAM usage (default: 512) / "
         "Patch Topology LossのVRAM使用量を制限するための空間クエリパッチのチャンクサイズ（デフォルト: 512）",
     )
+    parser.add_argument(
+        "--patch_topology_start_step",
+        type=int,
+        default=0,
+        help="Training step at which to start applying Patch Topology Loss (default: 0). "
+        "Before this step, the loss is skipped entirely. / "
+        "Patch Topology Lossの適用を開始するトレーニングステップ（デフォルト: 0）。"
+        "このステップ以前は損失は完全にスキップされる",
+    )
+    parser.add_argument(
+        "--patch_topology_warmup_steps",
+        type=int,
+        default=0,
+        help="Number of steps to linearly ramp Patch Topology Loss weight from 0 to full weight "
+        "after start_step (default: 0 = no warmup). / "
+        "start_step後にPatch Topology Lossの重みを0から目標重みまで線形に増加させるステップ数"
+        "（デフォルト: 0 = ウォームアップなし）",
+    )
     if support_weighted_captions:
         parser.add_argument(
             "--weighted_captions",

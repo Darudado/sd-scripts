@@ -413,6 +413,8 @@ class TestPatchTopologyCLI:
         assert args.patch_topology_loss_type == "kl"
         assert args.patch_topology_disable_timestep_weight is False
         assert args.patch_topology_chunk_size == 512
+        assert args.patch_topology_start_step == 0
+        assert args.patch_topology_warmup_steps == 0
 
     def test_patch_topology_custom_values(self):
         """Custom values should be parsed correctly."""
@@ -428,6 +430,8 @@ class TestPatchTopologyCLI:
             "--patch_topology_loss_type", "cosine",
             "--patch_topology_disable_timestep_weight",
             "--patch_topology_chunk_size", "256",
+            "--patch_topology_start_step", "500",
+            "--patch_topology_warmup_steps", "200",
         ])
         assert args.patch_topology_loss is True
         assert args.patch_topology_weight == 0.5
@@ -436,6 +440,8 @@ class TestPatchTopologyCLI:
         assert args.patch_topology_loss_type == "cosine"
         assert args.patch_topology_disable_timestep_weight is True
         assert args.patch_topology_chunk_size == 256
+        assert args.patch_topology_start_step == 500
+        assert args.patch_topology_warmup_steps == 200
 
 
 # ──────────────────────────────────────────────
@@ -458,9 +464,17 @@ class TestPatchTopologyIntegration:
         assert hasattr(trainer, "patch_topology_enabled")
         assert hasattr(trainer, "patch_topology_loss_module")
         assert hasattr(trainer, "patch_topology_loss_value")
+        assert hasattr(trainer, "patch_topology_full_weight")
+        assert hasattr(trainer, "patch_topology_start_step")
+        assert hasattr(trainer, "patch_topology_warmup_steps")
+        assert hasattr(trainer, "_patch_topology_current_step")
         assert trainer.patch_topology_enabled is False
         assert trainer.patch_topology_loss_module is None
         assert trainer.patch_topology_loss_value is None
+        assert trainer.patch_topology_full_weight == 1.0
+        assert trainer.patch_topology_start_step == 0
+        assert trainer.patch_topology_warmup_steps == 0
+        assert trainer._patch_topology_current_step == 0
 
     def test_generate_step_logs_accepts_patch_topology(self):
         """generate_step_logs should accept current_patch_topology_loss parameter."""
@@ -722,3 +736,129 @@ class TestPatchTopologyChunkedProcessing:
             target = torch.randn(1, 4, 8, 8, dtype=dtype)
             loss = loss_fn(pred, target)
             assert loss.dtype == dtype, f"Expected {dtype} output, got {loss.dtype}"
+
+
+# ──────────────────────────────────────────────
+# Warmup and start_step tests
+# ──────────────────────────────────────────────
+
+
+def _compute_effective_weight(current_step, full_weight, start_step, warmup_steps):
+    """Replicates the warmup/start_step logic from NetworkTrainer.process_batch.
+
+    This is the exact same formula used in train_network.py, extracted here
+    for testability without requiring a full training loop.
+    """
+    effective_weight = 0.0
+    if current_step >= start_step:
+        if warmup_steps > 0:
+            steps_into_warmup = current_step - start_step
+            warmup_progress = min(1.0, float(steps_into_warmup) / float(warmup_steps))
+            effective_weight = full_weight * warmup_progress
+        else:
+            effective_weight = full_weight
+    return effective_weight
+
+
+class TestPatchTopologyWarmupStartStep:
+    """Tests for warmup and start_step effective weight computation."""
+
+    def test_no_warmup_no_start(self):
+        """With start_step=0 and warmup_steps=0, effective weight equals full weight immediately."""
+        for step in [0, 1, 10, 100]:
+            w = _compute_effective_weight(step, full_weight=0.5, start_step=0, warmup_steps=0)
+            assert w == 0.5, f"Step {step}: expected 0.5, got {w}"
+
+    def test_start_step_defers_activation(self):
+        """Before start_step, effective weight should be 0."""
+        for step in range(0, 100):
+            w = _compute_effective_weight(step, full_weight=1.0, start_step=100, warmup_steps=0)
+            assert w == 0.0, f"Step {step}: expected 0.0, got {w}"
+
+    def test_start_step_activates(self):
+        """At and after start_step (no warmup), effective weight equals full weight."""
+        for step in [100, 101, 200, 1000]:
+            w = _compute_effective_weight(step, full_weight=1.0, start_step=100, warmup_steps=0)
+            assert w == 1.0, f"Step {step}: expected 1.0, got {w}"
+
+    def test_warmup_linear_ramp(self):
+        """With start_step=100 and warmup_steps=50, weight should linearly ramp from 0 to full."""
+        full_weight = 0.8
+        start = 100
+        warmup = 50
+
+        # Before start
+        assert _compute_effective_weight(99, full_weight, start, warmup) == 0.0
+
+        # At start (0% warmup)
+        assert _compute_effective_weight(100, full_weight, start, warmup) == 0.0
+
+        # 25% warmup
+        w = _compute_effective_weight(112, full_weight, start, warmup)
+        assert abs(w - 0.8 * 0.24) < 1e-6, f"Expected ~0.192, got {w}"
+
+        # 50% warmup
+        w = _compute_effective_weight(125, full_weight, start, warmup)
+        assert abs(w - 0.8 * 0.5) < 1e-6, f"Expected ~0.4, got {w}"
+
+        # 100% warmup
+        w = _compute_effective_weight(150, full_weight, start, warmup)
+        assert abs(w - full_weight) < 1e-6, f"Expected {full_weight}, got {w}"
+
+        # Beyond warmup — clamped to full weight
+        w = _compute_effective_weight(200, full_weight, start, warmup)
+        assert abs(w - full_weight) < 1e-6, f"Expected {full_weight}, got {w}"
+
+    def test_warmup_clamps_at_one(self):
+        """Warmup progress should clamp at 1.0 even after many steps beyond warmup."""
+        w = _compute_effective_weight(10000, full_weight=1.0, start_step=0, warmup_steps=100)
+        assert w == 1.0, f"Expected 1.0, got {w}"
+
+    def test_warmup_zero_steps_is_instant(self):
+        """warmup_steps=0 means instant activation at start_step."""
+        w = _compute_effective_weight(500, full_weight=1.0, start_step=500, warmup_steps=0)
+        assert w == 1.0
+        w = _compute_effective_weight(499, full_weight=1.0, start_step=500, warmup_steps=0)
+        assert w == 0.0
+
+    def test_warmup_with_combined_loss(self):
+        """Effective weight applied to topology loss should produce expected combined loss."""
+        torch.manual_seed(42)
+        loss_fn = PatchTopologyLoss(loss_weight=1.0, apply_timestep_weight=False)
+        pred = torch.randn(1, 4, 8, 8, requires_grad=True)
+        target = torch.randn(1, 4, 8, 8)
+
+        base_loss = ((pred - target) ** 2).mean()
+        topo_raw = loss_fn(pred, target).mean()
+
+        # Simulate: at step 5 (before start_step=10), effective weight = 0
+        eff_w = _compute_effective_weight(5, full_weight=0.5, start_step=10, warmup_steps=0)
+        total_before = base_loss + eff_w * topo_raw
+        assert torch.allclose(total_before, base_loss), "Before start_step, topology loss should not contribute"
+
+        # Simulate: at step 10 (at start_step), effective weight = 0.5
+        eff_w = _compute_effective_weight(10, full_weight=0.5, start_step=10, warmup_steps=0)
+        total_at = base_loss + eff_w * topo_raw
+        expected = base_loss + 0.5 * topo_raw
+        assert torch.allclose(total_at, expected), "At start_step, topology loss should contribute at full weight"
+
+    def test_warmup_midpoint(self):
+        """At midpoint of warmup, effective weight should be exactly half of full weight."""
+        full_weight = 0.6
+        start = 200
+        warmup = 100
+        w = _compute_effective_weight(250, full_weight, start, warmup)
+        assert abs(w - 0.3) < 1e-6, f"Expected 0.3, got {w}"
+
+    def test_start_step_and_warmup_default_no_effect(self):
+        """Default values (start_step=0, warmup_steps=0) should apply full weight from step 0."""
+        for step in [0, 1, 5, 100]:
+            w = _compute_effective_weight(step, full_weight=1.0, start_step=0, warmup_steps=0)
+            assert w == 1.0, f"Default config should apply full weight at step {step}"
+
+    def test_large_start_step(self):
+        """Large start_step values should defer loss until that step."""
+        w = _compute_effective_weight(99999, full_weight=1.0, start_step=100000, warmup_steps=0)
+        assert w == 0.0
+        w = _compute_effective_weight(100000, full_weight=1.0, start_step=100000, warmup_steps=0)
+        assert w == 1.0
