@@ -712,7 +712,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
         weighting = weighting * args.ileco_loss_weight * pair_conds["weight"]
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def get_addift_noise_pred_and_target(
         self,
@@ -854,7 +854,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if addift_mask is not None:
             weighting = weighting * addift_mask
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]  # compatibility
@@ -1167,6 +1167,23 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             metadata["ss_reverse_weight"] = args.reverse_weight
             metadata["ss_addift_min_sigma"] = args.addift_min_sigma
             metadata["ss_addift_max_sigma"] = args.addift_max_sigma
+
+        # Patch Topology Loss config (runs through inherited NetworkTrainer.process_batch)
+        metadata["ss_patch_topology_loss"] = bool(getattr(args, "patch_topology_loss", False))
+        metadata["ss_patch_topology_weight"] = getattr(args, "patch_topology_weight", 1.0)
+        metadata["ss_patch_topology_tau"] = getattr(args, "patch_topology_tau", 0.1)
+        metadata["ss_patch_topology_scale_levels"] = getattr(args, "patch_topology_scale_levels", 2)
+        metadata["ss_patch_topology_loss_type"] = getattr(args, "patch_topology_loss_type", "kl")
+        metadata["ss_patch_topology_disable_timestep_weight"] = bool(
+            getattr(args, "patch_topology_disable_timestep_weight", False)
+        )
+        metadata["ss_patch_topology_chunk_size"] = getattr(args, "patch_topology_chunk_size", 512)
+        metadata["ss_patch_topology_start_step"] = getattr(args, "patch_topology_start_step", 0)
+        metadata["ss_patch_topology_warmup_steps"] = getattr(args, "patch_topology_warmup_steps", 0)
+        metadata["ss_patch_topology_dynamic_weighting"] = getattr(args, "patch_topology_dynamic_weighting", "none")
+        metadata["ss_patch_topology_dwa_temperature"] = getattr(args, "patch_topology_dwa_temperature", 2.0)
+        metadata["ss_patch_topology_gradnorm_alpha"] = getattr(args, "patch_topology_gradnorm_alpha", 1.5)
+        metadata["ss_patch_topology_dynamic_max_weight"] = getattr(args, "patch_topology_dynamic_max_weight", 10.0)
 
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs and not self.is_train_text_encoder(args)
