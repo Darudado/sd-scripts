@@ -565,16 +565,18 @@ class NetworkTrainer:
                     else:
                         expanded_conds.append(c)
                 encoder_mask_bias = expanded_conds[1] if len(expanded_conds) > 1 else None
-                return self.call_unet(
-                    adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
-                    expanded_conds, encoder_mask_bias, adaptive_batch, wdtype,
-                )
+                with torch.no_grad(), accelerator.autocast():
+                    return self.call_unet(
+                        adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
+                        expanded_conds, encoder_mask_bias, adaptive_batch, wdtype,
+                    )
             else:
                 encoder_mask_bias = text_masks
-                return self.call_unet(
-                    adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
-                    text_conds, encoder_mask_bias, adaptive_batch, wdtype,
-                )
+                with torch.no_grad(), accelerator.autocast():
+                    return self.call_unet(
+                        adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
+                        text_conds, encoder_mask_bias, adaptive_batch, wdtype,
+                    )
 
         return model_fn
 

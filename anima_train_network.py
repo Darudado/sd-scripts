@@ -123,7 +123,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             w_latent = noisy_latents.shape[-1]
             padding_mask = torch.zeros(N, 1, h_latent, w_latent, dtype=wdtype, device=noisy_latents.device)
 
-            with torch.no_grad():
+            with torch.no_grad(), accelerator.autocast():
                 output = anima_model(
                     x_5d,
                     anima_ts,
