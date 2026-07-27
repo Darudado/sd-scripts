@@ -112,8 +112,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             else:
                 et5m = None
 
-            # Scale timesteps to [0, 1] range for Anima (Anima expects timesteps / 1000)
-            anima_ts = timesteps.float() / 1000.0
+            # Scale timesteps to [0, 1] range for Anima (Anima expects timesteps / 1000).
+            # IMPORTANT: cast to wdtype (bf16/fp16) to match the training path, where
+            # flux_train_utils.get_noisy_model_input_and_timesteps returns timesteps in
+            # weight_dtype. The sinusoidal embedder inherits the timestep dtype, and the
+            # AdaLN block runs with autocast explicitly disabled (enabled=use_fp32), so a
+            # float32 embedding would crash against bf16 AdaLN weights.
+            anima_ts = (timesteps.float() / 1000.0).to(wdtype)
 
             # 4D to 5D: [N, C, H, W] -> [N, C, 1, H, W]
             x_5d = noisy_latents.to(wdtype).unsqueeze(2)

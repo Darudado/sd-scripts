@@ -648,6 +648,8 @@ class TestBuildAdaptiveModelFn:
             def forward(self, x, timesteps, context, **kwargs):
                 call_log["x_shape"] = x.shape  # Should be 5D
                 call_log["ts_range"] = (timesteps.min().item(), timesteps.max().item())
+                call_log["ts_dtype"] = timesteps.dtype  # Must match weight dtype (bf16/fp16/fp32)
+                call_log["x_dtype"] = x.dtype
                 call_log["ctx_shape"] = context.shape
                 call_log["N"] = x.shape[0]
                 # Return 5D output
@@ -672,6 +674,15 @@ class TestBuildAdaptiveModelFn:
         # Verify timesteps were scaled to [0, 1] range
         ts_min, ts_max = call_log["ts_range"]
         assert ts_min >= 0.0 and ts_max <= 1.0, f"Timesteps should be in [0,1], got [{ts_min}, {ts_max}]"
+
+        # Verify timesteps were cast to the weight dtype, matching the training path
+        # (flux_train_utils returns timesteps in weight_dtype; the sinusoidal embedder
+        # inherits this dtype, and Anima's AdaLN runs with autocast disabled so a
+        # float32 embedding would crash against bf16 weights).
+        assert call_log["ts_dtype"] == torch.float32, (
+            f"Timestep dtype should match weight dtype (fp32 in this test), got {call_log['ts_dtype']}"
+        )
+        assert call_log["x_dtype"] == torch.float32
 
         # Result should be 4D (squeezed from 5D)
         assert result.shape == x_input.shape, f"Expected 4D result, got {result.shape}"
