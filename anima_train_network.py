@@ -123,6 +123,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             w_latent = noisy_latents.shape[-1]
             padding_mask = torch.zeros(N, 1, h_latent, w_latent, dtype=wdtype, device=noisy_latents.device)
 
+            # Autocast is required: the training forward pass runs under
+            # accelerator.autocast(), which casts the float32 timestep embedding to
+            # the model's weight dtype (bf16/fp16). Without it, bf16 AdaLN linear
+            # layers receive float32 inputs and raise a dtype mismatch error.
             with torch.no_grad(), accelerator.autocast():
                 output = anima_model(
                     x_5d,

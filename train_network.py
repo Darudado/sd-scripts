@@ -565,14 +565,16 @@ class NetworkTrainer:
                     else:
                         expanded_conds.append(c)
                 encoder_mask_bias = expanded_conds[1] if len(expanded_conds) > 1 else None
-                with torch.no_grad(), accelerator.autocast():
+                # Autocast to match the training forward pass (avoids float32-vs-bf16
+                # dtype mismatch in mixed-precision training).
+                with accelerator.autocast():
                     return self.call_unet(
                         adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
                         expanded_conds, encoder_mask_bias, adaptive_batch, wdtype,
                     )
             else:
                 encoder_mask_bias = text_masks
-                with torch.no_grad(), accelerator.autocast():
+                with accelerator.autocast():
                     return self.call_unet(
                         adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
                         text_conds, encoder_mask_bias, adaptive_batch, wdtype,
