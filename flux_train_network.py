@@ -23,7 +23,7 @@ from library import (
     train_util,
 )
 from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
-from library.adaptive_timestep_sampler import TimestepSamplerNetwork, AdaptiveTimestepManager
+from library.adaptive_timestep_sampler import AdaptiveTimestepManager
 from library import utils
 from library.utils import setup_logging
 
@@ -614,7 +614,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         )
 
         # Update sampler via policy gradient (Algorithm 1, line 8)
-        self.adaptive_manager.update_sampler(delta_approx, latents[:1])
+        self.adaptive_manager.update_sampler(delta_approx, latents)
 
         # Clear cached data
         self._adaptive_losses_before = None

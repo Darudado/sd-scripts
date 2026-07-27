@@ -182,16 +182,16 @@ class TestDDPMIntegration:
         def model_fn(noisy_latents, timesteps, wdtype):
             return model(noisy_latents.to(wdtype))
 
-        initial_a_mean = None
-        final_a_mean = None
+        # Use a fixed probe input to measure Beta(a,b) parameters before/after training
+        probe_input = torch.randn(1, 4, 8, 8, device=device)
+        with torch.no_grad():
+            a_init, _ = manager.sampler_network(probe_input)
+        initial_a_mean = a_init.mean().item()
 
         for step in range(10):
             x_0 = torch.randn(2, 4, 8, 8, device=device)
             noise = torch.randn_like(x_0)
             timesteps = manager.sample_timesteps(x_0, T)
-
-            if step == 0:
-                initial_a_mean = manager._cached_a.mean().item()
 
             alpha_bar = scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1)
             noisy = torch.sqrt(alpha_bar) * x_0 + torch.sqrt(1 - alpha_bar) * noise
@@ -208,9 +208,11 @@ class TestDDPMIntegration:
                 delta_approx, selected = manager.compute_delta_approximation(
                     model_fn, x_0[:1], noise[:1], torch.float32, losses_before,
                 )
-                manager.update_sampler(delta_approx, x_0[:1])
+                manager.update_sampler(delta_approx, x_0)
 
-        final_a_mean = manager._cached_a.mean().item()
+        with torch.no_grad():
+            a_final, _ = manager.sampler_network(probe_input)
+        final_a_mean = a_final.mean().item()
 
         # The distribution parameters should have been updated at least once
         # (not necessarily different due to small model, but the update ran)

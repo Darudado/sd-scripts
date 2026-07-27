@@ -180,9 +180,9 @@ class AdaptiveTimestepManager:
 
     def __init__(
         self,
-        sampler_network: TimestepSamplerNetwork,
-        noise_scheduler,
-        device: torch.device,
+        sampler_network: Optional[TimestepSamplerNetwork] = None,
+        noise_scheduler=None,
+        device: torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.float32,
         # Hyperparameters from the paper
         learning_rate: float = 1e-2,
@@ -194,10 +194,29 @@ class AdaptiveTimestepManager:
         # Flow-matching support
         model_type: str = "ddpm",  # "ddpm" or "flow_matching"
         compute_loss_fn=None,  # Optional: (model_output, x_0, noise, t_indices) -> per_sample_losses
+        # Network architecture params for lazy initialization
+        hidden_channels: int = 128,
+        hidden_depth: int = 2,
     ):
-        self.sampler_network = sampler_network.to(device=device, dtype=dtype)
         self.device = device
         self.dtype = dtype
+
+        # Store network architecture params for lazy initialization
+        self._hidden_channels = hidden_channels
+        self._hidden_depth = hidden_depth
+
+        # If a pre-created network is provided, use it directly; otherwise
+        # the network will be lazily initialized on the first sample_timesteps() call
+        # by inferring in_channels from the actual latent tensor shape.
+        if sampler_network is not None:
+            self.sampler_network = sampler_network.to(device=device, dtype=dtype)
+            self.optimizer = torch.optim.SGD(
+                self.sampler_network.parameters(),
+                lr=learning_rate,
+            )
+        else:
+            self.sampler_network = None
+            self.optimizer = None
 
         # Hyperparameters
         self.learning_rate = learning_rate
@@ -210,18 +229,9 @@ class AdaptiveTimestepManager:
         self.noise_scheduler = noise_scheduler
         self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
 
-        # Optimizer for the sampler network (SGD as used in the paper)
-        self.optimizer = torch.optim.SGD(
-            self.sampler_network.parameters(),
-            lr=learning_rate,
-        )
-
         # Queue Q for storing historical delta values (Algorithm 2, line 3)
         self.queue: deque = deque(maxlen=queue_size)
 
-        # Cached Beta distribution parameters from the last sampling
-        self._cached_a: Optional[torch.Tensor] = None
-        self._cached_b: Optional[torch.Tensor] = None
         # Cached sampled t (continuous, in [0,1]) for REINFORCE update
         self._cached_t_continuous: Optional[torch.Tensor] = None
         # Track the currently selected |S| timesteps for the next call to Algorithm 2.
@@ -258,7 +268,35 @@ class AdaptiveTimestepManager:
             f"AdaptiveTimestepManager initialized: lr={learning_rate}, "
             f"entropy_coeff={entropy_coeff}, f_S={update_freq}, "
             f"|Q|={queue_size}, |S|={num_selected}, v_pred={v_parameterization}, "
-            f"model_type={model_type}, custom_loss_fn={compute_loss_fn is not None}"
+            f"model_type={model_type}, custom_loss_fn={compute_loss_fn is not None}, "
+            f"network={'pre-created' if sampler_network is not None else 'lazy (will init from first latent shape)'}"
+        )
+
+    def _init_sampler_network(self, in_channels: int):
+        """
+        Lazily create the TimestepSamplerNetwork and optimizer if not already done.
+
+        Called on the first sample_timesteps() invocation, using the actual
+        channel count from the latent tensor to correctly handle any VAE
+        (e.g. 4-channel for SD1.5/SDXL, 16-channel for Flux/SD3/Anima).
+
+        Args:
+            in_channels: Number of latent channels (from x_0_latent.shape[1])
+        """
+        if self.sampler_network is not None:
+            return
+        logger.info(
+            f"Lazily creating TimestepSamplerNetwork: in_channels={in_channels}, "
+            f"hidden_channels={self._hidden_channels}, hidden_depth={self._hidden_depth}"
+        )
+        self.sampler_network = TimestepSamplerNetwork(
+            in_channels=in_channels,
+            hidden_channels=self._hidden_channels,
+            hidden_depth=self._hidden_depth,
+        ).to(device=self.device, dtype=self.dtype)
+        self.optimizer = torch.optim.SGD(
+            self.sampler_network.parameters(),
+            lr=self.learning_rate,
         )
 
     def should_update(self, global_step: int) -> bool:
@@ -273,6 +311,9 @@ class AdaptiveTimestepManager:
         """
         Sample timesteps using the adaptive Beta distribution sampler.
 
+        On the first call, lazily initializes the sampler network using
+        x_0_latent.shape[1] to determine in_channels.
+
         Args:
             x_0_latent: Latent representations, shape (B, C, H, W)
             num_timesteps: Total number of discrete timesteps (T)
@@ -280,13 +321,10 @@ class AdaptiveTimestepManager:
         Returns:
             timesteps: Sampled timesteps, shape (B,), dtype long, in range [0, num_timesteps)
         """
+        self._init_sampler_network(x_0_latent.shape[1])
         self.sampler_network.eval()
         with torch.no_grad():
             a, b = self.sampler_network(x_0_latent)
-
-        # Cache the parameters and sampled t for later policy gradient update
-        self._cached_a = a.detach()
-        self._cached_b = b.detach()
 
         # Sample from Beta distribution
         beta_dist = torch.distributions.Beta(a, b)
@@ -484,7 +522,7 @@ class AdaptiveTimestepManager:
                 full_batch_latents, full_batch_noise, model_fn, weight_dtype, prev_S
             )
             # Delta for the full batch: mean over batch and |S| timesteps
-            delta_approx = (self._prev_batch_losses_at_S - losses_after_batch_at_S).mean()
+            delta_approx = self._prev_batch_losses_at_S - losses_after_batch_at_S
             # Use the previous selection as the returned indices (these are the ones
             # for which the delta was actually computed)
             selected_indices = prev_S
@@ -548,7 +586,7 @@ class AdaptiveTimestepManager:
             selected_indices: Timestep indices to evaluate, shape (|S|,)
 
         Returns:
-            delta_approx: Scalar approximation of Δ̃_k^t averaged over batch and timesteps
+            losses: Scalar mean loss across the batch and selected timesteps
         """
         T = self.num_train_timesteps
         B = x_0_latent.shape[0]
@@ -575,7 +613,7 @@ class AdaptiveTimestepManager:
             model_output = model_output.to(torch.float32)
             if self._compute_loss_fn is not None:
                 # Custom loss function
-                losses = self._compute_loss_fn(model_output, x_0_exp, eps_exp, selected_indices)
+                losses = self._compute_loss_fn(model_output, x_0_exp, eps_exp, timesteps_exp)
                 if losses.ndim > 1:
                     losses = losses.mean(dim=list(range(1, losses.ndim)))
             else:
@@ -601,7 +639,7 @@ class AdaptiveTimestepManager:
 
             model_output = model_output.to(torch.float32)
             if self._compute_loss_fn is not None:
-                losses = self._compute_loss_fn(model_output, x_0_exp, eps_exp, selected_indices)
+                losses = self._compute_loss_fn(model_output, x_0_exp, eps_exp, timesteps_exp)
                 if losses.ndim > 1:
                     losses = losses.mean(dim=list(range(1, losses.ndim)))
             elif self.v_parameterization:
@@ -690,10 +728,12 @@ class AdaptiveTimestepManager:
         )
 
     def state_dict(self) -> Dict:
-        """Save sampler state for checkpointing."""
-        return {
-            "sampler_network": self.sampler_network.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
+        """Save sampler state for checkpointing.
+
+        If the network has not been lazily initialized yet, only the
+        hyperparameters and queue are saved (network/optimizer are omitted).
+        """
+        state: Dict = {
             "queue": list(self.queue),
             "learning_rate": self.learning_rate,
             "entropy_coeff": self.entropy_coeff,
@@ -703,9 +743,35 @@ class AdaptiveTimestepManager:
             "v_parameterization": self.v_parameterization,
             "model_type": self.model_type,
         }
+        if self.sampler_network is not None:
+            state["sampler_network"] = self.sampler_network.state_dict()
+        if self.optimizer is not None:
+            state["optimizer"] = self.optimizer.state_dict()
+        return state
 
     def load_state_dict(self, state_dict: Dict):
-        """Load sampler state from checkpoint."""
-        self.sampler_network.load_state_dict(state_dict["sampler_network"])
-        self.optimizer.load_state_dict(state_dict["optimizer"])
+        """Load sampler state from checkpoint.
+
+        If the network has not been lazily initialized yet, infers
+        in_channels from the saved weights' first linear layer.
+        """
+        # Lazily create the network if needed, inferring in_channels from saved weights
+        if self.sampler_network is None and "sampler_network" in state_dict:
+            net_sd = state_dict["sampler_network"]
+            if net_sd and "mlp.0.weight" in net_sd:
+                first_weight = net_sd["mlp.0.weight"]  # shape: (hidden_channels, in_channels * 4 * 4)
+                inferred_in_channels = first_weight.shape[1] // 16
+                inferred_hidden_channels = first_weight.shape[0]
+                # Count MLP linear layers to infer hidden_depth
+                inferred_hidden_depth = sum(
+                    1 for k in net_sd if k.startswith("mlp.") and k.endswith(".weight")
+                )
+                self._hidden_channels = inferred_hidden_channels
+                self._hidden_depth = inferred_hidden_depth
+                self._init_sampler_network(inferred_in_channels)
+
+        if self.sampler_network is not None and "sampler_network" in state_dict:
+            self.sampler_network.load_state_dict(state_dict["sampler_network"])
+        if self.optimizer is not None and "optimizer" in state_dict:
+            self.optimizer.load_state_dict(state_dict["optimizer"])
         self.queue = deque(state_dict["queue"], maxlen=self.queue_size)

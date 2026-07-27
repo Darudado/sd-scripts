@@ -777,3 +777,147 @@ class TestFlowMatching:
         )
         assert loss.ndim == 0 or loss.shape == ()
         assert loss >= 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: Lazy Network Initialization
+# ---------------------------------------------------------------------------
+
+class TestLazyInit:
+    """Test lazy initialization of TimestepSamplerNetwork from latent shape."""
+
+    def _make_manager(self, device, **kwargs):
+        """Create a manager without a pre-created network (lazy init)."""
+        scheduler = MagicMock()
+        T = 1000
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        return AdaptiveTimestepManager(
+            noise_scheduler=scheduler, device=device,
+            hidden_channels=32, hidden_depth=2, update_freq=5,
+            queue_size=10, num_selected=3, **kwargs,
+        )
+
+    def test_lazy_init_network_none_before_sampling(self, device):
+        """Network should be None before first sample_timesteps call."""
+        manager = self._make_manager(device)
+        assert manager.sampler_network is None
+        assert manager.optimizer is None
+
+    def test_lazy_init_4_channels(self, device):
+        """Lazy init with 4-channel latents (SD1.5/SDXL)."""
+        manager = self._make_manager(device)
+        x_0 = torch.randn(2, 4, 8, 8, device=device)
+        timesteps = manager.sample_timesteps(x_0, num_timesteps=1000)
+        assert manager.sampler_network is not None
+        assert manager.optimizer is not None
+        assert timesteps.shape == (2,)
+        # Verify the network was created with the correct in_channels
+        first_weight = manager.sampler_network.mlp[0].weight
+        assert first_weight.shape[1] == 4 * 4 * 4  # in_channels=4 * 4 * 4
+
+    def test_lazy_init_16_channels(self, device):
+        """Lazy init with 16-channel latents (Flux/SD3/Anima)."""
+        manager = self._make_manager(device)
+        x_0 = torch.randn(2, 16, 8, 8, device=device)
+        timesteps = manager.sample_timesteps(x_0, num_timesteps=1000)
+        assert manager.sampler_network is not None
+        assert timesteps.shape == (2,)
+        first_weight = manager.sampler_network.mlp[0].weight
+        assert first_weight.shape[1] == 16 * 4 * 4  # in_channels=16 * 4 * 4
+
+    def test_lazy_init_64_channels(self, device):
+        """Lazy init with 64-channel latents (extreme/edge case)."""
+        manager = self._make_manager(device)
+        x_0 = torch.randn(2, 64, 8, 8, device=device)
+        timesteps = manager.sample_timesteps(x_0, num_timesteps=1000)
+        assert manager.sampler_network is not None
+        assert timesteps.shape == (2,)
+        first_weight = manager.sampler_network.mlp[0].weight
+        assert first_weight.shape[1] == 64 * 4 * 4
+
+    def test_lazy_init_only_once(self, device):
+        """Network should only be created once, not on every sample_timesteps call."""
+        manager = self._make_manager(device)
+        x_0 = torch.randn(2, 16, 8, 8, device=device)
+        manager.sample_timesteps(x_0, num_timesteps=1000)
+        net1 = manager.sampler_network
+        # Second call with same channel count
+        manager.sample_timesteps(x_0, num_timesteps=1000)
+        assert manager.sampler_network is net1  # Same object, not re-created
+
+    def test_lazy_init_state_dict_before_sampling(self, device):
+        """state_dict should work before lazy init (returns no network weights)."""
+        manager = self._make_manager(device)
+        state = manager.state_dict()
+        assert "sampler_network" not in state
+        assert "optimizer" not in state
+        assert "queue" in state
+
+    def test_lazy_init_load_state_dict_infers_channels(self, device):
+        """load_state_dict should infer in_channels from saved weights."""
+        # Create a manager with a pre-created 16-channel network and train it
+        scheduler = MagicMock()
+        T = 1000
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=16, hidden_channels=32, hidden_depth=2).to(device)
+        original_manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            hidden_channels=32, hidden_depth=2, update_freq=5,
+            queue_size=10, num_selected=3,
+        )
+        state = original_manager.state_dict()
+
+        # Create a new lazy manager and load state
+        new_manager = self._make_manager(device)
+        assert new_manager.sampler_network is None
+        new_manager.load_state_dict(state)
+        assert new_manager.sampler_network is not None
+        # Verify the network was created with 16 channels
+        first_weight = new_manager.sampler_network.mlp[0].weight
+        assert first_weight.shape[1] == 16 * 4 * 4
+
+    def test_lazy_init_full_algorithm_cycle(self, device):
+        """Full Algorithm 1+2 cycle should work with lazy-init 16-channel network."""
+        manager = self._make_manager(device)
+        x_0 = torch.randn(2, 16, 8, 8, device=device)
+        noise = torch.randn_like(x_0)
+
+        def mock_model_fn(noisy_latents, timesteps, weight_dtype):
+            return torch.randn_like(noisy_latents)
+
+        # Sample timesteps (triggers lazy init)
+        timesteps = manager.sample_timesteps(x_0, num_timesteps=1000)
+        assert timesteps.shape == (2,)
+
+        # Algorithm 2: compute delta
+        losses_before = manager.compute_per_timestep_losses(
+            x_0, noise, mock_model_fn, torch.float32, chunk_size=200
+        )
+        delta_approx, selected = manager.compute_delta_approximation(
+            mock_model_fn, x_0, noise, torch.float32, losses_before
+        )
+
+        # Algorithm 1, line 8: update sampler
+        manager.update_sampler(delta_approx, x_0)
+        assert len(manager.queue) >= 1
+
+    def test_pre_created_network_still_works(self, device):
+        """Passing a pre-created network should still work (backward compatibility)."""
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        scheduler = MagicMock()
+        T = 1000
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+        )
+        assert manager.sampler_network is net
+        assert manager.optimizer is not None
+        x_0 = torch.randn(2, 4, 8, 8, device=device)
+        timesteps = manager.sample_timesteps(x_0, num_timesteps=1000)
+        assert timesteps.shape == (2,)

@@ -44,7 +44,7 @@ from library.config_util import (
 )
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
-from library.adaptive_timestep_sampler import TimestepSamplerNetwork, AdaptiveTimestepManager
+from library.adaptive_timestep_sampler import AdaptiveTimestepManager
 from library.custom_train_functions import (
     apply_snr_weight,
     apply_snr_weight_for_flow_matching,
@@ -605,7 +605,7 @@ class NetworkTrainer:
         )
 
         # Update sampler via policy gradient (Algorithm 1, line 8)
-        self.adaptive_manager.update_sampler(delta_approx, latents[:1])
+        self.adaptive_manager.update_sampler(delta_approx, latents)
 
         # Clear cached data
         self._adaptive_losses_before = None
@@ -2625,16 +2625,11 @@ class NetworkTrainer:
                     "timesteps, so antithetic/stratified/QMC variance reduction will NOT be applied. "
                     "Disable one of them to avoid this conflict."
                 )
-            unet_config = getattr(unet, "config", None)
-            in_channels = getattr(unet_config, "in_channels", 4) if unet_config else 4
-            sampler_net = TimestepSamplerNetwork(
-                in_channels=in_channels,
-                hidden_channels=args.adaptive_sampler_hidden_channels,
-                hidden_depth=args.adaptive_sampler_hidden_depth,
-            ).to(accelerator.device)
             adaptive_model_type = self.get_adaptive_model_type(args)
             self.adaptive_manager = AdaptiveTimestepManager(
-                sampler_network=sampler_net,
+                # Network is lazily initialized on first sample_timesteps() call,
+                # inferring in_channels from the actual latent tensor shape.
+                # This correctly handles any VAE (4-ch SD1.5/SDXL, 16-ch Flux/SD3/Anima).
                 noise_scheduler=noise_scheduler,
                 device=accelerator.device,
                 dtype=weight_dtype,
@@ -2645,6 +2640,8 @@ class NetworkTrainer:
                 num_selected=args.adaptive_sampler_num_selected,
                 v_parameterization=args.v_parameterization,
                 model_type=adaptive_model_type,
+                hidden_channels=args.adaptive_sampler_hidden_channels,
+                hidden_depth=args.adaptive_sampler_hidden_depth,
             )
             logger.info(f"Adaptive non-uniform timestep sampling enabled (model_type={adaptive_model_type})")
 
