@@ -226,6 +226,38 @@ This technique involves merging a pre-trained LoRA into the base model before st
     *   **Out of Memory (OOM):** Try the VRAM reduction measures listed above.
     *   **Training not progressing:** Learning rate might be too low, optimizer/scheduler settings incorrect, or dataset issues.
 
+## 2.9 Token-Level Hard Mining and Antithetic Timestep Sampling (Flow Matching)
+
+Two options targeting small-batch (4-8) flow-matching DiT training, where per-batch loss means are noisy and spatially uniform weighting wastes gradient on easy regions.
+
+### Token-Level Hard Mining
+
+`--token_mining` reweights the per-element spatial loss by *detached* per-token difficulty: `w_i = clamp((L_i / median(L))**alpha, min, max)`, renormalized to mean 1 per sample so the overall loss scale matches the plain mean. Hard tokens (edges, textures) get more gradient than flat regions.
+
+*   `--token_mining_alpha` (default 1.0): difficulty exponent; higher concentrates more weight on hard tokens.
+*   `--token_mining_min_weight` / `--token_mining_max_weight` (default 0.25 / 4.0): clamp bounds relative to uniform.
+*   Sigma gate: by default, mining strength is scaled by `clip(4*sigma*(1-sigma), 0, 1)` — full strength mid-schedule, disabled at the sigma extremes where per-token loss variation is mostly irreducible noise. Disable with `--token_mining_no_sigma_gate`.
+
+Composes with masked loss, wavelet masking, min-SNR weighting, and per-sample `loss_weights` (applied after token mining, at the batch level).
+
+### Antithetic, Stratified & QMC Timestep Sampling
+
+`--antithetic_timestep_sampling` fills each batch with mirrored pairs of the base sampling randomness — `(u, 1-u)` for uniform, `(z, -z)` for normal-based distributions — then applies the configured distribution transform and shift identically to both. Because the mirrored variate has the same marginal distribution, the configured timestep distribution (`logit_normal`/`uniform`/`sigmoid`/`mode`, plus `flow_uniform_shift`/`flow_uniform_static_ratio`/`training_shift`/`discrete_flow_shift` and scale parameters) is preserved exactly, while a large fraction of timestep-sampling variance cancels out. Most effective at batch sizes 4-8.
+
+`--stratified_timestep_sampling` is an alternative variance-reduction method: the unit interval `[0,1]` is partitioned into `batch_size` equal-width strata and one uniform is drawn inside each stratum. This guarantees full coverage of the timestep range every batch (no region can be empty or over-sampled). It scales better than antithetic as batch size grows (variance ~1/B³ vs ~1/B), works for any batch size including odd, and is robust to non-monotonic loss landscapes. Only applies to the base uniform variate, so it composes with the distribution transform and shift.
+
+`--qmc_timestep_sampling sobol|halton` enables quasi-Monte Carlo (low-discrepancy sequence) sampling: a Sobol or Halton sequence is used for the base uniform instead of pseudo-random numbers. These sequences fill `[0,1]` more uniformly than pseudo-random draws, yielding faster convergence than iid (and often better than stratified at moderate batch sizes). Unlike stratified (which resets every batch), the QMC sequence **advances across batches** via a global counter, so over many training steps the entire timestep range is covered with minimal discrepancy. The sequence is scrambled (with `--qmc_seed`, default 0) for randomization, which preserves the low-discrepancy property while allowing unbiased error estimation. `halton` requires `scipy`. Composes with the distribution transform and shift.
+
+**Precedence:** if multiple variance-reduction methods are set simultaneously, the order is `antithetic` > `qmc` > `stratified`. A warning is logged when conflicts are detected.
+
+**Caveats:**
+
+* **Gradient accumulation / multi-GPU (DDP):** antithetic assumes each `(u, 1-u)` pair lives in the same loss/gradient aggregation unit; QMC assumes the sequence advances contiguously. With `--gradient_accumulation_steps > 1` the batch is split into micro-batches, and with DDP it is sharded across ranks — pairs may be separated and QMC sequences may diverge per rank, reducing or eliminating the benefit. A warning is logged when this configuration is detected. For full benefit, use a single GPU with `gradient_accumulation_steps=1`.
+* **Adaptive timestep sampling:** `--adaptive_timestep_sampling` produces its own timesteps (passed as fixed timesteps), which bypasses the antithetic/stratified/QMC paths entirely. They are mutually exclusive (adaptive takes precedence); a warning is logged if both are enabled.
+* **Unsupported branches:** `timestep_sampling=hump` uses a multinomial draw that cannot honor pairing, stratification, or low-discrepancy sequences; the flag(s) are ignored for that branch and a warning is logged.
+
+Supported in: `train_network.py` Rectified Flow path (`--flow_model`), Flux trainers (`--timestep_sampling uniform|sigmoid|shift|flux_shift` and the weighting-scheme density path), SD3 trainers (`--weighting_scheme` density path with `--training_shift`), and Lumina trainers.
+
 ## 3. Conclusion / おわりに
 
 `sdxl_train_network.py` offers many options to customize SDXL LoRA training. Refer to `--help`, other documents and the source code for further details.

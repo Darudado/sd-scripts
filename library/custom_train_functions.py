@@ -1,4 +1,5 @@
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+import math
 import torch
 import argparse
 import random
@@ -158,6 +159,362 @@ def apply_snr_weight_for_flow_matching(
     snr_weight = snr_weight.to(dtype=loss.dtype, device=loss.device)
 
     return loss * snr_weight
+
+
+class _QMCSequenceManager:
+    """Manages low-discrepancy (quasi-random) sequences for timestep sampling.
+
+    Sobol and Halton sequences are deterministic low-discrepancy sequences that
+    fill the unit interval more uniformly than pseudo-random numbers, yielding
+    faster convergence of Monte Carlo estimates (variance ~O((log B)^d / B^d)
+    vs ~O(1/B) for iid). Unlike stratified sampling (which resets every batch),
+    a QMC sequence advances across batches so that over many steps the entire
+    timestep range is covered with minimal discrepancy.
+
+    The manager keeps a global draw counter so consecutive calls produce
+    *different* points (the sequence does not restart at 0 each batch). A
+    scrambled Sobol engine is used for randomization, which preserves the
+    low-discrepancy property while allowing unbiased error estimation.
+
+    Supported methods:
+        "sobol":  Scrambled Sobol sequence (torch.quasirandom.SobolEngine).
+        "halton": Halton sequence (scipy.stats.qmc.Halton, scrambled).
+    """
+
+    _instances: dict = {}  # keyed by (method, seed) -> _QMCSequenceManager
+
+    def __new__(cls, method: str = "sobol", seed: int = 0):
+        key = (method, seed)
+        if key not in cls._instances:
+            cls._instances[key] = super().__new__(cls)
+            cls._instances[key]._initialized = False
+        return cls._instances[key]
+
+    def __init__(self, method: str = "sobol", seed: int = 0):
+        if self._initialized:
+            return
+        self.method = method
+        self.seed = seed
+        self._draw_count = 0
+        if method == "sobol":
+            # Scrambled Sobol for unbiased error estimation; dimension=1 (timestep).
+            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=seed)
+        elif method == "halton":
+            try:
+                from scipy.stats import qmc as scipy_qmc
+            except ImportError as e:
+                raise ImportError(
+                    "Halton QMC timestep sampling requires scipy. Install it with: pip install scipy"
+                ) from e
+            self._scipy_qmc = scipy_qmc
+            self._halton = scipy_qmc.Halton(d=1, scramble=True, seed=seed)
+        else:
+            raise ValueError(f"Unknown QMC method: {method!r}. Use 'sobol' or 'halton'.")
+        self._initialized = True
+
+    def draw(self, n: int, device: Union[str, torch.device] = "cpu") -> torch.Tensor:
+        """Draw the next ``n`` points of the low-discrepancy sequence.
+
+        Returns a tensor of shape (n,) in [0, 1] on ``device``.
+        """
+        if self.method == "sobol":
+            # SobolEngine draws on CPU; move to target device.
+            pts = self._sobol.draw(n).squeeze(-1).to(device=device, dtype=torch.float32)
+        else:
+            # Halton via scipy (CPU), then move to device.
+            pts = torch.from_numpy(self._halton.random(n).squeeze(-1)).to(device=device, dtype=torch.float32)
+        self._draw_count += n
+        return pts
+
+    def reset(self):
+        """Reset the sequence to the beginning (e.g. for reproducibility)."""
+        self._draw_count = 0
+        if self.method == "sobol":
+            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=self.seed)
+        else:
+            self._halton = self._scipy_qmc.Halton(d=1, scramble=True, seed=self.seed)
+
+
+def compute_density_for_timestep_sampling(
+    weighting_scheme: str,
+    batch_size: int,
+    logit_mean: float = None,
+    logit_std: float = None,
+    mode_scale: float = None,
+    antithetic: bool = False,
+    stratified: bool = False,
+    qmc: str = None,
+    device: Union[str, torch.device] = "cpu",
+    sigmoid_scale: float = 1.0,
+    qmc_seed: int = 0,
+) -> torch.Tensor:
+    """Compute the density for sampling the timesteps when doing SD3/Flux training.
+
+    This is the single canonical implementation shared by the SD3, Flux, Lumina
+    and flow-model (train_util) trainers. It supersedes the per-module copies that
+    previously existed in ``sd3_train_utils``, ``flux_train_utils`` and
+    ``lumina_train_util``.
+
+    Courtesy: This was contributed by Rafie Walker in
+    https://github.com/huggingface/diffusers/pull/8528.
+    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+
+    Variance-reduction methods (mutually exclusive; precedence order is
+    ``antithetic`` > ``qmc`` > ``stratified``):
+
+    * ``antithetic=True``: the base randomness is drawn as mirrored pairs
+      ((z, -z) for logit_normal, (u, 1-u) for mode/uniform) before applying the
+      same deterministic transform, preserving the marginal distribution while
+      reducing sampling variance. Most effective at small batch sizes (4-8).
+      Odd batch sizes are handled by truncating the last mirrored pair.
+
+    * ``qmc="sobol"|"halton"``: use a low-discrepancy (quasi-random) sequence for
+      the base uniform. These sequences fill [0,1] more uniformly than
+      pseudo-random numbers, yielding faster convergence than iid (and often
+      better than stratified at moderate batch sizes). The sequence advances
+      across batches via a global counter, so over many steps the entire
+      timestep range is covered with minimal discrepancy. Composes with the
+      deterministic distribution transform and any shift.
+
+    * ``stratified=True``: the unit interval is partitioned into ``batch_size``
+      equal strata and one uniform is drawn inside each stratum. This guarantees
+      coverage of the whole timestep range every batch and scales better than
+      antithetic as batch size grows (variance ~1/B^3 vs ~1/B). Works for any
+      batch size including odd. Only applies to the *base* uniform variate, so
+      it composes with the deterministic distribution transform and any shift.
+
+    Args:
+        weighting_scheme: One of "logit_normal", "mode", "uniform", "sigmoid".
+            ("uniform" and "sigmoid" are accepted for the flow path; the SD3
+            density originally only used logit_normal/mode/uniform.)
+        batch_size: Number of sigmas to draw.
+        logit_mean: Mean of the logit-normal base distribution.
+        logit_std: Std of the logit-normal base distribution.
+        mode_scale: Scale for the "mode" weighting scheme.
+        antithetic: If True, draw mirrored base-variates pairs.
+        stratified: If True, use stratified sampling on the base uniform.
+        qmc: If set to "sobol" or "halton", use a low-discrepancy sequence for
+            the base uniform.
+        device: Device on which to generate the tensor. Defaults to "cpu" for
+            backward compatibility with the original SD3 density, but callers on
+            CUDA should pass the target device to avoid a host->device sync.
+        sigmoid_scale: Scale of the normal base for "sigmoid" sampling.
+        qmc_seed: Seed for the (scrambled) QMC sequence. Only used when ``qmc``
+            is set.
+
+    Returns:
+        Tensor of shape (batch_size,) of base variates in [0, 1] on ``device``.
+    """
+    # Short-circuit: a single sample cannot benefit from any variance reduction.
+    if batch_size <= 1:
+        antithetic = False
+        stratified = False
+        qmc = None
+
+    # Resolve precedence: antithetic > qmc > stratified. Warn on conflicts.
+    active_methods = [m for m, v in [("antithetic", antithetic), ("qmc", bool(qmc)), ("stratified", stratified)] if v]
+    if len(active_methods) > 1:
+        if antithetic:
+            logger.warning(
+                "Multiple variance-reduction methods requested (%s); antithetic takes "
+                "precedence, others are ignored." % ", ".join(active_methods)
+            )
+            qmc = None
+            stratified = False
+        elif qmc:
+            logger.warning(
+                "Both QMC (%s) and stratified timestep sampling were requested; "
+                "QMC takes precedence and stratified is ignored." % qmc
+            )
+            stratified = False
+
+    n_pairs = (batch_size + 1) // 2 if antithetic else batch_size
+
+    # QMC produces base uniforms in [0,1]; apply the same deterministic transform.
+    if qmc is not None:
+        qmc_mgr = _QMCSequenceManager(method=qmc, seed=qmc_seed)
+        u_base = qmc_mgr.draw(batch_size, device=device)
+
+    if weighting_scheme == "logit_normal":
+        # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
+        if qmc is not None:
+            # Map the low-discrepancy uniform through the inverse-CDF (logit)
+            # to get a low-discrepancy sample under the logit-normal distribution.
+            z = torch.logit(u_base.clamp(1e-7, 1 - 1e-7))
+            u = torch.nn.functional.sigmoid(logit_mean + logit_std * z)
+        else:
+            # Mirror the standardized z so the pair is symmetric about the mean.
+            z = torch.normal(mean=0.0, std=1.0, size=(n_pairs,), device=device)
+            if antithetic:
+                z = torch.cat([z, -z])[:batch_size]
+            u = torch.nn.functional.sigmoid(logit_mean + logit_std * z)
+    elif weighting_scheme == "mode":
+        if qmc is not None:
+            u = 1 - u_base - mode_scale * (torch.cos(math.pi * u_base / 2) ** 2 - 1 + u_base)
+        else:
+            u = torch.rand(size=(n_pairs,), device=device)
+            if antithetic:
+                u = torch.cat([u, 1.0 - u])[:batch_size]
+            u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
+    elif weighting_scheme == "sigmoid":
+        # XLabs-AI style: sigma = sigmoid(scale * z).
+        if qmc is not None:
+            z = torch.logit(u_base.clamp(1e-7, 1 - 1e-7))
+            u = torch.sigmoid(sigmoid_scale * z)
+        else:
+            z = torch.normal(mean=0.0, std=1.0, size=(n_pairs,), device=device)
+            if antithetic:
+                z = torch.cat([z, -z])[:batch_size]
+            u = torch.sigmoid(sigmoid_scale * z)
+    else:
+        # "uniform" (and any unknown scheme falls back to uniform).
+        if qmc is not None:
+            u = u_base
+        elif stratified:
+            # One uniform per equal-width stratum: guarantees full [0,1] coverage.
+            edges = torch.arange(batch_size, device=device, dtype=torch.float32)
+            u = (edges + torch.rand(batch_size, device=device)) / batch_size
+        else:
+            u = torch.rand(size=(n_pairs,), device=device)
+            if antithetic:
+                u = torch.cat([u, 1.0 - u])[:batch_size]
+    return u
+
+
+def compute_antithetic_sigmas(
+    batch_size: int,
+    distribution: str,
+    device: torch.device,
+    logit_mean: float = 0.0,
+    logit_std: float = 1.0,
+    sigmoid_scale: float = 1.0,
+) -> torch.Tensor:
+    """Sample flow-matching sigmas with antithetic pairing for variance reduction.
+
+    .. deprecated::
+        Thin backward-compatible wrapper around
+        :func:`compute_density_for_timestep_sampling` with ``antithetic=True``.
+        New code should call that function directly.
+
+    The batch is filled with mirrored pairs of the *base* randomness, and the
+    configured distribution transform is applied identically to both members of
+    each pair. Because the base variate of a mirrored pair (z, -z) or (u, 1-u)
+    has the same marginal distribution as an i.i.d. draw, the batch remains
+    marginally distributed according to the configured distribution while
+    cancelling a large fraction of sampling variance.
+
+    Supported distributions:
+        "uniform":      u ~ U(0,1);           pair = (u, 1-u)
+        "logit_normal": sigma = sigmoid(mean + std*z), z ~ N(0,1); pair = (z, -z)
+        "sigmoid":      sigma = sigmoid(scale*z), z ~ N(0,1);       pair = (z, -z)
+        "mode":         u ~ U(0,1) transformed; pair = (u, 1-u)
+
+    Any downstream *deterministic* transform of sigma (e.g. the SD3/Flux shift
+    sigma' = s*sigma / (1 + (s-1)*sigma)) may be applied afterwards and still
+    respects the intended final distribution.
+
+    Args:
+        batch_size: Number of sigmas to draw. Odd batch sizes are handled by
+            truncating the last mirrored pair.
+        distribution: One of "uniform", "logit_normal", "sigmoid", "mode".
+        device: Torch device for the returned tensor.
+        logit_mean: Mean of the logit-normal base distribution.
+        logit_std: Std of the logit-normal base distribution.
+        sigmoid_scale: Scale of the normal base for "sigmoid" sampling.
+
+    Returns:
+        Tensor of shape (batch_size,) on ``device``, float32.
+    """
+    # Preserve the strict validation of the original implementation: only the
+    # explicitly supported distributions are accepted here (the canonical
+    # density function falls back to uniform for unknown schemes, which is the
+    # desired behavior for the SD3 weighting_scheme path but not for this
+    # dedicated antithetic helper).
+    _SUPPORTED = ("uniform", "logit_normal", "sigmoid", "mode")
+    if distribution not in _SUPPORTED:
+        raise ValueError(f"Unknown antithetic sigma distribution: {distribution}")
+    return compute_density_for_timestep_sampling(
+        weighting_scheme=distribution,
+        batch_size=batch_size,
+        logit_mean=logit_mean,
+        logit_std=logit_std,
+        mode_scale=1.29,  # SD3 default; only used for "mode"
+        antithetic=True,
+        device=device,
+        sigmoid_scale=sigmoid_scale,
+    )
+
+
+def apply_flow_shift(sigmas: torch.Tensor, shift) -> torch.Tensor:
+    """Apply the SD3/Flux timestep shift: sigma' = s*sigma / (1 + (s-1)*sigma).
+
+    Args:
+        sigmas: Tensor of sigmas in [0, 1].
+        shift: Positive scalar or per-sample tensor of shift ratios.
+    """
+    return (sigmas * shift) / (1.0 + (shift - 1.0) * sigmas)
+
+
+def apply_token_mining(
+    loss: torch.Tensor,
+    sigmas: Optional[torch.Tensor] = None,
+    alpha: float = 1.0,
+    min_weight: float = 0.25,
+    max_weight: float = 4.0,
+    sigma_gate: bool = True,
+) -> torch.Tensor:
+    """Token-level hard-example mining for per-element (spatial) losses.
+
+    Computes a per-token difficulty map from the *detached* per-element loss,
+    converts it to multiplicative weights, and reweights the loss so that hard
+    spatial tokens (edges, textures) contribute more gradient than easy ones
+    (flat regions). Weights are detached, so the model cannot inflate its own
+    mining weights.
+
+    Weight construction per sample:
+        w_i = clamp((L_i / median(L)) ** alpha, min_weight, max_weight)
+    followed by renormalization to mean 1 per sample, so the overall loss scale
+    matches the plain mean reduction.
+
+    When ``sigma_gate`` is enabled and ``sigmas`` are provided, mining strength
+    is gated by g(sigma) = clip(4*sigma*(1-sigma), 0, 1): full strength at
+    mid-schedule, disabled at the sigma extremes (where per-token loss
+    variation is mostly irreducible noise). The gate blends weights toward
+    uniform: w = 1 + g*(w-1), again renormalized to mean 1.
+
+    Args:
+        loss: Per-element loss, shape (B, C, ...) with >= 3 dims (e.g. (B,C,H,W)).
+            Tensors with fewer than 3 dims are returned unchanged.
+        sigmas: Optional per-sample flow-matching sigmas, shape (B,) or (B,1,...).
+        alpha: Difficulty exponent. Higher values concentrate more weight on
+            hard tokens.
+        min_weight / max_weight: Clamp bounds for the mining weights, relative
+            to uniform (1.0).
+        sigma_gate: Enable the sigma-dependent strength gate.
+
+    Returns:
+        Weighted loss tensor, same shape and dtype as ``loss``.
+    """
+    if loss.ndim < 3:
+        return loss
+
+    with torch.no_grad():
+        per_token = loss.detach().to(torch.float32).mean(dim=1)  # (B, ...) e.g. (B,H,W)
+        flat = per_token.flatten(1)  # (B, N)
+        med = flat.median(dim=1, keepdim=True).values.clamp(min=1e-12)
+        w = (flat / med) ** alpha
+        w = w.clamp(min_weight, max_weight)
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-12)
+
+        if sigma_gate and sigmas is not None:
+            s = sigmas.detach().reshape(sigmas.shape[0], -1)[:, 0].to(torch.float32).clamp(0.0, 1.0)
+            g = (4.0 * s * (1.0 - s)).clamp(0.0, 1.0).unsqueeze(1)  # (B, 1)
+            w = 1.0 + g * (w - 1.0)
+            w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-12)
+
+        w = w.view(per_token.shape).unsqueeze(1)  # (B, 1, ...)
+
+    return loss * w.to(dtype=loss.dtype, device=loss.device)
 
 
 def scale_v_prediction_loss_like_noise_prediction(loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler):
@@ -355,6 +712,87 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         help="Maximum clamp for dynamically-computed Patch Topology Loss weights (default: 10.0) / "
         "動的に計算されたPatch Topology Loss重みの最大クランプ値（デフォルト: 10.0）",
     )
+
+    parser.add_argument(
+        "--token_mining",
+        action="store_true",
+        help="Enable token-level hard-example mining on the spatial loss. Reweights latent tokens "
+        "by detached per-token difficulty (median-normalized, clamped, renormalized), so hard "
+        "spatial regions contribute more gradient. Best suited to flow-matching DiT training. / "
+        "空間損失にトークンレベルのハードマイニングを有効にする",
+    )
+    parser.add_argument(
+        "--token_mining_alpha",
+        type=float,
+        default=1.0,
+        help="Difficulty exponent for token mining weights (default: 1.0). Higher concentrates more "
+        "weight on hard tokens. / トークンマイニング重みの難易度指数（デフォルト: 1.0）",
+    )
+    parser.add_argument(
+        "--token_mining_min_weight",
+        type=float,
+        default=0.25,
+        help="Minimum mining weight relative to uniform (default: 0.25) / 一様重みに対する最小マイニング重み",
+    )
+    parser.add_argument(
+        "--token_mining_max_weight",
+        type=float,
+        default=4.0,
+        help="Maximum mining weight relative to uniform (default: 4.0) / 一様重みに対する最大マイニング重み",
+    )
+    parser.add_argument(
+        "--token_mining_no_sigma_gate",
+        action="store_true",
+        help="Disable the sigma-dependent gate (4*sigma*(1-sigma)) that reduces mining strength at "
+        "timestep extremes. / タイムステップ両端でマイニング強度を下げるシグマゲートを無効にする",
+    )
+    parser.add_argument(
+        "--antithetic_timestep_sampling",
+        action="store_true",
+        help="Enable antithetic sigma sampling for flow-matching trainers: the batch is filled with "
+        "mirrored pairs of the base randomness ((u, 1-u) for uniform, (z, -z) for normal-based "
+        "distributions) before applying the configured distribution transform (logit_normal/uniform/"
+        "sigmoid/mode) and any shift. Preserves the marginal timestep distribution while reducing "
+        "sampling variance; most effective at small batch sizes (4-8). Note: with gradient "
+        "accumulation or multi-GPU (DDP) the pairing may be split across micro-batches/ranks, "
+        "reducing the variance-reduction benefit. / "
+        "フローマッチングで対称（アンチセティック）なタイムステップサンプリングを有効にする",
+    )
+    parser.add_argument(
+        "--stratified_timestep_sampling",
+        action="store_true",
+        help="Enable stratified sigma sampling for flow-matching trainers: the unit interval is "
+        "partitioned into batch_size equal strata and one uniform is drawn inside each, guaranteeing "
+        "full coverage of the timestep range every batch. Scales better than antithetic as batch "
+        "size grows (variance ~1/B^3 vs ~1/B) and works for any batch size including odd. Only "
+        "applies to the base uniform variate, so it composes with the distribution transform and "
+        "shift. If both this and --antithetic_timestep_sampling are set, antithetic takes "
+        "precedence. / "
+        "フローマッチングで層化（ストラティファイド）タイムステップサンプリングを有効にする",
+    )
+    parser.add_argument(
+        "--qmc_timestep_sampling",
+        type=str,
+        default=None,
+        choices=["sobol", "halton"],
+        help="Enable quasi-Monte Carlo (low-discrepancy) sigma sampling for flow-matching "
+        "trainers: a Sobol or Halton sequence is used for the base uniform instead of "
+        "pseudo-random numbers. These sequences fill [0,1] more uniformly, yielding faster "
+        "convergence than iid (and often better than stratified at moderate batch sizes). "
+        "The sequence advances across batches via a global counter, so over many steps the "
+        "entire timestep range is covered with minimal discrepancy. Composes with the "
+        "distribution transform and shift. Precedence: antithetic > qmc > stratified (if "
+        "multiple are set, a warning is logged). 'halton' requires scipy. / "
+        "フローマッチングで準モンテカルロ（低差異）タイムステップサンプリングを有効にする",
+    )
+    parser.add_argument(
+        "--qmc_seed",
+        type=int,
+        default=0,
+        help="Seed for the scrambled QMC sequence (default: 0). Only used when "
+        "--qmc_timestep_sampling is set. / QMCシーケンスのシード（デフォルト: 0）",
+    )
+
     if support_weighted_captions:
         parser.add_argument(
             "--weighted_captions",

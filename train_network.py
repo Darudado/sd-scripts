@@ -954,6 +954,25 @@ class NetworkTrainer:
                     self._wavelet_mask_ratio = 0.0
         else:
                 loss = train_util.conditional_loss(noise_pred, target, "l2", "none", None)
+
+        # --- Token-level hard mining: reweight spatial tokens by detached per-token difficulty ---
+        if is_train and getattr(args, "token_mining", False):
+            mining_sigmas = None
+            if not getattr(args, "token_mining_no_sigma_gate", False):
+                ts = timesteps.detach().float().reshape(-1)
+                if ts.numel() > 0 and ts.max() > 1.5:  # discrete timesteps in [0, T]
+                    mining_sigmas = ts / noise_scheduler.config.num_train_timesteps
+                else:  # flow-matching trainers already return sigmas in [0, 1]
+                    mining_sigmas = ts
+            loss = custom_train_functions.apply_token_mining(
+                loss,
+                sigmas=mining_sigmas,
+                alpha=float(getattr(args, "token_mining_alpha", 1.0)),
+                min_weight=float(getattr(args, "token_mining_min_weight", 0.25)),
+                max_weight=float(getattr(args, "token_mining_max_weight", 4.0)),
+                sigma_gate=mining_sigmas is not None,
+            )
+
         loss = loss.mean(dim=list(range(1, loss.ndim)))  # mean over all dims except batch
 
         if is_train:
@@ -2555,6 +2574,21 @@ class NetworkTrainer:
 
         # Initialize Adaptive Timestep Sampler
         if getattr(args, "adaptive_timestep_sampling", False):
+            # Adaptive sampling produces its own timesteps (passed as fixed_timesteps),
+            # which bypasses the antithetic/stratified/QMC variance-reduction paths. Warn
+            # so the user knows they are mutually exclusive (adaptive takes precedence).
+            if (
+                getattr(args, "antithetic_timestep_sampling", False)
+                or getattr(args, "stratified_timestep_sampling", False)
+                or getattr(args, "qmc_timestep_sampling", None) is not None
+            ):
+                logger.warning(
+                    "Both --adaptive_timestep_sampling and "
+                    "--antithetic_timestep_sampling/--stratified_timestep_sampling/--qmc_timestep_sampling "
+                    "are enabled. Adaptive timestep sampling takes precedence and supplies fixed "
+                    "timesteps, so antithetic/stratified/QMC variance reduction will NOT be applied. "
+                    "Disable one of them to avoid this conflict."
+                )
             unet_config = getattr(unet, "config", None)
             in_channels = getattr(unet_config, "in_channels", 4) if unet_config else 4
             sampler_net = TimestepSamplerNetwork(
@@ -2577,6 +2611,30 @@ class NetworkTrainer:
                 model_type=adaptive_model_type,
             )
             logger.info(f"Adaptive non-uniform timestep sampling enabled (model_type={adaptive_model_type})")
+
+        # Warn about variance-reduction pairing/sequence breakage under gradient
+        # accumulation or DDP. Antithetic assumes each (u, 1-u) pair lives in the same
+        # loss/gradient aggregation unit; QMC assumes the sequence advances contiguously.
+        # With gradient accumulation the batch is split into micro-batches and with DDP it
+        # is sharded across ranks, so pairs may be separated and QMC sequences may
+        # diverge per rank, reducing the variance-reduction benefit.
+        if (
+            getattr(args, "antithetic_timestep_sampling", False)
+            or getattr(args, "stratified_timestep_sampling", False)
+            or getattr(args, "qmc_timestep_sampling", None) is not None
+        ):
+            _ga = getattr(args, "gradient_accumulation_steps", 1)
+            _np = accelerator.num_processes if hasattr(accelerator, "num_processes") else 1
+            if _ga > 1 or _np > 1:
+                logger.warning(
+                    f"Antithetic/stratified/QMC timestep sampling is enabled with "
+                    f"gradient_accumulation_steps={_ga} and num_processes={_np}. "
+                    "Mirrored pairs may be split across micro-batches or GPU ranks, and QMC "
+                    "sequences may diverge per rank, which reduces (and can eliminate) the "
+                    "variance-reduction benefit. For full benefit, use a single GPU with "
+                    "gradient_accumulation_steps=1, or form pairs/sequences within each "
+                    "micro-batch/rank."
+                )
 
         train_util.init_trackers(accelerator, args, "network_train")
 

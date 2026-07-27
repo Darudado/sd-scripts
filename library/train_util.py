@@ -6912,18 +6912,29 @@ def get_noise_noisy_latents_and_timesteps(
     elif flow_model_enabled:
         timestep_max = noise_scheduler.config.num_train_timesteps
         distribution = getattr(args, "flow_timestep_distribution", "logit_normal")
-        if distribution == "logit_normal":
-            logits = torch.normal(
-                mean=float(getattr(args, "flow_logit_mean", 0.0)),
-                std=float(getattr(args, "flow_logit_std", 1.0)),
-                size=(b_size,),
-                device=latents.device,
-            )
-            sigmas = torch.sigmoid(logits)
-        elif distribution == "uniform":
-            sigmas = torch.rand((b_size,), device=latents.device)
-        else:
+        antithetic = getattr(args, "antithetic_timestep_sampling", False) and is_train
+        stratified = getattr(args, "stratified_timestep_sampling", False) and is_train
+        qmc = getattr(args, "qmc_timestep_sampling", None) if is_train else None
+        # Route through the canonical density function so that antithetic pairing,
+        # stratified sampling, QMC, and the "mode" distribution are all supported
+        # here (previously only logit_normal/uniform + antithetic were handled).
+        # The function generates on the target device and applies the deterministic
+        # distribution transform; the downstream shift below stays applicable and
+        # the marginal distribution is preserved.
+        if distribution not in ("logit_normal", "uniform", "mode"):
             raise ValueError(f"Unknown flow_timestep_distribution: {distribution}")
+        sigmas = custom_train_functions.compute_density_for_timestep_sampling(
+            weighting_scheme=distribution,
+            batch_size=b_size,
+            logit_mean=float(getattr(args, "flow_logit_mean", 0.0)),
+            logit_std=float(getattr(args, "flow_logit_std", 1.0)),
+            mode_scale=float(getattr(args, "flow_mode_scale", 1.29)),
+            antithetic=antithetic,
+            stratified=stratified,
+            qmc=qmc,
+            qmc_seed=getattr(args, "qmc_seed", 0),
+            device=latents.device,
+        )
 
         shift_requested = (
             getattr(args, "flow_uniform_shift", False) or getattr(args, "flow_uniform_static_ratio", None) is not None
