@@ -411,14 +411,18 @@ class NetworkTrainer:
             adaptive_fixed_timesteps = self.adaptive_manager.sample_timesteps(
                 latents, noise_scheduler.config.num_train_timesteps
             )
-            # Store data for Algorithm 2 (delta computation after optimizer step)
+            # Store latents and args for Algorithm 2 (delta computation after optimizer step).
+            # Noise will be stored AFTER it is actually computed below.
             self._adaptive_last_latents = latents.detach()
-            self._adaptive_last_noise = noise.detach()
             self._adaptive_last_args = args
 
         noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
             args, noise_scheduler, latents, fixed_timesteps=adaptive_fixed_timesteps, is_train=is_train, pixel_counts=pixel_counts
         )
+
+        # Now that noise is actually computed, store it for Algorithm 2
+        if is_train and self.adaptive_manager is not None and fixed_timesteps is None:
+            self._adaptive_last_noise = noise.detach()
 
         # Store noisy latents for LWD wavelet masking (used in process_batch)
         if is_train and getattr(self, "wavelet_masking_enabled", False):
@@ -526,6 +530,54 @@ class NetworkTrainer:
         return loss
 
 
+    def build_adaptive_model_fn(self, unet, accelerator, weight_dtype):
+        """Build a model_fn(noisy_latents, timesteps, wdtype) -> noise_pred for Algorithm 2.
+
+        The returned closure captures the last training step's text_conds, args, batch,
+        and masks.  When called with an *arbitrary* batch size N (e.g. chunk_len for the
+        queue, or B*|S| for the batch-loss cache), it expands the captured conditioning
+        tensors so their leading dimension matches N.
+
+        Subclasses (e.g. AnimaNetworkTrainer) override this to call their own model
+        instead of ``self.call_unet``.
+        """
+        text_conds = self._adaptive_last_text_conds
+        text_masks = text_conds[1] if len(text_conds) > 1 else None
+        adaptive_args = self._adaptive_last_args
+        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
+        base_batch_size = self._adaptive_last_latents.shape[0] if self._adaptive_last_latents is not None else 1
+
+        def model_fn(noisy_latents, timesteps, wdtype):
+            N = noisy_latents.shape[0]
+            noisy_latents_in = noisy_latents.to(wdtype)
+
+            # Expand conditioning to match the batch dimension of noisy_latents.
+            # The queue path (single x_0) and batch-loss path (B*|S|) both produce
+            # latents whose leading dimension may differ from the training batch B.
+            if N != base_batch_size:
+                # Repeat the first element to match N — safe because the adaptive
+                # sampler always operates on a single x_0 expanded to N copies, or
+                # on the full batch expanded by |S| copies per sample.
+                expanded_conds = []
+                for c in text_conds:
+                    if isinstance(c, torch.Tensor) and c.shape[0] > 0:
+                        expanded_conds.append(c[:1].expand(N, *c.shape[1:]).contiguous())
+                    else:
+                        expanded_conds.append(c)
+                encoder_mask_bias = expanded_conds[1] if len(expanded_conds) > 1 else None
+                return self.call_unet(
+                    adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
+                    expanded_conds, encoder_mask_bias, adaptive_batch, wdtype,
+                )
+            else:
+                encoder_mask_bias = text_masks
+                return self.call_unet(
+                    adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
+                    text_conds, encoder_mask_bias, adaptive_batch, wdtype,
+                )
+
+        return model_fn
+
     def compute_adaptive_delta_before_step(self, unet, noise_scheduler, weight_dtype, accelerator, global_step):
         """Compute per-timestep losses with theta_k (before optimizer step) for Algorithm 2.
 
@@ -544,18 +596,7 @@ class NetworkTrainer:
         if latents is None or noise is None or text_conds is None:
             return
 
-        text_masks = text_conds[1] if len(text_conds) > 1 else None
-
-        adaptive_args = self._adaptive_last_args
-        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
-
-        def model_fn(noisy_latents, timesteps, wdtype):
-            noisy_latents_in = noisy_latents.to(wdtype)
-            encoder_mask_bias = text_masks
-            return self.call_unet(
-                adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
-                text_conds, encoder_mask_bias, adaptive_batch, wdtype,
-            )
+        model_fn = self.build_adaptive_model_fn(unet, accelerator, weight_dtype)
 
         # Compute per-timestep losses for a single x_0 at all T timesteps (for the queue)
         self._adaptive_losses_before = self.adaptive_manager.compute_per_timestep_losses(
@@ -584,18 +625,7 @@ class NetworkTrainer:
         if latents is None or noise is None or text_conds is None:
             return
 
-        text_masks = text_conds[1] if len(text_conds) > 1 else None
-
-        adaptive_args = self._adaptive_last_args
-        adaptive_batch = self._adaptive_last_batch if self._adaptive_last_batch is not None else {}
-
-        def model_fn(noisy_latents, timesteps, wdtype):
-            noisy_latents_in = noisy_latents.to(wdtype)
-            encoder_mask_bias = text_masks
-            return self.call_unet(
-                adaptive_args, accelerator, unet, noisy_latents_in, timesteps,
-                text_conds, encoder_mask_bias, adaptive_batch, wdtype,
-            )
+        model_fn = self.build_adaptive_model_fn(unet, accelerator, weight_dtype)
 
         # Algorithm 2: compute delta approximation. When a previous |S| selection
         # exists, the full batch at those timesteps is used (paper Algorithm 2 line 7).
@@ -2626,6 +2656,8 @@ class NetworkTrainer:
                     "Disable one of them to avoid this conflict."
                 )
             adaptive_model_type = self.get_adaptive_model_type(args)
+            adaptive_min_ts = 0 if args.min_timestep is None else args.min_timestep
+            adaptive_max_ts = args.max_timestep  # None → defaults to num_train_timesteps in manager
             self.adaptive_manager = AdaptiveTimestepManager(
                 # Network is lazily initialized on first sample_timesteps() call,
                 # inferring in_channels from the actual latent tensor shape.
@@ -2642,6 +2674,8 @@ class NetworkTrainer:
                 model_type=adaptive_model_type,
                 hidden_channels=args.adaptive_sampler_hidden_channels,
                 hidden_depth=args.adaptive_sampler_hidden_depth,
+                min_timestep=adaptive_min_ts,
+                max_timestep=adaptive_max_ts,
             )
             logger.info(f"Adaptive non-uniform timestep sampling enabled (model_type={adaptive_model_type})")
 

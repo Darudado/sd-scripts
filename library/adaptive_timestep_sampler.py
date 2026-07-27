@@ -197,9 +197,24 @@ class AdaptiveTimestepManager:
         # Network architecture params for lazy initialization
         hidden_channels: int = 128,
         hidden_depth: int = 2,
+        # Timestep range
+        min_timestep: int = 0,
+        max_timestep: Optional[int] = None,
+        # Reward normalization baseline (reduces REINFORCE variance)
+        reward_baseline_decay: float = 0.9,
     ):
         self.device = device
         self.dtype = dtype
+
+        # Timestep range for Beta sampling
+        self.min_timestep = min_timestep
+        self.max_timestep = max_timestep if max_timestep is not None else self._get_num_train_timesteps(noise_scheduler)
+
+        # Reward normalization baseline (EMA of delta) to reduce REINFORCE variance.
+        # A running baseline does not bias the gradient but dramatically reduces variance,
+        # making the sampler learn effectively even with small per-step deltas (e.g. LoRA).
+        self.reward_baseline_decay = reward_baseline_decay
+        self._reward_baseline: float = 0.0
 
         # Store network architecture params for lazy initialization
         self._hidden_channels = hidden_channels
@@ -227,7 +242,7 @@ class AdaptiveTimestepManager:
 
         # Noise scheduler reference for Algorithm 2
         self.noise_scheduler = noise_scheduler
-        self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
+        self.num_train_timesteps = self._get_num_train_timesteps(noise_scheduler)
 
         # Queue Q for storing historical delta values (Algorithm 2, line 3)
         self.queue: deque = deque(maxlen=queue_size)
@@ -269,8 +284,19 @@ class AdaptiveTimestepManager:
             f"entropy_coeff={entropy_coeff}, f_S={update_freq}, "
             f"|Q|={queue_size}, |S|={num_selected}, v_pred={v_parameterization}, "
             f"model_type={model_type}, custom_loss_fn={compute_loss_fn is not None}, "
+            f"timestep_range=[{min_timestep}, {self.max_timestep}), "
+            f"reward_baseline_decay={reward_baseline_decay}, "
             f"network={'pre-created' if sampler_network is not None else 'lazy (will init from first latent shape)'}"
         )
+
+    @staticmethod
+    def _get_num_train_timesteps(noise_scheduler) -> int:
+        """Extract num_train_timesteps from a scheduler, handling both object and mock configs."""
+        if noise_scheduler is None:
+            return 1000
+        if hasattr(noise_scheduler, "config") and hasattr(noise_scheduler.config, "num_train_timesteps"):
+            return noise_scheduler.config.num_train_timesteps
+        return getattr(noise_scheduler, "num_train_timesteps", 1000)
 
     def _init_sampler_network(self, in_channels: int):
         """
@@ -331,11 +357,20 @@ class AdaptiveTimestepManager:
         t_continuous = beta_dist.sample()  # shape (B,), values in (0, 1)
 
         # Cache the sampled t for REINFORCE update (Algorithm 1, line 8)
+        # The cached value is the raw Beta sample in [0, 1]; the min/max mapping
+        # below is deterministic so log_prob gradients are unaffected.
         self._cached_t_continuous = t_continuous.detach()
 
-        # Map to discrete timesteps [0, num_timesteps)
-        timesteps = (t_continuous * num_timesteps).long()
-        timesteps = torch.clamp(timesteps, 0, num_timesteps - 1)
+        # Map Beta samples [0, 1] to the requested timestep range [min_timestep, max_timestep).
+        # The Beta distribution naturally concentrates on high-impact regions while the
+        # range constraint ensures we never sample outside the training schedule.
+        sigma_min = self.min_timestep / num_timesteps
+        sigma_max = self.max_timestep / num_timesteps
+        t_scaled = sigma_min + t_continuous * (sigma_max - sigma_min)
+
+        # Convert to discrete timesteps within the constrained range
+        timesteps = (t_scaled * num_timesteps).long()
+        timesteps = torch.clamp(timesteps, self.min_timestep, self.max_timestep - 1)
 
         return timesteps
 
@@ -681,16 +716,6 @@ class AdaptiveTimestepManager:
         # Forward pass to get current (a, b) with gradients
         a, b = self.sampler_network(x_0_latent)
 
-        # Compute log probability of the cached Beta distribution parameters
-        # We use the NEW forward pass (with grad) but evaluate at the CACHED (a, b)
-        # Actually, we need to compute log_prob of the ACTUAL timesteps that were sampled
-        # using the current network parameters. Since we need gradients through φ,
-        # we re-sample or use the cached continuous values.
-
-        # For the REINFORCE estimator, we need:
-        # ∇_φ E[Δ̃] = E[Δ̃ · ∇_φ log π_φ(a,b|x_0)]
-        # This is equivalent to minimizing: -Δ̃ · log Beta(t; a, b)
-
         # Sample from the current Beta distribution (with gradients)
         beta_dist = torch.distributions.Beta(a, b)
 
@@ -705,11 +730,22 @@ class AdaptiveTimestepManager:
         # Compute log probability
         log_prob = beta_dist.log_prob(t_continuous.clamp(1e-6, 1.0 - 1e-6))
 
-        # Policy gradient loss: -Δ̃ * log_prob (we want to maximize Δ̃)
-        # delta_k_t is positive when the update was beneficial
-        policy_loss = -(delta_k_t.detach() * log_prob).mean()
+        # Reward normalization baseline (EMA of past deltas).
+        # Subtracting a baseline from the reward does not bias the REINFORCE gradient
+        # but dramatically reduces variance, which is critical for LoRA fine-tuning
+        # where per-step model updates (and therefore delta_k_t) are very small.
+        with torch.no_grad():
+            delta_val = delta_k_t.mean().item()
+            self._reward_baseline = (
+                self.reward_baseline_decay * self._reward_baseline
+                + (1.0 - self.reward_baseline_decay) * delta_val
+            )
+            advantage = delta_k_t.detach() - self._reward_baseline
 
-        # Entropy regularization: H(Beta(a,b)) = log B(a,b) - (a-1)ψ(a) - (b-1)ψ(b) + (a+b-2)ψ(a+b)
+        # Policy gradient loss: -advantage * log_prob (we want to maximize delta)
+        policy_loss = -(advantage * log_prob).mean()
+
+        # Entropy regularization: H(Beta(a,b)) to prevent premature convergence
         entropy = beta_dist.entropy().mean()
         entropy_loss = -self.entropy_coeff * entropy
 
@@ -721,7 +757,8 @@ class AdaptiveTimestepManager:
         self.optimizer.step()
 
         logger.debug(
-            f"Sampler update: delta={delta_k_t.item():.6f}, "
+            f"Sampler update: delta={delta_val:.6f}, baseline={self._reward_baseline:.6f}, "
+            f"advantage={advantage.mean().item():.6f}, "
             f"policy_loss={policy_loss.item():.6f}, "
             f"entropy={entropy.item():.6f}, "
             f"a_mean={a.mean().item():.3f}, b_mean={b.mean().item():.3f}"
@@ -742,6 +779,10 @@ class AdaptiveTimestepManager:
             "num_selected": self.num_selected,
             "v_parameterization": self.v_parameterization,
             "model_type": self.model_type,
+            "min_timestep": self.min_timestep,
+            "max_timestep": self.max_timestep,
+            "reward_baseline_decay": self.reward_baseline_decay,
+            "reward_baseline": self._reward_baseline,
         }
         if self.sampler_network is not None:
             state["sampler_network"] = self.sampler_network.state_dict()
@@ -775,3 +816,12 @@ class AdaptiveTimestepManager:
         if self.optimizer is not None and "optimizer" in state_dict:
             self.optimizer.load_state_dict(state_dict["optimizer"])
         self.queue = deque(state_dict["queue"], maxlen=self.queue_size)
+        # Restore new fields if present (backward-compatible with older checkpoints)
+        if "min_timestep" in state_dict:
+            self.min_timestep = state_dict["min_timestep"]
+        if "max_timestep" in state_dict:
+            self.max_timestep = state_dict["max_timestep"]
+        if "reward_baseline_decay" in state_dict:
+            self.reward_baseline_decay = state_dict["reward_baseline_decay"]
+        if "reward_baseline" in state_dict:
+            self._reward_baseline = state_dict["reward_baseline"]

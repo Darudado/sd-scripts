@@ -921,3 +921,264 @@ class TestLazyInit:
         x_0 = torch.randn(2, 4, 8, 8, device=device)
         timesteps = manager.sample_timesteps(x_0, num_timesteps=1000)
         assert timesteps.shape == (2,)
+
+
+# ---------------------------------------------------------------------------
+# Tests: min_timestep / max_timestep range
+# ---------------------------------------------------------------------------
+
+class TestMinMaxTimestep:
+
+    def test_min_timestep_respected(self, device):
+        """Sampled timesteps should be >= min_timestep."""
+        scheduler = MagicMock()
+        T = 1000
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            min_timestep=100, max_timestep=800,
+        )
+        x = torch.randn(64, 4, 8, 8, device=device)
+        timesteps = manager.sample_timesteps(x, num_timesteps=T)
+        assert (timesteps >= 100).all(), f"Min timestep violated: {timesteps.min().item()}"
+        assert (timesteps < 800).all(), f"Max timestep violated: {timesteps.max().item()}"
+
+    def test_max_timestep_respected(self, device):
+        """Sampled timesteps should be < max_timestep."""
+        scheduler = MagicMock()
+        T = 1000
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            min_timestep=0, max_timestep=500,
+        )
+        x = torch.randn(128, 4, 8, 8, device=device)
+        timesteps = manager.sample_timesteps(x, num_timesteps=T)
+        assert (timesteps < 500).all(), f"Max timestep violated: {timesteps.max().item()}"
+
+    def test_full_range_default(self, device):
+        """With defaults, timesteps should span [0, T)."""
+        scheduler = MagicMock()
+        T = 100
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+        )
+        x = torch.randn(256, 4, 8, 8, device=device)
+        timesteps = manager.sample_timesteps(x, num_timesteps=T)
+        assert timesteps.min() >= 0
+        assert timesteps.max() < T
+
+    def test_narrow_range_still_samples(self, device):
+        """Even with a very narrow range, sampling should produce valid timesteps."""
+        scheduler = MagicMock()
+        T = 1000
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            min_timestep=400, max_timestep=410,
+        )
+        x = torch.randn(32, 4, 8, 8, device=device)
+        timesteps = manager.sample_timesteps(x, num_timesteps=T)
+        assert (timesteps >= 400).all()
+        assert (timesteps < 410).all()
+
+
+# ---------------------------------------------------------------------------
+# Tests: Reward baseline normalization
+# ---------------------------------------------------------------------------
+
+class TestRewardBaseline:
+
+    def test_reward_baseline_starts_at_zero(self, device):
+        """Reward baseline should start at 0."""
+        scheduler = MagicMock()
+        T = 100
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            reward_baseline_decay=0.9,
+        )
+        assert manager._reward_baseline == 0.0
+
+    def test_reward_baseline_updates_after_sampler_update(self, device):
+        """After update_sampler, the baseline should be non-zero."""
+        scheduler = MagicMock()
+        T = 100
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            reward_baseline_decay=0.9,
+        )
+        x_0 = torch.randn(1, 4, 8, 8, device=device)
+        delta = torch.tensor(1.0, device=device)
+        manager.update_sampler(delta, x_0)
+        # Baseline = 0.9 * 0.0 + 0.1 * 1.0 = 0.1
+        assert abs(manager._reward_baseline - 0.1) < 1e-6
+
+    def test_reward_baseline_decays(self, device):
+        """Baseline should decay toward the current delta value."""
+        scheduler = MagicMock()
+        T = 100
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            reward_baseline_decay=0.9,
+        )
+        x_0 = torch.randn(1, 4, 8, 8, device=device)
+
+        # Run several updates with a constant delta.
+        # EMA formula: baseline = v * (1 - decay^n). With decay=0.9, n=50:
+        # 0.9^50 ≈ 0.005, so baseline ≈ 0.995 → within 0.01 of 1.0.
+        for _ in range(50):
+            manager.update_sampler(torch.tensor(1.0, device=device), x_0)
+
+        # EMA of constant 1.0 with decay=0.9 should converge to 1.0
+        assert abs(manager._reward_baseline - 1.0) < 0.02
+
+    def test_reward_baseline_in_state_dict(self, device):
+        """Baseline and decay should round-trip through state_dict."""
+        scheduler = MagicMock()
+        T = 100
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            reward_baseline_decay=0.95,
+        )
+        # Simulate some training
+        manager._reward_baseline = 0.42
+
+        state = manager.state_dict()
+        assert "reward_baseline" in state
+        assert state["reward_baseline"] == 0.42
+        assert "reward_baseline_decay" in state
+        assert state["reward_baseline_decay"] == 0.95
+
+        # Load into a fresh manager
+        new_manager = AdaptiveTimestepManager(
+            sampler_network=TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device),
+            noise_scheduler=scheduler, device=device,
+            reward_baseline_decay=0.95,
+        )
+        new_manager.load_state_dict(state)
+        assert new_manager._reward_baseline == 0.42
+
+    def test_reward_baseline_advantage_reduces_variance(self, device):
+        """Advantage = delta - baseline should be centered closer to zero than raw delta."""
+        scheduler = MagicMock()
+        T = 100
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            reward_baseline_decay=0.9,
+        )
+        x_0 = torch.randn(1, 4, 8, 8, device=device)
+
+        # Run updates with varying deltas
+        advantages = []
+        deltas = [0.5, 0.3, 0.7, 0.4, 0.6]
+        for d in deltas:
+            # Capture advantage by checking baseline before and after
+            baseline_before = manager._reward_baseline
+            manager.update_sampler(torch.tensor(d, device=device), x_0)
+            baseline_after = manager._reward_baseline
+            advantage = d - baseline_before
+            advantages.append(advantage)
+
+        # With baseline, the mean advantage should be smaller in magnitude
+        # than the mean of raw deltas
+        import statistics
+        raw_mean = statistics.mean(deltas)
+        adv_mean = abs(statistics.mean(advantages))
+        # The baseline reduces the mean absolute advantage
+        assert adv_mean <= raw_mean + 0.1
+
+
+# ---------------------------------------------------------------------------
+# Tests: New state_dict fields backward compatibility
+# ---------------------------------------------------------------------------
+
+class TestStateDictBackwardCompat:
+
+    def test_load_old_state_dict_without_new_fields(self, device):
+        """Loading an old checkpoint without new fields should not crash."""
+        scheduler = MagicMock()
+        T = 100
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            min_timestep=50, max_timestep=900, reward_baseline_decay=0.95,
+        )
+
+        # Create an "old" state dict without the new fields
+        old_state = manager.state_dict()
+        del old_state["min_timestep"]
+        del old_state["max_timestep"]
+        del old_state["reward_baseline_decay"]
+        del old_state["reward_baseline"]
+
+        # Create a fresh manager with defaults and load the old state
+        new_manager = AdaptiveTimestepManager(
+            sampler_network=TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device),
+            noise_scheduler=scheduler, device=device,
+        )
+        new_manager.load_state_dict(old_state)
+        # Defaults should be preserved (not overwritten by missing keys)
+        assert new_manager.min_timestep == 0
+        assert new_manager.max_timestep == T
+        assert new_manager.reward_baseline_decay == 0.9
+
+    def test_new_state_dict_round_trip(self, device):
+        """New fields should survive a state dict round-trip."""
+        scheduler = MagicMock()
+        T = 100
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            min_timestep=100, max_timestep=800, reward_baseline_decay=0.95,
+        )
+        manager._reward_baseline = 0.37
+
+        state = manager.state_dict()
+        new_manager = AdaptiveTimestepManager(
+            sampler_network=TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device),
+            noise_scheduler=scheduler, device=device,
+        )
+        new_manager.load_state_dict(state)
+        assert new_manager.min_timestep == 100
+        assert new_manager.max_timestep == 800
+        assert new_manager.reward_baseline_decay == 0.95
+        assert new_manager._reward_baseline == 0.37

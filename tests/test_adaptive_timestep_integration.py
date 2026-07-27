@@ -506,3 +506,273 @@ class TestAdaptiveModelTypeOverrides:
         trainer = NetworkTrainer()
         args = MagicMock()
         assert trainer.get_adaptive_model_type(args) == "ddpm"
+
+
+# ---------------------------------------------------------------------------
+# Tests: build_adaptive_model_fn (conditioning expansion)
+# ---------------------------------------------------------------------------
+
+class TestBuildAdaptiveModelFn:
+    """Test that build_adaptive_model_fn correctly expands conditioning to match
+    the batch size of noisy_latents passed to model_fn."""
+
+    def test_base_trainer_build_adaptive_model_fn_expands(self, device):
+        """Base trainer's model_fn should expand text_conds to match N."""
+        from train_network import NetworkTrainer
+
+        trainer = NetworkTrainer()
+        T = 100
+        scheduler = _make_flow_matching_scheduler(device, T=T)
+        B = 4
+
+        # Set up adaptive manager
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        trainer.adaptive_manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            model_type="flow_matching",
+        )
+
+        # Simulate stored data from last training step
+        latents = torch.randn(B, 4, 8, 8, device=device)
+        noise = torch.randn_like(latents)
+        # text_conds: [embeddings, masks, extra1, extra2]
+        text_conds = [
+            torch.randn(B, 16, 64, device=device),  # embeddings
+            torch.ones(B, 16, device=device),  # masks
+            torch.randn(B, 32, device=device),  # extra
+        ]
+
+        trainer._adaptive_last_latents = latents
+        trainer._adaptive_last_noise = noise
+        trainer._adaptive_last_text_conds = text_conds
+        trainer._adaptive_last_args = MagicMock()
+        trainer._adaptive_last_batch = {}
+
+        # Mock call_unet to capture the batch size of text_conds it receives
+        received_batch_sizes = []
+        def mock_call_unet(args, accel, unet, noisy_latents, timesteps, text_conds, masks, batch, wdt, **kw):
+            received_batch_sizes.append(text_conds[0].shape[0])
+            return noisy_latents  # return input as prediction
+        trainer.call_unet = mock_call_unet
+
+        model_fn = trainer.build_adaptive_model_fn(MagicMock(), MagicMock(), torch.float32)
+
+        # Call with N=10 (different from B=4) — like compute_per_timestep_losses would
+        x_expanded = torch.randn(10, 4, 8, 8, device=device)
+        t_expanded = torch.randint(0, T, (10,), device=device)
+        result = model_fn(x_expanded, t_expanded, torch.float32)
+
+        # The model_fn should have expanded text_conds from B=4 to N=10
+        assert received_batch_sizes[-1] == 10, (
+            f"text_conds[0].shape[0] should be 10 (expanded), got {received_batch_sizes[-1]}"
+        )
+        assert result.shape == x_expanded.shape
+
+    def test_base_trainer_model_fn_same_batch_size(self, device):
+        """When N == B, model_fn should not expand (pass through as-is)."""
+        from train_network import NetworkTrainer
+
+        trainer = NetworkTrainer()
+        T = 100
+        scheduler = _make_flow_matching_scheduler(device, T=T)
+        B = 4
+
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        trainer.adaptive_manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            model_type="flow_matching",
+        )
+
+        latents = torch.randn(B, 4, 8, 8, device=device)
+        noise = torch.randn_like(latents)
+        text_conds = [torch.randn(B, 16, 64, device=device), torch.ones(B, 16, device=device)]
+
+        trainer._adaptive_last_latents = latents
+        trainer._adaptive_last_noise = noise
+        trainer._adaptive_last_text_conds = text_conds
+        trainer._adaptive_last_args = MagicMock()
+        trainer._adaptive_last_batch = {}
+
+        received_batch_sizes = []
+        def mock_call_unet(args, accel, unet, noisy_latents, timesteps, tc, masks, batch, wdt, **kw):
+            received_batch_sizes.append(tc[0].shape[0])
+            return noisy_latents
+        trainer.call_unet = mock_call_unet
+
+        model_fn = trainer.build_adaptive_model_fn(MagicMock(), MagicMock(), torch.float32)
+
+        # Call with N=4 (same as B)
+        x_same = torch.randn(B, 4, 8, 8, device=device)
+        t_same = torch.randint(0, T, (B,), device=device)
+        model_fn(x_same, t_same, torch.float32)
+
+        assert received_batch_sizes[-1] == B
+
+    def test_anima_build_adaptive_model_fn(self, device):
+        """AnimaNetworkTrainer's build_adaptive_model_fn should create a model_fn
+        that expands conditioning, scales timesteps, and uses 5D latents."""
+        from anima_train_network import AnimaNetworkTrainer
+
+        trainer = AnimaNetworkTrainer()
+        T = 1000
+        scheduler = _make_flow_matching_scheduler(device, T=T)
+        B = 2
+
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        trainer.adaptive_manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            model_type="flow_matching",
+        )
+
+        latents = torch.randn(B, 4, 8, 8, device=device)
+        noise = torch.randn_like(latents)
+        # Anima text_conds: [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask]
+        text_conds = [
+            torch.randn(B, 16, 64, device=device),  # prompt_embeds
+            torch.ones(B, 16, dtype=torch.bool, device=device),  # attn_mask
+            torch.randint(0, 1000, (B, 32), device=device),  # t5_input_ids
+            torch.ones(B, 32, dtype=torch.bool, device=device),  # t5_attn_mask
+        ]
+
+        trainer._adaptive_last_latents = latents
+        trainer._adaptive_last_noise = noise
+        trainer._adaptive_last_text_conds = text_conds
+        trainer._adaptive_last_args = MagicMock()
+        trainer._adaptive_last_batch = {}
+
+        # Mock the Anima model
+        call_log = {}
+        class MockAnima(nn.Module):
+            def __init__(self):
+                super().__init__()
+            def forward(self, x, timesteps, context, **kwargs):
+                call_log["x_shape"] = x.shape  # Should be 5D
+                call_log["ts_range"] = (timesteps.min().item(), timesteps.max().item())
+                call_log["ctx_shape"] = context.shape
+                call_log["N"] = x.shape[0]
+                # Return 5D output
+                return x  # Same shape
+        mock_anima = MockAnima().to(device)
+
+        # Provide a real accelerator-like mock with a proper device
+        mock_accel = MagicMock()
+        mock_accel.device = device
+        model_fn = trainer.build_adaptive_model_fn(mock_anima, mock_accel, torch.float32)
+
+        # Call with N=6 (expanded from B=2, like B*|S| = 2*3 = 6)
+        x_input = torch.randn(6, 4, 8, 8, device=device)
+        t_input = torch.randint(0, T, (6,), device=device)
+        result = model_fn(x_input, t_input, torch.float32)
+
+        # Verify the model was called with correct shapes
+        assert call_log["x_shape"] == (6, 4, 1, 8, 8), f"Expected 5D shape, got {call_log['x_shape']}"
+        assert call_log["N"] == 6
+        assert call_log["ctx_shape"][0] == 6, "Context should be expanded to N=6"
+
+        # Verify timesteps were scaled to [0, 1] range
+        ts_min, ts_max = call_log["ts_range"]
+        assert ts_min >= 0.0 and ts_max <= 1.0, f"Timesteps should be in [0,1], got [{ts_min}, {ts_max}]"
+
+        # Result should be 4D (squeezed from 5D)
+        assert result.shape == x_input.shape, f"Expected 4D result, got {result.shape}"
+
+    def test_anima_build_adaptive_model_fn_single_sample(self, device):
+        """Anima model_fn with N=1 (single x_0 for queue) should work."""
+        from anima_train_network import AnimaNetworkTrainer
+
+        trainer = AnimaNetworkTrainer()
+        T = 1000
+        scheduler = _make_flow_matching_scheduler(device, T=T)
+        B = 4
+
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        trainer.adaptive_manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            model_type="flow_matching",
+        )
+
+        latents = torch.randn(B, 4, 8, 8, device=device)
+        noise = torch.randn_like(latents)
+        text_conds = [
+            torch.randn(B, 16, 64, device=device),
+            torch.ones(B, 16, dtype=torch.bool, device=device),
+            torch.randint(0, 1000, (B, 32), device=device),
+            torch.ones(B, 32, dtype=torch.bool, device=device),
+        ]
+
+        trainer._adaptive_last_latents = latents
+        trainer._adaptive_last_noise = noise
+        trainer._adaptive_last_text_conds = text_conds
+        trainer._adaptive_last_args = MagicMock()
+        trainer._adaptive_last_batch = {}
+
+        call_log = {}
+        class MockAnima(nn.Module):
+            def __init__(self):
+                super().__init__()
+            def forward(self, x, timesteps, context, **kwargs):
+                call_log["N"] = x.shape[0]
+                call_log["ctx_N"] = context.shape[0]
+                return x
+        mock_anima = MockAnima().to(device)
+
+        mock_accel = MagicMock()
+        mock_accel.device = device
+        model_fn = trainer.build_adaptive_model_fn(mock_anima, mock_accel, torch.float32)
+
+        # Call with N=1 (single sample for queue)
+        x_single = torch.randn(1, 4, 8, 8, device=device)
+        t_single = torch.randint(0, T, (1,), device=device)
+        result = model_fn(x_single, t_single, torch.float32)
+
+        assert call_log["N"] == 1
+        assert call_log["ctx_N"] == 1, f"Context should be expanded to N=1, got {call_log['ctx_N']}"
+        assert result.shape == x_single.shape
+
+
+# ---------------------------------------------------------------------------
+# Tests: Min/Max timestep integration
+# ---------------------------------------------------------------------------
+
+class TestMinMaxTimestepIntegration:
+    """Test min/max timestep with a full flow-matching training loop."""
+
+    def test_flow_matching_with_min_max_timestep(self, device):
+        """Adaptive sampling should respect min/max timestep in a flow-matching loop."""
+        T = 100
+        scheduler = _make_flow_matching_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+
+        min_ts, max_ts = 20, 80
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            model_type="flow_matching", update_freq=5, queue_size=5, num_selected=3,
+            min_timestep=min_ts, max_timestep=max_ts,
+        )
+
+        # Sample many timesteps and verify all are in [min_ts, max_ts)
+        for _ in range(10):
+            x = torch.randn(8, 4, 8, 8, device=device)
+            timesteps = manager.sample_timesteps(x, num_timesteps=T)
+            assert (timesteps >= min_ts).all(), f"Min timestep violated: {timesteps.min().item()} < {min_ts}"
+            assert (timesteps < max_ts).all(), f"Max timestep violated: {timesteps.max().item()} >= {max_ts}"
+
+    def test_state_dict_preserves_min_max_timestep(self, device):
+        """Min/max timestep should survive checkpoint round-trip."""
+        T = 100
+        scheduler = _make_flow_matching_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            min_timestep=30, max_timestep=70,
+        )
+
+        state = manager.state_dict()
+
+        new_net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        new_manager = AdaptiveTimestepManager(
+            sampler_network=new_net, noise_scheduler=scheduler, device=device,
+        )
+        new_manager.load_state_dict(state)
+        assert new_manager.min_timestep == 30
+        assert new_manager.max_timestep == 70

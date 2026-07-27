@@ -51,6 +51,94 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
 
+    def build_adaptive_model_fn(self, unet, accelerator, weight_dtype):
+        """Build Anima-compatible model_fn for Algorithm 2 (adaptive timestep sampling).
+
+        Handles:
+        - 5D latent expansion ([B,C,H,W] -> [B,C,1,H,W])
+        - Timestep scaling to [0, 1] range (divided by 1000)
+        - Conditioning expansion to match arbitrary batch sizes from the adaptive sampler
+        - Anima model's full conditioning signature (prompt_embeds, padding_mask, t5_ids, masks)
+        """
+        anima_model: anima_models.Anima = unet
+        text_conds = self._adaptive_last_text_conds
+
+        # Unpack the 4 core conditioning tensors
+        prompt_embeds = text_conds[0].to(accelerator.device, dtype=weight_dtype)
+        attn_mask = text_conds[1].to(accelerator.device) if len(text_conds) > 1 else None
+        t5_input_ids = text_conds[2].to(accelerator.device, dtype=torch.long) if len(text_conds) > 2 else None
+        t5_attn_mask = text_conds[3].to(accelerator.device) if len(text_conds) > 3 else None
+
+        def model_fn(noisy_latents, timesteps, wdtype):
+            """Model forward compatible with AdaptiveTimestepManager's contract.
+
+            Args:
+                noisy_latents: (N, C, H, W) 4D latents, N may differ from training batch
+                timesteps: (N,) integer timesteps in [0, num_train_timesteps)
+                wdtype: weight dtype for model inference
+
+            Returns:
+                model_output: (N, C, H, W) 4D prediction
+            """
+            N = noisy_latents.shape[0]
+
+            # Expand conditioning to match N
+            if prompt_embeds.shape[0] != N:
+                ep = prompt_embeds[:1].expand(N, -1, -1).contiguous()
+            else:
+                ep = prompt_embeds
+
+            if attn_mask is not None:
+                if attn_mask.shape[0] != N:
+                    em = attn_mask[:1].expand(N, -1).contiguous()
+                else:
+                    em = attn_mask
+            else:
+                em = None
+
+            if t5_input_ids is not None:
+                if t5_input_ids.shape[0] != N:
+                    et5 = t5_input_ids[:1].expand(N, -1).contiguous()
+                else:
+                    et5 = t5_input_ids
+            else:
+                et5 = None
+
+            if t5_attn_mask is not None:
+                if t5_attn_mask.shape[0] != N:
+                    et5m = t5_attn_mask[:1].expand(N, -1).contiguous()
+                else:
+                    et5m = t5_attn_mask
+            else:
+                et5m = None
+
+            # Scale timesteps to [0, 1] range for Anima (Anima expects timesteps / 1000)
+            anima_ts = timesteps.float() / 1000.0
+
+            # 4D to 5D: [N, C, H, W] -> [N, C, 1, H, W]
+            x_5d = noisy_latents.to(wdtype).unsqueeze(2)
+
+            # Create padding mask matching the latent spatial dimensions
+            h_latent = noisy_latents.shape[-2]
+            w_latent = noisy_latents.shape[-1]
+            padding_mask = torch.zeros(N, 1, h_latent, w_latent, dtype=wdtype, device=noisy_latents.device)
+
+            with torch.no_grad():
+                output = anima_model(
+                    x_5d,
+                    anima_ts,
+                    ep,
+                    padding_mask=padding_mask,
+                    target_input_ids=et5,
+                    target_attention_mask=et5m,
+                    source_attention_mask=em,
+                )
+
+            # 5D to 4D: [N, C, 1, H, W] -> [N, C, H, W]
+            return output.squeeze(2)
+
+        return model_fn
+
     def assert_extra_args(
         self,
         args,
@@ -940,6 +1028,18 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Sample noise
         if latents.ndim == 5:  # Fallback for 5D latents (old cache)
             latents = latents.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
+
+        # Adaptive timestep sampling: use Beta distribution sampler if enabled.
+        # Sample timesteps BEFORE noise so we can store all data for Algorithm 2 after noise is computed.
+        adaptive_fixed_timesteps = fixed_timesteps
+        if is_train and self.adaptive_manager is not None and fixed_timesteps is None:
+            adaptive_fixed_timesteps = self.adaptive_manager.sample_timesteps(
+                latents, noise_scheduler.config.num_train_timesteps
+            )
+            # Store latents and args for Algorithm 2. Noise will be stored after it is computed.
+            self._adaptive_last_latents = latents.detach()
+            self._adaptive_last_args = args
+
         noise = torch.randn_like(latents)
 
         if getattr(args, "flow_use_ot", False) and latents.size(0) > 1:
@@ -959,15 +1059,19 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Antithetic noise pairing (after OT so pair structure matches sigmas)
         noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
 
+        # Now that noise is computed, store it for Algorithm 2
+        if is_train and self.adaptive_manager is not None and fixed_timesteps is None:
+            self._adaptive_last_noise = noise.detach()
+
         # Get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, 
-            noise_scheduler, 
-            latents, 
-            noise, 
-            accelerator.device, 
+            args,
+            noise_scheduler,
+            latents,
+            noise,
+            accelerator.device,
             weight_dtype,
-            fixed_timesteps=fixed_timesteps, 
+            fixed_timesteps=adaptive_fixed_timesteps,
             is_train=is_train,
         )
         # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
