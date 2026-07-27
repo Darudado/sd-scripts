@@ -43,7 +43,7 @@ from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
 )
-from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments, apply_snr_weight_for_flow_matching
+from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments, apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 
 # from library.custom_train_functions import (
 #     apply_snr_weight,
@@ -809,6 +809,7 @@ def train(args):
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
+                noise = maybe_apply_antithetic_noise_pairing(args, noise)
                 # bsz = latents.shape[0]
 
                 # get noisy model input and timesteps

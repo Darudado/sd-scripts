@@ -23,7 +23,7 @@ from library import (
     strategy_lumina,
     train_util,
 )
-from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 from library.utils import setup_logging
 
 setup_logging()
@@ -265,6 +265,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
     ):
         assert isinstance(noise_scheduler, sd3_train_utils.FlowMatchEulerDiscreteScheduler)
         noise = torch.randn_like(latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = lumina_train_util.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, fixed_timesteps=fixed_timesteps, is_train=is_train

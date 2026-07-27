@@ -14,7 +14,7 @@ from library.safetensors_utils import load_safetensors
 init_ipex()
 
 from library import flux_models, flux_train_utils, flux_utils, sd3_train_utils, sd3_utils, strategy_base, strategy_sd3, train_util
-from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 import train_network
 from library import utils
 from library.utils import setup_logging
@@ -347,6 +347,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
 
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = sd3_train_utils.get_noisy_model_input_and_timesteps(

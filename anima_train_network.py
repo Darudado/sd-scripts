@@ -24,7 +24,10 @@ from library import (
     strategy_base,
     train_util,
 )
-from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.custom_train_functions import (
+    apply_snr_weight_for_flow_matching,
+    maybe_apply_antithetic_noise_pairing,
+)
 import train_network
 from library.utils import setup_logging
 from library.ramtorch_util import apply_ramtorch_to_module
@@ -641,6 +644,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if latents.ndim == 5:
             latents = latents.squeeze(2)
         noise = torch.randn_like(latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise)
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
         )
@@ -774,6 +778,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 addift_pair_weight = 1.0
 
         noise = torch.randn_like(source_latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise)
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, source_latents, noise, accelerator.device, weight_dtype
         )
@@ -950,6 +955,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                     f"New noise assignment indices: {col_indices.squeeze(0).tolist()}"
                 )
                 self._ot_logged = True
+
+        # Antithetic noise pairing (after OT so pair structure matches sigmas)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
 
         # Get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(

@@ -37,7 +37,12 @@ from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
 )
-from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments, apply_snr_weight_for_flow_matching
+from library.custom_train_functions import (
+    apply_masked_loss,
+    add_custom_train_arguments,
+    apply_snr_weight_for_flow_matching,
+    maybe_apply_antithetic_noise_pairing,
+)
 
 
 def train(args):
@@ -556,6 +561,9 @@ def train(args):
                         noise_flat = noise.view(b_size, -1)
                         _, (_, col_indices) = train_util.cosine_optimal_transport(lat_flat, noise_flat)
                         noise = noise[col_indices.squeeze(0)]
+
+                # Antithetic noise pairing (after OT so pair structure matches sigmas)
+                noise = maybe_apply_antithetic_noise_pairing(args, noise)
 
                 # Get noisy model input and timesteps
                 noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(

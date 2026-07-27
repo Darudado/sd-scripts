@@ -47,6 +47,7 @@ import library.custom_train_functions as custom_train_functions
 from library.adaptive_timestep_sampler import TimestepSamplerNetwork, AdaptiveTimestepManager
 from library.custom_train_functions import (
     apply_snr_weight,
+    apply_snr_weight_for_flow_matching,
     get_weighted_text_embeddings,
     prepare_scheduler_for_custom_training,
     scale_v_prediction_loss_like_noise_prediction,
@@ -506,14 +507,22 @@ class NetworkTrainer:
         return noise_pred, target, timesteps, None, noise
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
-        if args.min_snr_gamma:
-            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization, soft=args.min_snr_gamma_soft)
-        if args.scale_v_pred_loss_like_noise_pred:
-            loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
-        if args.v_pred_like_loss:
-            loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
-        if args.debiased_estimation_loss:
-            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
+        if getattr(args, "flow_model", False):
+            # For flow-matching models (enabled via --flow_model), apply flow-aware
+            # Min-SNR-gamma instead of the DDPM-style apply_snr_weight (which
+            # requires a DDPM scheduler with alphas_cumprod).
+            if args.min_snr_gamma:
+                sigmas = timesteps / noise_scheduler.config.num_train_timesteps
+                loss = apply_snr_weight_for_flow_matching(loss, sigmas, args.min_snr_gamma, soft=args.min_snr_gamma_soft)
+        else:
+            if args.min_snr_gamma:
+                loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization, soft=args.min_snr_gamma_soft)
+            if args.scale_v_pred_loss_like_noise_pred:
+                loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+            if args.v_pred_like_loss:
+                loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+            if args.debiased_estimation_loss:
+                loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
         return loss
 
 

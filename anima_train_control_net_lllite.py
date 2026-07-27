@@ -39,7 +39,7 @@ import library.train_util as train_util
 import library.config_util as config_util
 from library.image_utils import to_srgb
 from library.config_util import ConfigSanitizer, BlueprintGenerator
-from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments
+from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments, maybe_apply_antithetic_noise_pairing
 from library.utils import setup_logging, add_logging_arguments
 
 import networks.control_net_lllite_anima as lllite_module
@@ -635,6 +635,7 @@ def train(args):
 
                 # noise + timesteps
                 noise = torch.randn_like(latents)
+                noise = maybe_apply_antithetic_noise_pairing(args, noise)
                 noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
                     args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
                 )

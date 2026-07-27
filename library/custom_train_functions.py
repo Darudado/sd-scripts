@@ -195,6 +195,21 @@ class _QMCSequenceManager:
     Supported methods:
         "sobol":  Scrambled Sobol sequence (torch.quasirandom.SobolEngine).
         "halton": Halton sequence (scipy.stats.qmc.Halton, scrambled).
+        "sobol_jittered": Sobol sequence used as within-stratum jitter; each
+            batch of ``n`` draws is placed one point per equal stratum of
+            [0,1] (strata assignment randomly permuted), combining per-batch
+            stratified coverage with low-discrepancy jitter across batches.
+        "halton_jittered": Same, with a Halton sequence as the jitter source.
+
+    Sobol base-2 alignment
+    ----------------------
+    Sobol sequences only have their optimal balance (low-discrepancy)
+    properties when the *total* number of generated points is a power of two.
+    When a draw of ``n = 2**m`` points is requested and the running total is
+    not a multiple of ``n``, the manager first draws and discards
+    ``(-total) % n`` padding points so every batch is a balanced base-2 block.
+    Padding is counted in ``_draw_count`` so checkpoint save/resume fast-forward
+    reproduces the exact same sequence position.
 
     Note on performance
     -------------------
@@ -227,10 +242,14 @@ class _QMCSequenceManager:
         # different scrambled low-discrepancy sequence (no duplicate points
         # across ranks, each still space-filling).
         effective_seed = seed + rank
-        if method == "sobol":
+        # Jittered variants use the named base sequence as within-stratum
+        # jitter; one point per stratum per batch (stratified-QMC hybrid).
+        self.jittered = method.endswith("_jittered")
+        self._engine_kind = "sobol" if method.startswith("sobol") else ("halton" if method.startswith("halton") else None)
+        if self._engine_kind == "sobol":
             # Scrambled Sobol for unbiased error estimation; dimension=1 (timestep).
             self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=effective_seed)
-        elif method == "halton":
+        elif self._engine_kind == "halton":
             try:
                 from scipy.stats import qmc as scipy_qmc
             except ImportError as e:
@@ -240,7 +259,9 @@ class _QMCSequenceManager:
             self._scipy_qmc = scipy_qmc
             self._halton = scipy_qmc.Halton(d=1, scramble=True, seed=effective_seed)
         else:
-            raise ValueError(f"Unknown QMC method: {method!r}. Use 'sobol' or 'halton'.")
+            raise ValueError(
+                f"Unknown QMC method: {method!r}. Use 'sobol', 'halton', 'sobol_jittered' or 'halton_jittered'."
+            )
         self._initialized = True
 
     @classmethod
@@ -263,30 +284,51 @@ class _QMCSequenceManager:
             # Guard: a zero/negative draw is a no-op returning an empty tensor.
             # Avoids passing 0 to SobolEngine.draw / Halton.random (undefined).
             return torch.empty(0, device=device, dtype=torch.float32)
-        if self.method == "sobol":
+        if self._engine_kind == "sobol":
             # Sobol sequences have optimal low-discrepancy when the *total* number
-            # of generated points is a power of two. Use draw_base2 only when both
-            # n and the running total are powers of two; otherwise fall back to
-            # draw() (which is always valid, just slightly less optimal).
-            total_after = self._draw_count + n
+            # of generated points is a power of two. When n is a power of two,
+            # pad the running total up to a multiple of n (discarding the
+            # padding points) so every batch is a balanced base-2 block drawn
+            # via draw_base2; otherwise fall back to draw() (always valid, just
+            # slightly less optimal).
             n_is_pow2 = n > 0 and (n & (n - 1)) == 0
-            total_is_pow2 = total_after > 0 and (total_after & (total_after - 1)) == 0
-            if n_is_pow2 and total_is_pow2:
-                pts = self._sobol.draw_base2(int(math.log2(n))).squeeze(-1).to(device=device, dtype=torch.float32)
+            if n_is_pow2:
+                # Align the running total to a multiple of n (discarding the
+                # padding points) so every batch is a balanced Sobol block: any
+                # 2^m consecutive points starting at a multiple of 2^m form a
+                # (0,m,1)-net. Use draw_base2 when the cumulative total lands
+                # on a power of two (torch's API requires this); otherwise a
+                # plain aligned draw() is still balanced and always valid.
+                pad = (-self._draw_count) % n
+                if pad:
+                    self._sobol.draw(pad)
+                    self._draw_count += pad
+                total_after = self._draw_count + n
+                if (total_after & (total_after - 1)) == 0:
+                    pts = self._sobol.draw_base2(int(math.log2(n))).squeeze(-1)
+                else:
+                    pts = self._sobol.draw(n).squeeze(-1)
             else:
                 # SobolEngine draws on CPU; move to target device.
-                pts = self._sobol.draw(n).squeeze(-1).to(device=device, dtype=torch.float32)
+                pts = self._sobol.draw(n).squeeze(-1)
+            pts = pts.to(dtype=torch.float32)
         else:
             # Halton via scipy (CPU), then move to device.
-            pts = torch.from_numpy(self._halton.random(n).squeeze(-1)).to(device=device, dtype=torch.float32)
+            pts = torch.from_numpy(self._halton.random(n).squeeze(-1)).to(dtype=torch.float32)
         self._draw_count += n
-        return pts
+        if self.jittered:
+            # Stratified-QMC hybrid: use each sequence point as the within-
+            # stratum offset and assign points to a random permutation of the n
+            # equal strata, guaranteeing one point per stratum per batch.
+            perm = torch.randperm(n, dtype=torch.float32)
+            pts = (perm + pts) / n
+        return pts.to(device=device)
 
     def reset(self):
         """Reset the sequence to the beginning (e.g. for reproducibility)."""
         self._draw_count = 0
         effective_seed = self.seed + self.rank
-        if self.method == "sobol":
+        if self._engine_kind == "sobol":
             self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=effective_seed)
         else:
             self._halton = self._scipy_qmc.Halton(d=1, scramble=True, seed=effective_seed)
@@ -312,13 +354,13 @@ class _QMCSequenceManager:
         # Rebuild from scratch so the fast-forward is exact.
         self._draw_count = 0
         effective_seed = self.seed + self.rank
-        if self.method == "sobol":
+        if self._engine_kind == "sobol":
             self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=effective_seed)
         else:
             self._halton = self._scipy_qmc.Halton(d=1, scramble=True, seed=effective_seed)
         # Fast-forward to the saved position.
         if target > 0:
-            if self.method == "sobol":
+            if self._engine_kind == "sobol":
                 self._sobol.fast_forward(target)
             else:
                 self._halton.random(target)
@@ -570,6 +612,53 @@ def apply_flow_shift(sigmas: torch.Tensor, shift) -> torch.Tensor:
         shift: Positive scalar or per-sample tensor of shift ratios.
     """
     return (sigmas * shift) / (1.0 + (shift - 1.0) * sigmas)
+
+
+def apply_antithetic_noise_pairing(noise: torch.Tensor) -> torch.Tensor:
+    """Mirror the noise tensor as antithetic pairs along the batch dimension.
+
+    Given a noise tensor of shape (B, ...), the first ``ceil(B/2)`` entries are
+    kept and the remaining entries are replaced by their negation, so sample
+    ``i`` and sample ``i + ceil(B/2)`` form a mirrored pair ``(eps, -eps)``.
+    This matches the pair ordering of
+    :func:`compute_density_for_timestep_sampling` with ``antithetic=True``
+    (base draws first, mirrored copies second), so composing both pairs the
+    timestep *and* the noise of each sample with its partner.
+
+    Because ``-eps`` has the same marginal distribution as ``eps`` for a
+    symmetric Gaussian, the marginal noise distribution is unchanged; only the
+    joint (within-batch) correlation structure is altered, which cancels a
+    large fraction of gradient variance from the flow-matching target
+    ``v = eps - x0``.
+
+    Odd batch sizes truncate the last mirrored pair. Batch sizes <= 1 are a
+    no-op (a single sample cannot benefit from pairing).
+
+    Args:
+        noise: Noise tensor of shape (B, ...).
+
+    Returns:
+        Tensor of the same shape and dtype with mirrored-pair structure.
+    """
+    bsz = noise.shape[0]
+    if bsz <= 1:
+        return noise
+    n_pairs = (bsz + 1) // 2
+    base = noise[:n_pairs]
+    return torch.cat([base, -base], dim=0)[:bsz]
+
+
+def maybe_apply_antithetic_noise_pairing(args, noise: torch.Tensor, is_train: bool = True) -> torch.Tensor:
+    """Apply :func:`apply_antithetic_noise_pairing` when enabled on ``args``.
+
+    Convenience guard for trainer call sites: pairs the noise only during
+    training and only when ``--antithetic_noise_pairing`` is set. Call this
+    immediately after sampling (and any OT reassignment of) the noise, so the
+    paired noise is used both for the noisy input *and* the loss target.
+    """
+    if is_train and getattr(args, "antithetic_noise_pairing", False):
+        return apply_antithetic_noise_pairing(noise)
+    return noise
 
 
 def apply_token_mining(
@@ -891,7 +980,7 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "--qmc_timestep_sampling",
         type=str,
         default=None,
-        choices=["sobol", "halton"],
+        choices=["sobol", "halton", "sobol_jittered", "halton_jittered"],
         help="Enable quasi-Monte Carlo (low-discrepancy) sigma sampling for flow-matching "
         "trainers: a Sobol or Halton sequence is used for the base uniform instead of "
         "pseudo-random numbers. These sequences fill [0,1] more uniformly, yielding faster "
@@ -903,7 +992,12 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "stratified conflict (qmc wins, a warning is logged). DDP-safe: each rank "
         "offsets its scramble seed by its process index so ranks draw from different "
         "scrambled sequences (no duplicate points). The sequence position is "
-        "saved/restored across checkpoint resume. 'halton' requires scipy. / "
+        "saved/restored across checkpoint resume. 'halton' requires scipy. The "
+        "'*_jittered' variants use the sequence as within-stratum jitter: one "
+        "point per equal stratum of [0,1] per batch (randomly permuted strata), "
+        "combining per-batch stratified coverage with low-discrepancy jitter. "
+        "Sobol draws are base-2 aligned: power-of-two batch sizes always produce "
+        "balanced low-discrepancy blocks. / "
         "フローマッチングで準モンテカルロ（低差異）タイムステップサンプリングを有効にする",
     )
     parser.add_argument(
@@ -912,6 +1006,18 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         default=0,
         help="Seed for the scrambled QMC sequence (default: 0). Only used when "
         "--qmc_timestep_sampling is set. / QMCシーケンスのシード（デフォルト: 0）",
+    )
+    parser.add_argument(
+        "--antithetic_noise_pairing",
+        action="store_true",
+        help="Mirror the Gaussian noise as antithetic pairs (eps, -eps) along the batch dimension "
+        "for flow-matching trainers, using the same pair ordering as --antithetic_timestep_sampling "
+        "(sample i pairs with sample i + ceil(B/2)). Since -eps has the same marginal distribution "
+        "as eps, this preserves the marginal while cancelling gradient variance from the "
+        "flow-matching target v = eps - x0. Most effective when combined with "
+        "--antithetic_timestep_sampling so each mirrored timestep pair also uses mirrored noise. "
+        "Odd batch sizes truncate the last pair; batch size 1 is a no-op. / "
+        "ガウシアンノイズを対称ペア（eps, -eps）としてミラーリングし、勾配分散を低減する",
     )
 
     if support_weighted_captions:

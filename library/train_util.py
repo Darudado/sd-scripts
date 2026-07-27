@@ -6984,6 +6984,10 @@ def get_noise_noisy_latents_and_timesteps(
                 _, (_, col_indices) = cosine_optimal_transport(lat_flat, noise_flat)
                 noise = noise[col_indices.squeeze(0)]
 
+        # Antithetic noise pairing (after OT so pair structure matches sigmas).
+        # The paired noise is returned and used for the loss target by callers.
+        noise = custom_train_functions.maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
+
         sigmas_view = sigmas.view(-1, 1, 1, 1)
         noisy_latents = sigmas_view * noise + (1.0 - sigmas_view) * latents
     else:

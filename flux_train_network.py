@@ -22,7 +22,7 @@ from library import (
     strategy_flux,
     train_util,
 )
-from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 from library.adaptive_timestep_sampler import TimestepSamplerNetwork, AdaptiveTimestepManager
 from library import utils
 from library.utils import setup_logging
@@ -368,6 +368,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
         bsz = latents.shape[0]
 
         # get noisy model input and timesteps

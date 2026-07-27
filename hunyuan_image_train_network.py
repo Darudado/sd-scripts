@@ -30,7 +30,7 @@ from library import (
     strategy_hunyuan_image,
     train_util,
 )
-from library.custom_train_functions import apply_snr_weight_for_flow_matching
+from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 from library.utils import setup_logging
 
 setup_logging()
@@ -551,6 +551,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
+        noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
 
         # get noisy model input and timesteps
         noisy_model_input, _, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
