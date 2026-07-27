@@ -6915,6 +6915,7 @@ def get_noise_noisy_latents_and_timesteps(
         antithetic = getattr(args, "antithetic_timestep_sampling", False) and is_train
         stratified = getattr(args, "stratified_timestep_sampling", False) and is_train
         qmc = getattr(args, "qmc_timestep_sampling", None) if is_train else None
+        qmc_rank = PartialState().process_index if qmc is not None else 0
         # Route through the canonical density function so that antithetic pairing,
         # stratified sampling, QMC, and the "mode" distribution are all supported
         # here (previously only logit_normal/uniform + antithetic were handled).
@@ -6934,6 +6935,7 @@ def get_noise_noisy_latents_and_timesteps(
             qmc=qmc,
             qmc_seed=getattr(args, "qmc_seed", 0),
             device=latents.device,
+            rank=qmc_rank,
         )
 
         shift_requested = (

@@ -53,6 +53,7 @@ from library.custom_train_functions import (
     add_v_prediction_like_loss,
     apply_debiased_estimation,
     apply_masked_loss,
+    _QMCSequenceManager,
 )
 from library.utils import setup_logging, add_logging_arguments
 
@@ -2118,6 +2119,18 @@ class NetworkTrainer:
                 with open(adaptive_state_file, "w", encoding="utf-8") as f:
                     json.dump(adaptive_state_serializable, f)
 
+            # save QMC timestep sampling sequence position if enabled, so the
+            # low-discrepancy coverage is preserved across checkpoint resume.
+            _qmc_method = getattr(args, "qmc_timestep_sampling", None)
+            if _qmc_method is not None:
+                _qmc_seed = getattr(args, "qmc_seed", 0)
+                _qmc_rank = accelerator.process_index if hasattr(accelerator, "process_index") else 0
+                _qmc_mgr = _QMCSequenceManager(method=_qmc_method, seed=_qmc_seed, rank=_qmc_rank)
+                qmc_state_file = os.path.join(output_dir, "qmc_state.json")
+                logger.info(f"save QMC sequence state to {qmc_state_file}")
+                with open(qmc_state_file, "w", encoding="utf-8") as f:
+                    json.dump(_qmc_mgr.state_dict(), f)
+
         steps_from_state = None
 
         def load_model_hook(models, input_dir):
@@ -2158,6 +2171,20 @@ class NetworkTrainer:
                         "num_selected": adaptive_state_serializable["num_selected"],
                     }
                     self.adaptive_manager.load_state_dict(adaptive_state)
+
+            # load QMC timestep sampling sequence position if available, so the
+            # low-discrepancy coverage continues from where it left off.
+            _qmc_method = getattr(args, "qmc_timestep_sampling", None)
+            if _qmc_method is not None:
+                qmc_state_file = os.path.join(input_dir, "qmc_state.json")
+                if os.path.exists(qmc_state_file):
+                    logger.info(f"load QMC sequence state from {qmc_state_file}")
+                    with open(qmc_state_file, "r", encoding="utf-8") as f:
+                        qmc_state = json.load(f)
+                    _qmc_seed = getattr(args, "qmc_seed", 0)
+                    _qmc_rank = accelerator.process_index if hasattr(accelerator, "process_index") else 0
+                    _qmc_mgr = _QMCSequenceManager(method=_qmc_method, seed=_qmc_seed, rank=_qmc_rank)
+                    _qmc_mgr.load_state_dict(qmc_state)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -2612,12 +2639,13 @@ class NetworkTrainer:
             )
             logger.info(f"Adaptive non-uniform timestep sampling enabled (model_type={adaptive_model_type})")
 
-        # Warn about variance-reduction pairing/sequence breakage under gradient
-        # accumulation or DDP. Antithetic assumes each (u, 1-u) pair lives in the same
-        # loss/gradient aggregation unit; QMC assumes the sequence advances contiguously.
-        # With gradient accumulation the batch is split into micro-batches and with DDP it
-        # is sharded across ranks, so pairs may be separated and QMC sequences may
-        # diverge per rank, reducing the variance-reduction benefit.
+        # Warn about variance-reduction pairing breakage under gradient accumulation or
+        # DDP. Antithetic assumes each (u, 1-u) pair lives in the same loss/gradient
+        # aggregation unit; with gradient accumulation the batch is split into
+        # micro-batches and with DDP it is sharded across ranks, so pairs may be
+        # separated, reducing the variance-reduction benefit. (QMC is DDP-safe: each
+        # rank offsets its scramble seed by its process index, so ranks draw from
+        # different scrambled low-discrepancy sequences with no duplicate points.)
         if (
             getattr(args, "antithetic_timestep_sampling", False)
             or getattr(args, "stratified_timestep_sampling", False)
@@ -2629,11 +2657,12 @@ class NetworkTrainer:
                 logger.warning(
                     f"Antithetic/stratified/QMC timestep sampling is enabled with "
                     f"gradient_accumulation_steps={_ga} and num_processes={_np}. "
-                    "Mirrored pairs may be split across micro-batches or GPU ranks, and QMC "
-                    "sequences may diverge per rank, which reduces (and can eliminate) the "
-                    "variance-reduction benefit. For full benefit, use a single GPU with "
-                    "gradient_accumulation_steps=1, or form pairs/sequences within each "
-                    "micro-batch/rank."
+                    "Antithetic mirrored pairs may be split across micro-batches or GPU "
+                    "ranks, which reduces (and can eliminate) the variance-reduction "
+                    "benefit of antithetic. (QMC is DDP-safe: each rank consumes a disjoint "
+                    "slice of the global low-discrepancy sequence.) For full antithetic "
+                    "benefit, use a single GPU with gradient_accumulation_steps=1, or form "
+                    "pairs within each micro-batch/rank."
                 )
 
         train_util.init_trackers(accelerator, args, "network_train")

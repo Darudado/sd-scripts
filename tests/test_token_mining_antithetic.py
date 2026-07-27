@@ -722,11 +722,13 @@ class TestQMCDensity:
         var_iid = torch.tensor(iid_means).var().item()
         assert var_sobol < var_iid
 
-    def test_antithetic_takes_precedence_over_qmc(self):
-        """When both antithetic and qmc are set, antithetic wins (pairs sum to 1)."""
+    def test_antithetic_qmc_composes(self):
+        """When both antithetic and qmc are set, they compose (antithetic-QMC):
+        batch_size//2 low-discrepancy points are drawn and mirrored as (u, 1-u)."""
         u = compute_density_for_timestep_sampling(
             "uniform", 8, antithetic=True, qmc="sobol", qmc_seed=0, device=DEVICE
         )
+        # Antithetic pairing: u[i] + u[i+4] == 1
         for i in range(4):
             assert u[i].item() + u[i + 4].item() == pytest.approx(1.0, abs=1e-6)
 

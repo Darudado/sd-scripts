@@ -176,29 +176,60 @@ class _QMCSequenceManager:
     scrambled Sobol engine is used for randomization, which preserves the
     low-discrepancy property while allowing unbiased error estimation.
 
+    Multi-GPU (DDP) support
+    ------------------------
+    Each DDP rank is a separate Python process with its own class-level
+    ``_instances`` dict. If every rank used the same ``seed`` they would all
+    draw the *identical* sequence, so the combined effective batch would be the
+    same ``batch_size`` points repeated ``num_processes`` times — destroying the
+    low-discrepancy property across the DDP dimension. To avoid this, callers
+    pass ``rank`` (the DDP process index); the manager offsets the scramble
+    seed by ``rank`` so each rank draws from a *different* scrambled sequence.
+    Scrambling preserves the low-discrepancy property of each individual
+    sequence, so every rank still gets a space-filling set of points, and the
+    combined batch across ranks has no duplicate points. (This is simpler and
+    more robust than fast-forwarding a single global sequence, which would
+    require the total draw count to remain a power of two for Sobol's balance
+    properties.)
+
     Supported methods:
         "sobol":  Scrambled Sobol sequence (torch.quasirandom.SobolEngine).
         "halton": Halton sequence (scipy.stats.qmc.Halton, scrambled).
+
+    Note on performance
+    -------------------
+    Both Sobol (``torch.quasirandom.SobolEngine``) and Halton (``scipy.stats.qmc``)
+    generate points on the CPU; the result is then moved to the target device.
+    For typical batch sizes (1-32) this host->device transfer is negligible, but
+    it is a per-step sync point. There is no native CUDA Sobol/Halton generator
+    in torch, so this cost is unavoidable with the current engines.
     """
 
     _instances: dict = {}  # keyed by (method, seed) -> _QMCSequenceManager
 
-    def __new__(cls, method: str = "sobol", seed: int = 0):
-        key = (method, seed)
+    def __new__(cls, method: str = "sobol", seed: int = 0, rank: int = 0):
+        key = (method, seed, rank)
         if key not in cls._instances:
             cls._instances[key] = super().__new__(cls)
             cls._instances[key]._initialized = False
         return cls._instances[key]
 
-    def __init__(self, method: str = "sobol", seed: int = 0):
+    def __init__(self, method: str = "sobol", seed: int = 0, rank: int = 0):
         if self._initialized:
             return
         self.method = method
         self.seed = seed
+        self.rank = rank
+        # Total number of points consumed so far (across all draws). Used for
+        # checkpoint save/resume fast-forward (see state_dict/load_state_dict).
         self._draw_count = 0
+        # Offset the scramble seed by rank so each DDP rank draws from a
+        # different scrambled low-discrepancy sequence (no duplicate points
+        # across ranks, each still space-filling).
+        effective_seed = seed + rank
         if method == "sobol":
             # Scrambled Sobol for unbiased error estimation; dimension=1 (timestep).
-            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=seed)
+            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=effective_seed)
         elif method == "halton":
             try:
                 from scipy.stats import qmc as scipy_qmc
@@ -207,19 +238,44 @@ class _QMCSequenceManager:
                     "Halton QMC timestep sampling requires scipy. Install it with: pip install scipy"
                 ) from e
             self._scipy_qmc = scipy_qmc
-            self._halton = scipy_qmc.Halton(d=1, scramble=True, seed=seed)
+            self._halton = scipy_qmc.Halton(d=1, scramble=True, seed=effective_seed)
         else:
             raise ValueError(f"Unknown QMC method: {method!r}. Use 'sobol' or 'halton'.")
         self._initialized = True
+
+    @classmethod
+    def clear_instances(cls):
+        """Drop all cached singleton instances.
+
+        Useful for test isolation (so one test's drawn-ahead sequence does not
+        leak into the next) and for forcing a fresh sequence on demand. After
+        calling this, subsequent ``_QMCSequenceManager(...)`` constructions build
+        new engines from their seed.
+        """
+        cls._instances.clear()
 
     def draw(self, n: int, device: Union[str, torch.device] = "cpu") -> torch.Tensor:
         """Draw the next ``n`` points of the low-discrepancy sequence.
 
         Returns a tensor of shape (n,) in [0, 1] on ``device``.
         """
+        if n <= 0:
+            # Guard: a zero/negative draw is a no-op returning an empty tensor.
+            # Avoids passing 0 to SobolEngine.draw / Halton.random (undefined).
+            return torch.empty(0, device=device, dtype=torch.float32)
         if self.method == "sobol":
-            # SobolEngine draws on CPU; move to target device.
-            pts = self._sobol.draw(n).squeeze(-1).to(device=device, dtype=torch.float32)
+            # Sobol sequences have optimal low-discrepancy when the *total* number
+            # of generated points is a power of two. Use draw_base2 only when both
+            # n and the running total are powers of two; otherwise fall back to
+            # draw() (which is always valid, just slightly less optimal).
+            total_after = self._draw_count + n
+            n_is_pow2 = n > 0 and (n & (n - 1)) == 0
+            total_is_pow2 = total_after > 0 and (total_after & (total_after - 1)) == 0
+            if n_is_pow2 and total_is_pow2:
+                pts = self._sobol.draw_base2(int(math.log2(n))).squeeze(-1).to(device=device, dtype=torch.float32)
+            else:
+                # SobolEngine draws on CPU; move to target device.
+                pts = self._sobol.draw(n).squeeze(-1).to(device=device, dtype=torch.float32)
         else:
             # Halton via scipy (CPU), then move to device.
             pts = torch.from_numpy(self._halton.random(n).squeeze(-1)).to(device=device, dtype=torch.float32)
@@ -229,10 +285,44 @@ class _QMCSequenceManager:
     def reset(self):
         """Reset the sequence to the beginning (e.g. for reproducibility)."""
         self._draw_count = 0
+        effective_seed = self.seed + self.rank
         if self.method == "sobol":
-            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=self.seed)
+            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=effective_seed)
         else:
-            self._halton = self._scipy_qmc.Halton(d=1, scramble=True, seed=self.seed)
+            self._halton = self._scipy_qmc.Halton(d=1, scramble=True, seed=effective_seed)
+
+    def state_dict(self) -> dict:
+        """Return a serializable snapshot of the sequence position.
+
+        Only the draw count is needed to reconstruct the sequence position
+        (the engine is deterministic given the seed and rank). The rank is
+        re-derived on construction, so it is stored for traceability only.
+        """
+        return {"method": self.method, "seed": self.seed, "rank": self.rank, "draw_count": self._draw_count}
+
+    def load_state_dict(self, state: dict):
+        """Restore the sequence position from a ``state_dict`` snapshot.
+
+        Rebuilds the engine from the (rank-offset) seed and fast-forwards by
+        ``draw_count`` so that subsequent draws continue the sequence exactly
+        where it left off. This makes QMC reproducible across checkpoint resume,
+        preserving the cumulative coverage benefit.
+        """
+        target = int(state.get("draw_count", 0))
+        # Rebuild from scratch so the fast-forward is exact.
+        self._draw_count = 0
+        effective_seed = self.seed + self.rank
+        if self.method == "sobol":
+            self._sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=True, seed=effective_seed)
+        else:
+            self._halton = self._scipy_qmc.Halton(d=1, scramble=True, seed=effective_seed)
+        # Fast-forward to the saved position.
+        if target > 0:
+            if self.method == "sobol":
+                self._sobol.fast_forward(target)
+            else:
+                self._halton.random(target)
+            self._draw_count = target
 
 
 def compute_density_for_timestep_sampling(
@@ -247,6 +337,7 @@ def compute_density_for_timestep_sampling(
     device: Union[str, torch.device] = "cpu",
     sigmoid_scale: float = 1.0,
     qmc_seed: int = 0,
+    rank: int = 0,
 ) -> torch.Tensor:
     """Compute the density for sampling the timesteps when doing SD3/Flux training.
 
@@ -259,8 +350,8 @@ def compute_density_for_timestep_sampling(
     https://github.com/huggingface/diffusers/pull/8528.
     SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
 
-    Variance-reduction methods (mutually exclusive; precedence order is
-    ``antithetic`` > ``qmc`` > ``stratified``):
+    Variance-reduction methods (precedence order is ``antithetic`` then
+    ``qmc`` then ``stratified``; antithetic and qmc compose, see below):
 
     * ``antithetic=True``: the base randomness is drawn as mirrored pairs
       ((z, -z) for logit_normal, (u, 1-u) for mode/uniform) before applying the
@@ -283,6 +374,17 @@ def compute_density_for_timestep_sampling(
       batch size including odd. Only applies to the *base* uniform variate, so
       it composes with the deterministic distribution transform and any shift.
 
+    Antithetic + QMC composition
+    ----------------------------
+    Unlike stratified, antithetic and qmc are not mutually exclusive: when
+    both are set, ``batch_size // 2`` low-discrepancy points are drawn and each
+    is mirrored as ``(u, 1-u)`` (for uniform/mode) or ``(z, -z)`` (for
+    logit_normal/sigmoid, where ``z = logit(u)``). This "antithetic QMC"
+    combines Sobol's space-filling property with pairwise variance
+    cancellation, and is strictly better than either method alone in many
+    settings. Odd batch sizes truncate the last mirrored pair. Only ``qmc``
+    and ``stratified`` conflict (qmc wins); a warning is logged in that case.
+
     Args:
         weighting_scheme: One of "logit_normal", "mode", "uniform", "sigmoid".
             ("uniform" and "sigmoid" are accepted for the flow path; the SD3
@@ -301,6 +403,10 @@ def compute_density_for_timestep_sampling(
         sigmoid_scale: Scale of the normal base for "sigmoid" sampling.
         qmc_seed: Seed for the (scrambled) QMC sequence. Only used when ``qmc``
             is set.
+        rank: DDP process index. When greater than 0, the QMC scramble seed is
+            offset by ``rank`` so each rank draws from a different scrambled
+            low-discrepancy sequence (no duplicate points across ranks, each
+            still space-filling). Only used when ``qmc`` is set.
 
     Returns:
         Tensor of shape (batch_size,) of base variates in [0, 1] on ``device``.
@@ -311,29 +417,27 @@ def compute_density_for_timestep_sampling(
         stratified = False
         qmc = None
 
-    # Resolve precedence: antithetic > qmc > stratified. Warn on conflicts.
-    active_methods = [m for m, v in [("antithetic", antithetic), ("qmc", bool(qmc)), ("stratified", stratified)] if v]
-    if len(active_methods) > 1:
-        if antithetic:
-            logger.warning(
-                "Multiple variance-reduction methods requested (%s); antithetic takes "
-                "precedence, others are ignored." % ", ".join(active_methods)
-            )
-            qmc = None
-            stratified = False
-        elif qmc:
-            logger.warning(
-                "Both QMC (%s) and stratified timestep sampling were requested; "
-                "QMC takes precedence and stratified is ignored." % qmc
-            )
-            stratified = False
+    # Resolve precedence: antithetic composes with qmc (antithetic-QMC). Only
+    # qmc-vs-stratified and antithetic-vs-stratified conflict (both qmc and
+    # antithetic win over stratified, since stratified replaces the base uniform
+    # entirely and cannot compose with either). Warn on conflicts.
+    if stratified and (qmc is not None or antithetic):
+        winner = "QMC (%s)" % qmc if qmc is not None else "antithetic"
+        logger.warning(
+            "Both %s and stratified timestep sampling were requested; "
+            "%s takes precedence and stratified is ignored." % (winner, winner)
+        )
+        stratified = False
 
     n_pairs = (batch_size + 1) // 2 if antithetic else batch_size
 
     # QMC produces base uniforms in [0,1]; apply the same deterministic transform.
+    # When antithetic is also set, draw only n_pairs points and mirror them
+    # (antithetic-QMC composition: combines low-discrepancy coverage with
+    # pairwise variance cancellation).
     if qmc is not None:
-        qmc_mgr = _QMCSequenceManager(method=qmc, seed=qmc_seed)
-        u_base = qmc_mgr.draw(batch_size, device=device)
+        qmc_mgr = _QMCSequenceManager(method=qmc, seed=qmc_seed, rank=rank)
+        u_base = qmc_mgr.draw(n_pairs, device=device)
 
     if weighting_scheme == "logit_normal":
         # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
@@ -341,6 +445,10 @@ def compute_density_for_timestep_sampling(
             # Map the low-discrepancy uniform through the inverse-CDF (logit)
             # to get a low-discrepancy sample under the logit-normal distribution.
             z = torch.logit(u_base.clamp(1e-7, 1 - 1e-7))
+            if antithetic:
+                # Antithetic-QMC: mirror the standardized z so the pair is
+                # symmetric about the mean.
+                z = torch.cat([z, -z])[:batch_size]
             u = torch.nn.functional.sigmoid(logit_mean + logit_std * z)
         else:
             # Mirror the standardized z so the pair is symmetric about the mean.
@@ -350,6 +458,9 @@ def compute_density_for_timestep_sampling(
             u = torch.nn.functional.sigmoid(logit_mean + logit_std * z)
     elif weighting_scheme == "mode":
         if qmc is not None:
+            if antithetic:
+                # Antithetic-QMC: mirror the base uniform before the transform.
+                u_base = torch.cat([u_base, 1.0 - u_base])[:batch_size]
             u = 1 - u_base - mode_scale * (torch.cos(math.pi * u_base / 2) ** 2 - 1 + u_base)
         else:
             u = torch.rand(size=(n_pairs,), device=device)
@@ -360,6 +471,9 @@ def compute_density_for_timestep_sampling(
         # XLabs-AI style: sigma = sigmoid(scale * z).
         if qmc is not None:
             z = torch.logit(u_base.clamp(1e-7, 1 - 1e-7))
+            if antithetic:
+                # Antithetic-QMC: mirror the standardized z.
+                z = torch.cat([z, -z])[:batch_size]
             u = torch.sigmoid(sigmoid_scale * z)
         else:
             z = torch.normal(mean=0.0, std=1.0, size=(n_pairs,), device=device)
@@ -369,6 +483,9 @@ def compute_density_for_timestep_sampling(
     else:
         # "uniform" (and any unknown scheme falls back to uniform).
         if qmc is not None:
+            if antithetic:
+                # Antithetic-QMC: mirror the base uniform.
+                u_base = torch.cat([u_base, 1.0 - u_base])[:batch_size]
             u = u_base
         elif stratified:
             # One uniform per equal-width stratum: guarantees full [0,1] coverage.
@@ -766,8 +883,8 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "full coverage of the timestep range every batch. Scales better than antithetic as batch "
         "size grows (variance ~1/B^3 vs ~1/B) and works for any batch size including odd. Only "
         "applies to the base uniform variate, so it composes with the distribution transform and "
-        "shift. If both this and --antithetic_timestep_sampling are set, antithetic takes "
-        "precedence. / "
+        "shift. If both this and --qmc_timestep_sampling are set, qmc takes precedence and "
+        "stratified is ignored. / "
         "フローマッチングで層化（ストラティファイド）タイムステップサンプリングを有効にする",
     )
     parser.add_argument(
@@ -781,8 +898,12 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "convergence than iid (and often better than stratified at moderate batch sizes). "
         "The sequence advances across batches via a global counter, so over many steps the "
         "entire timestep range is covered with minimal discrepancy. Composes with the "
-        "distribution transform and shift. Precedence: antithetic > qmc > stratified (if "
-        "multiple are set, a warning is logged). 'halton' requires scipy. / "
+        "distribution transform and shift. Antithetic and qmc compose (antithetic-QMC: "
+        "batch_size//2 low-discrepancy points are drawn and mirrored); only qmc and "
+        "stratified conflict (qmc wins, a warning is logged). DDP-safe: each rank "
+        "offsets its scramble seed by its process index so ranks draw from different "
+        "scrambled sequences (no duplicate points). The sequence position is "
+        "saved/restored across checkpoint resume. 'halton' requires scipy. / "
         "フローマッチングで準モンテカルロ（低差異）タイムステップサンプリングを有効にする",
     )
     parser.add_argument(

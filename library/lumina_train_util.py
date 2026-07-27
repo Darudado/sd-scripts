@@ -955,6 +955,7 @@ def get_noisy_model_input_and_timesteps(
             qmc=getattr(args, "qmc_timestep_sampling", None) if is_train else None,
             qmc_seed=getattr(args, "qmc_seed", 0),
             device=device,
+            rank=PartialState().process_index if getattr(args, "qmc_timestep_sampling", None) is not None else 0,
         )
         indices = (u * num_timesteps).long()
         timesteps = noise_scheduler.timesteps[indices].to(device=device)

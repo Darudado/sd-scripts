@@ -663,6 +663,9 @@ def get_noisy_model_input_and_timesteps(
     stratified = getattr(args, "stratified_timestep_sampling", False) and is_train and fixed_timesteps is None
     qmc = getattr(args, "qmc_timestep_sampling", None) if (is_train and fixed_timesteps is None) else None
     qmc_seed = getattr(args, "qmc_seed", 0)
+    # DDP rank: each rank fast-forwards its QMC sequence to a disjoint slice so
+    # the combined batch across ranks covers distinct low-discrepancy points.
+    qmc_rank = PartialState().process_index if qmc is not None else 0
 
     if fixed_timesteps is not None:
         timesteps = fixed_timesteps
@@ -684,6 +687,7 @@ def get_noisy_model_input_and_timesteps(
                 qmc_seed=qmc_seed,
                 device=device,
                 sigmoid_scale=args.sigmoid_scale,
+                rank=qmc_rank,
             )
         elif stratified and args.timestep_sampling == "uniform":
             # Stratified: one uniform per equal-width stratum of [0,1].
@@ -716,7 +720,7 @@ def get_noisy_model_input_and_timesteps(
             # QMC low-discrepancy base; the deterministic shift preserves the
             # shifted marginal distribution.
             sigmas = custom_train_functions.compute_density_for_timestep_sampling(
-                "sigmoid", bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, sigmoid_scale=args.sigmoid_scale
+                "sigmoid", bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, sigmoid_scale=args.sigmoid_scale, rank=qmc_rank
             )
         elif stratified:
             # Stratified base uniform mapped through the sigmoid transform; the
@@ -742,7 +746,7 @@ def get_noisy_model_input_and_timesteps(
             # QMC low-discrepancy base; the resolution-dependent time_shift is
             # deterministic, so the shifted marginal distribution is preserved.
             sigmas = custom_train_functions.compute_density_for_timestep_sampling(
-                "sigmoid", bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, sigmoid_scale=args.sigmoid_scale
+                "sigmoid", bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, sigmoid_scale=args.sigmoid_scale, rank=qmc_rank
             )
         elif stratified:
             # Stratified base uniform mapped through the sigmoid transform; the

@@ -950,6 +950,7 @@ def get_noisy_model_input_and_timesteps(args, latents, noise, device, dtype, fix
         qmc=getattr(args, "qmc_timestep_sampling", None) if (is_train and fixed_timesteps is None) else None,
         qmc_seed=getattr(args, "qmc_seed", 0),
         device=device,
+        rank=PartialState().process_index if getattr(args, "qmc_timestep_sampling", None) is not None else 0,
     )
     t_min = args.min_timestep if args.min_timestep is not None else 0
     t_max = args.max_timestep if args.max_timestep is not None else 1000
