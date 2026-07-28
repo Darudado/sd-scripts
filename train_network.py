@@ -111,6 +111,8 @@ class NetworkTrainer:
         self._adaptive_last_args = None
         self._adaptive_last_batch = None
         self._adaptive_losses_before = None
+        self._adaptive_update_pending = False  # True on steps where Algorithm 2 will run
+        self._adaptive_disable_empty_cache = False  # --adaptive_sampler_disable_empty_cache
 
         # Focal Frequency Loss config
         self.ffl_enabled = False
@@ -412,16 +414,17 @@ class NetworkTrainer:
                 latents, noise_scheduler.config.num_train_timesteps
             )
             # Store latents and args for Algorithm 2 (delta computation after optimizer step).
-            # Noise will be stored AFTER it is actually computed below.
-            self._adaptive_last_latents = latents.detach()
-            self._adaptive_last_args = args
+            # Only pin tensors when this is an update step to avoid wasting VRAM on non-update steps.
+            if self._adaptive_update_pending:
+                self._adaptive_last_latents = latents.detach()
+                self._adaptive_last_args = args
 
         noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
             args, noise_scheduler, latents, fixed_timesteps=adaptive_fixed_timesteps, is_train=is_train, pixel_counts=pixel_counts
         )
 
         # Now that noise is actually computed, store it for Algorithm 2
-        if is_train and self.adaptive_manager is not None and fixed_timesteps is None:
+        if is_train and self.adaptive_manager is not None and fixed_timesteps is None and self._adaptive_update_pending:
             self._adaptive_last_noise = noise.detach()
 
         # Store noisy latents for LWD wavelet masking (used in process_batch)
@@ -604,7 +607,7 @@ class NetworkTrainer:
 
         # Compute per-timestep losses for a single x_0 at all T timesteps (for the queue)
         self._adaptive_losses_before = self.adaptive_manager.compute_per_timestep_losses(
-            latents, noise, model_fn, weight_dtype
+            latents, noise, model_fn, weight_dtype, label="theta_k pre-step"
         )
 
         # Cache per-timestep losses for the FULL batch at the current |S| timesteps,
@@ -648,6 +651,11 @@ class NetworkTrainer:
         self._adaptive_last_text_conds = None
         self._adaptive_last_args = None
         self._adaptive_last_batch = None
+
+        # Release the caching allocator's reserved pool after Algorithm 2 sweeps
+        # to prevent permanently elevated VRAM (the sweeps spike peak reserved memory).
+        if not self._adaptive_disable_empty_cache and accelerator.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def get_adaptive_model_type(self, args) -> str:
         """Return the model type for the adaptive timestep sampler.
@@ -912,7 +920,7 @@ class NetworkTrainer:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
         # Store text encoder conditions and batch for adaptive Algorithm 2
-        if self.adaptive_manager is not None and is_train:
+        if self.adaptive_manager is not None and is_train and self._adaptive_update_pending:
             self._adaptive_last_text_conds = [c.detach() if isinstance(c, torch.Tensor) else c for c in text_encoder_conds]
             self._adaptive_last_batch = batch
 
@@ -2309,6 +2317,9 @@ class NetworkTrainer:
             "ss_adaptive_sampler_lr": args.adaptive_sampler_lr if getattr(args, "adaptive_timestep_sampling", False) else None,
             "ss_adaptive_sampler_entropy_coeff": args.adaptive_sampler_entropy_coeff if getattr(args, "adaptive_timestep_sampling", False) else None,
             "ss_adaptive_sampler_update_freq": args.adaptive_sampler_update_freq if getattr(args, "adaptive_timestep_sampling", False) else None,
+            "ss_adaptive_sampler_eval_chunk_size": getattr(args, "adaptive_sampler_eval_chunk_size", 16) if getattr(args, "adaptive_timestep_sampling", False) else None,
+            "ss_adaptive_sampler_eval_stride": getattr(args, "adaptive_sampler_eval_stride", 1) if getattr(args, "adaptive_timestep_sampling", False) else None,
+            "ss_adaptive_sampler_fp32_eval": bool(getattr(args, "adaptive_sampler_fp32_eval", False)) if getattr(args, "adaptive_timestep_sampling", False) else None,
             "ss_min_snr_gamma": args.min_snr_gamma,
             "ss_scale_weight_norms": args.scale_weight_norms,
             "ss_ip_noise_gamma": args.ip_noise_gamma,
@@ -2662,6 +2673,7 @@ class NetworkTrainer:
             adaptive_model_type = self.get_adaptive_model_type(args)
             adaptive_min_ts = 0 if args.min_timestep is None else args.min_timestep
             adaptive_max_ts = args.max_timestep  # None → defaults to num_train_timesteps in manager
+            self._adaptive_disable_empty_cache = getattr(args, "adaptive_sampler_disable_empty_cache", False)
             self.adaptive_manager = AdaptiveTimestepManager(
                 # Network is lazily initialized on first sample_timesteps() call,
                 # inferring in_channels from the actual latent tensor shape.
@@ -2680,6 +2692,9 @@ class NetworkTrainer:
                 hidden_depth=args.adaptive_sampler_hidden_depth,
                 min_timestep=adaptive_min_ts,
                 max_timestep=adaptive_max_ts,
+                eval_chunk_size=getattr(args, "adaptive_sampler_eval_chunk_size", 16),
+                eval_stride=getattr(args, "adaptive_sampler_eval_stride", 1),
+                fp32_eval=getattr(args, "adaptive_sampler_fp32_eval", False),
             )
             logger.info(f"Adaptive non-uniform timestep sampling enabled (model_type={adaptive_model_type})")
 
@@ -2816,7 +2831,7 @@ class NetworkTrainer:
                         accelerator.unwrap_model(t_enc).train()
 
         if plot_edm2_loss_weighting_check(args, global_step):
-            plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
+            plot_edm2_loss_weighting(args, global_step, edm2_model, noise_scheduler.config.num_train_timesteps, accelerator.device)
 
         is_tracking = len(accelerator.trackers) > 0
         if is_tracking:
@@ -2888,6 +2903,10 @@ class NetworkTrainer:
                 if initial_step > 0:
                     initial_step -= 1
                     continue
+
+                # Set adaptive update flag: stash tensors only on steps where Algorithm 2 will run
+                if self.adaptive_manager is not None:
+                    self._adaptive_update_pending = self.adaptive_manager.should_update(global_step)
 
                 with train_util.determine_grad_sync_context(args, accelerator, None, training_model, edm2_model):
                     on_step_start_for_network(text_encoder, unet)
@@ -3151,7 +3170,7 @@ class NetworkTrainer:
 
                     # EDM2 graph generation - moved outside the sample/val/save conditional
                     if plot_edm2_loss_weighting_check(args, global_step):
-                        plot_edm2_loss_weighting(args, global_step, edm2_model, 1000, accelerator.device)
+                        plot_edm2_loss_weighting(args, global_step, edm2_model, noise_scheduler.config.num_train_timesteps, accelerator.device)
 
                 current_global_step_loss += loss.detach().item()
                 if args.edm2_loss_weighting:
