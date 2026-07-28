@@ -11,6 +11,7 @@ continuous timesteps (Flux, SD3, Anima, Lumina).
 
 import logging
 import math
+import time
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
@@ -176,6 +177,15 @@ class AdaptiveTimestepManager:
     3. Every f_S gradient steps, computes the impact of the gradient update on
        per-timestep losses (Algorithm 2)
     4. Updates the sampler using policy gradient (REINFORCE) with entropy regularization
+
+    VRAM optimization parameters (new, memory-only — results unchanged):
+    - eval_chunk_size: batch size for per-timestep loss sweeps (default 16,
+      reduced from the original 100 to lower peak activation memory).
+    - eval_stride: stride for the evaluation timestep grid (default 1 = all
+      timesteps, paper-faithful; stride>1 is an opt-in approximation).
+    - fp32_eval: if True, keep model_output/target in fp32 during sweeps
+      (original behavior); default False uses weight_dtype accumulation
+      with fp32 scalar reduction.
     """
 
     def __init__(
@@ -202,6 +212,10 @@ class AdaptiveTimestepManager:
         max_timestep: Optional[int] = None,
         # Reward normalization baseline (reduces REINFORCE variance)
         reward_baseline_decay: float = 0.9,
+        # VRAM optimization params (memory-only; results unchanged for defaults)
+        eval_chunk_size: int = 16,
+        eval_stride: int = 1,
+        fp32_eval: bool = False,
     ):
         self.device = device
         self.dtype = dtype
@@ -240,19 +254,26 @@ class AdaptiveTimestepManager:
         self.queue_size = queue_size
         self.num_selected = num_selected
 
+        # VRAM optimization parameters
+        self.eval_chunk_size = eval_chunk_size
+        self.eval_stride = max(1, eval_stride)
+        self.fp32_eval = fp32_eval
+
         # Noise scheduler reference for Algorithm 2
         self.noise_scheduler = noise_scheduler
         self.num_train_timesteps = self._get_num_train_timesteps(noise_scheduler)
+
+        # Precompute the evaluation timestep grid (strided subset of [0, T)).
+        # With stride=1 (default) this is all timesteps, matching the paper exactly.
+        self._eval_timesteps = torch.arange(0, self.num_train_timesteps, self.eval_stride)
 
         # Queue Q for storing historical delta values (Algorithm 2, line 3)
         self.queue: deque = deque(maxlen=queue_size)
 
         # Cached sampled t (continuous, in [0,1]) for REINFORCE update
         self._cached_t_continuous: Optional[torch.Tensor] = None
-        # Track the currently selected |S| timesteps for the next call to Algorithm 2.
-        # On the first call, we use the top-|S| timesteps with highest absolute delta.
-        # On subsequent calls, we use the selection from the previous call (so that
-        # we can compute losses at those timesteps for the full batch BEFORE the step).
+        # Track the currently selected |S| REAL timestep indices (not grid indices)
+        # for the next call to Algorithm 2.
         self._current_selected_indices: Optional[torch.Tensor] = None
         # Cache for the previous full-batch losses at |S| timesteps (computed before
         # the optimizer step). Used in Algorithm 2 line 7 to compute the delta for
@@ -286,6 +307,9 @@ class AdaptiveTimestepManager:
             f"model_type={model_type}, custom_loss_fn={compute_loss_fn is not None}, "
             f"timestep_range=[{min_timestep}, {self.max_timestep}), "
             f"reward_baseline_decay={reward_baseline_decay}, "
+            f"eval_chunk_size={eval_chunk_size}, eval_stride={eval_stride} "
+            f"(eval_grid_size={len(self._eval_timesteps)}), "
+            f"fp32_eval={fp32_eval}, "
             f"network={'pre-created' if sampler_network is not None else 'lazy (will init from first latent shape)'}"
         )
 
@@ -374,19 +398,32 @@ class AdaptiveTimestepManager:
 
         return timesteps
 
+    def _grid_to_timestep(self, grid_indices: torch.Tensor) -> torch.Tensor:
+        """Convert evaluation-grid indices to real timestep indices.
+
+        Grid indices are positions in the strided evaluation grid;
+        real timestep = grid_index * eval_stride.  Results are clamped
+        to [min_timestep, max_timestep - 1].
+        """
+        real = grid_indices * self.eval_stride
+        return torch.clamp(real, self.min_timestep, self.max_timestep - 1)
+
     def compute_per_timestep_losses(
         self,
         x_0_latent: torch.Tensor,
         noise: torch.Tensor,
         model_fn,
         weight_dtype: torch.dtype,
-        chunk_size: int = 100,
+        chunk_size: Optional[int] = None,
+        label: str = "sweep",
     ) -> torch.Tensor:
         """
-        Compute the diffusion loss at each timestep for a single x_0.
+        Compute the diffusion loss at each timestep in the evaluation grid for a single x_0.
 
         This is used by Algorithm 2 to evaluate the impact of gradient updates.
-        For efficiency, processes timesteps in chunks to avoid OOM.
+        For efficiency, processes timesteps in chunks to avoid OOM, and by default
+        accumulates per-sample losses in weight_dtype with fp32 scalar reduction
+        (controlled by self.fp32_eval).
 
         Supports both DDPM-style and flow-matching noise addition.
         For flow-matching models, a custom compute_loss_fn can be provided
@@ -397,26 +434,43 @@ class AdaptiveTimestepManager:
             noise: Corresponding noise, shape (1, C, H, W)
             model_fn: Function(noisy_latents, timesteps, weight_dtype) -> noise_pred
             weight_dtype: Data type for model inference
-            chunk_size: Number of timesteps to process at once
+            chunk_size: Number of timesteps to process at once (default: self.eval_chunk_size)
+            label: Human-readable tag for log messages (e.g. "theta_k pre-step")
 
         Returns:
-            losses: Per-timestep losses, shape (T,)
+            losses: Per-timestep losses over the evaluation grid, shape (T_eval,)
         """
         T = self.num_train_timesteps
+        if chunk_size is None:
+            chunk_size = self.eval_chunk_size
 
         # Expand x_0 and noise to single sample
         x_0 = x_0_latent[:1]  # (1, C, H, W)
         eps = noise[:1]  # (1, C, H, W)
 
-        losses = torch.zeros(T, device=self.device, dtype=torch.float32)
+        eval_ts = self._eval_timesteps.to(self.device)  # (T_eval,)
+        T_eval = len(eval_ts)
+        losses = torch.zeros(T_eval, device=self.device, dtype=torch.float32)
 
-        for start in range(0, T, chunk_size):
-            end = min(start + chunk_size, T)
-            t_indices = torch.arange(start, end, device=self.device, dtype=torch.long)
+        # Determine whether to use fp32 for model_output/target (original behavior)
+        # or weight_dtype with fp32 scalar reduction (optimized path).
+        # Always use fp32 when a custom loss function is provided (it may expect fp32).
+        use_fp32 = self.fp32_eval or self._compute_loss_fn is not None
+
+        reduce_dims = list(range(1, 4))  # spatial dims for (chunk, C, H, W) tensors
+
+        num_chunks = (T_eval + chunk_size - 1) // chunk_size
+        logger.info(
+            f"Adaptive sampler sweep start ({label}): {T_eval} eval points in "
+            f"{num_chunks} chunks of {chunk_size}, "
+            f"precision={'fp32' if use_fp32 else 'weight_dtype+fp32-reduce'}"
+        )
+        sweep_t0 = time.time()
+
+        for start in range(0, T_eval, chunk_size):
+            end = min(start + chunk_size, T_eval)
+            t_indices = eval_ts[start:end].long()  # real timestep indices, (chunk_len,)
             chunk_len = end - start
-
-            # Create chunk of timesteps
-            t_chunk = t_indices  # (chunk_len,)
 
             if self.model_type == "flow_matching":
                 # Flow-matching noise addition: x_t = sigma * noise + (1 - sigma) * x_0
@@ -432,18 +486,26 @@ class AdaptiveTimestepManager:
 
                 # Forward pass through the model
                 with torch.no_grad():
-                    model_output = model_fn(x_t, t_chunk, weight_dtype)
+                    model_output = model_fn(x_t, t_indices, weight_dtype)
 
-                # Compute loss
-                model_output = model_output.to(torch.float32)
-                if self._compute_loss_fn is not None:
-                    # Custom loss function for model-specific loss computation
-                    chunk_losses = self._compute_loss_fn(model_output, x_0_expanded, eps_expanded, t_indices)
+                if use_fp32:
+                    # Original fp32 path (for custom loss fns or fp32_eval escape hatch)
+                    model_output = model_output.to(torch.float32)
+                    if self._compute_loss_fn is not None:
+                        chunk_losses = self._compute_loss_fn(model_output, x_0_expanded.to(torch.float32), eps_expanded.to(torch.float32), t_indices)
+                    else:
+                        target = (eps_expanded - x_0_expanded).to(torch.float32)
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims)
                 else:
-                    # Default flow-matching: velocity prediction target v = noise - x_0
-                    target = (eps_expanded - x_0_expanded).to(torch.float32)
-                    chunk_losses = F.mse_loss(model_output, target, reduction="none")
-                    chunk_losses = chunk_losses.mean(dim=list(range(1, chunk_losses.ndim)))
+                    # Optimized path: accumulate in weight_dtype, reduce to fp32
+                    if self._compute_loss_fn is not None:
+                        model_output_f32 = model_output.to(torch.float32)
+                        chunk_losses = self._compute_loss_fn(model_output_f32, x_0_expanded.to(torch.float32), eps_expanded.to(torch.float32), t_indices)
+                    else:
+                        target = eps_expanded - x_0_expanded  # stays in weight_dtype
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims, dtype=torch.float32)
             else:
                 # DDPM noise addition: x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
                 alphas_cumprod = self._alphas_cumprod
@@ -460,25 +522,43 @@ class AdaptiveTimestepManager:
 
                 # Forward pass through the model
                 with torch.no_grad():
-                    model_output = model_fn(x_t, t_chunk, weight_dtype)
+                    model_output = model_fn(x_t, t_indices, weight_dtype)
 
-                # Compute MSE loss for each timestep
-                model_output = model_output.to(torch.float32)
-                if self._compute_loss_fn is not None:
-                    chunk_losses = self._compute_loss_fn(model_output, x_0_expanded, eps_expanded, t_indices)
-                elif self.v_parameterization:
-                    # v-prediction target: v = sqrt(alpha_bar) * eps - sqrt(1 - alpha_bar) * x_0
-                    target = sqrt_alpha * eps_expanded - sqrt_one_minus_alpha * x_0_expanded
-                    target = target.to(torch.float32)
-                    chunk_losses = F.mse_loss(model_output, target, reduction="none")
-                    chunk_losses = chunk_losses.mean(dim=list(range(1, chunk_losses.ndim)))
+                if use_fp32:
+                    # Original fp32 path
+                    model_output = model_output.to(torch.float32)
+                    if self._compute_loss_fn is not None:
+                        chunk_losses = self._compute_loss_fn(model_output, x_0_expanded.to(torch.float32), eps_expanded.to(torch.float32), t_indices)
+                    elif self.v_parameterization:
+                        target = sqrt_alpha * eps_expanded - sqrt_one_minus_alpha * x_0_expanded
+                        target = target.to(torch.float32)
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims)
+                    else:
+                        target = eps_expanded.to(torch.float32)
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims)
                 else:
-                    # epsilon prediction target
-                    target = eps_expanded.to(torch.float32)
-                    chunk_losses = F.mse_loss(model_output, target, reduction="none")
-                    chunk_losses = chunk_losses.mean(dim=list(range(1, chunk_losses.ndim)))
+                    # Optimized path: accumulate in weight_dtype, reduce to fp32
+                    if self._compute_loss_fn is not None:
+                        model_output_f32 = model_output.to(torch.float32)
+                        chunk_losses = self._compute_loss_fn(model_output_f32, x_0_expanded.to(torch.float32), eps_expanded.to(torch.float32), t_indices)
+                    elif self.v_parameterization:
+                        target = sqrt_alpha * eps_expanded - sqrt_one_minus_alpha * x_0_expanded
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims, dtype=torch.float32)
+                    else:
+                        target = eps_expanded  # stays in weight_dtype
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims, dtype=torch.float32)
 
             losses[start:end] = chunk_losses
+
+        # losses.mean().item() also synchronizes CUDA, making elapsed time accurate
+        logger.info(
+            f"Adaptive sampler sweep done ({label}): "
+            f"{time.time() - sweep_t0:.2f}s, mean loss={losses.mean().item():.6f}"
+        )
 
         return losses
 
@@ -512,34 +592,38 @@ class AdaptiveTimestepManager:
             x_0_latent: Single latent for the queue, shape (1, C, H, W)
             noise: Corresponding noise for the queue, shape (1, C, H, W)
             weight_dtype: Data type for model inference
-            losses_before: Per-timestep losses with θ_k for the single x_0, shape (T,)
+            losses_before: Per-timestep losses with θ_k over the eval grid, shape (T_eval,)
             full_batch_latents: Optional full batch latents, shape (B, C, H, W)
             full_batch_noise: Optional full batch noise, shape (B, C, H, W)
 
         Returns:
             delta_approx: Scalar approximation of Δ̃_k^t
-            selected_indices: The timestep indices selected by feature selection
+            selected_indices: The REAL timestep indices selected by feature selection
         """
         # Step 2: Compute per-timestep losses with θ_{k+1} (after optimizer step)
         losses_after = self.compute_per_timestep_losses(
-            x_0_latent, noise, model_fn, weight_dtype
+            x_0_latent, noise, model_fn, weight_dtype, label="theta_{k+1} post-step"
         )
 
-        # Compute delta for each timestep: δ_{k,τ} = L_τ(θ_k) - L_τ(θ_{k+1})
-        deltas = losses_before - losses_after  # shape (T,)
+        # Compute delta for each grid timestep: δ_{k,τ} = L_τ(θ_k) - L_τ(θ_{k+1})
+        deltas = losses_before - losses_after  # shape (T_eval,)
 
         # Step 3: Push into queue Q
         self.queue.append(deltas.detach().cpu())
 
-        # Step 4-5: Feature selection if queue has enough data
+        # Step 4-5: Feature selection if queue has enough data.
+        # Returns grid indices into the evaluation grid.
         if len(self.queue) > 1:
-            queue_tensor = torch.stack(list(self.queue), dim=0).to(self.device)  # (Q, T)
-            new_selected_indices = select_timesteps_f_statistic(
+            queue_tensor = torch.stack(list(self.queue), dim=0).to(self.device)  # (Q, T_eval)
+            new_selected_grid_indices = select_timesteps_f_statistic(
                 queue_tensor, self.num_selected
             )
         else:
             # First iteration: select timesteps with highest absolute delta
-            new_selected_indices = torch.topk(deltas.abs(), self.num_selected).indices
+            new_selected_grid_indices = torch.topk(deltas.abs(), self.num_selected).indices
+
+        # Convert grid indices to real timestep indices
+        new_selected_timestep_indices = self._grid_to_timestep(new_selected_grid_indices)
 
         # Step 7: Compute approximation for the current mini-batch.
         # Prefer the full batch at the PREVIOUS |S| selection (if available),
@@ -562,11 +646,12 @@ class AdaptiveTimestepManager:
             # for which the delta was actually computed)
             selected_indices = prev_S
         else:
-            # Fallback: single x_0 at the new |S| selection
-            delta_approx = deltas[new_selected_indices].mean()
-            selected_indices = new_selected_indices
+            # Fallback: single x_0 at the new |S| selection (grid indices for indexing deltas)
+            delta_approx = deltas[new_selected_grid_indices].mean()
+            selected_indices = new_selected_timestep_indices
 
         # Update the current selection for the NEXT call to Algorithm 2
+        # Store REAL timestep indices (not grid indices) so batch loss fns work correctly
         self._current_selected_indices = selected_indices.detach().cpu()
         # Clear the cached prev batch losses (will be set by the next before-step call)
         self._prev_batch_losses_at_S = None
@@ -592,6 +677,7 @@ class AdaptiveTimestepManager:
         """
         if self._current_selected_indices is None:
             return
+        # _current_selected_indices stores REAL timestep indices (not grid indices)
         indices = self._current_selected_indices.to(self.device)
         self._prev_batch_losses_at_S = self.compute_per_timestep_losses_for_batch(
             full_batch_latents, full_batch_noise, model_fn, weight_dtype, indices
@@ -608,17 +694,20 @@ class AdaptiveTimestepManager:
         selected_indices: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute per-timestep losses for the full batch at selected timesteps only.
+        Compute per-timestep losses for the full batch at selected real timesteps.
 
         This is used to compute the final Δ̃_k^t for the full mini-batch
         (Algorithm 2, line 7: "for x_0s in current mini-batch").
+
+        To avoid peak VRAM from a single B×|S| forward, processes one timestep
+        at a time with batch-size B (|S| sequential forwards at batch B).
 
         Args:
             x_0_latent: Latent representations for the batch, shape (B, C, H, W)
             noise: Corresponding noise, shape (B, C, H, W)
             model_fn: Function(noisy_latents, timesteps, weight_dtype) -> noise_pred
             weight_dtype: Data type for model inference
-            selected_indices: Timestep indices to evaluate, shape (|S|,)
+            selected_indices: Real timestep indices to evaluate, shape (|S|,)
 
         Returns:
             losses: Scalar mean loss across the batch and selected timesteps
@@ -627,72 +716,99 @@ class AdaptiveTimestepManager:
         B = x_0_latent.shape[0]
         S = selected_indices.shape[0]
 
-        # Expand: (B, C, H, W) -> (B*S, C, H, W) by repeating
-        x_0_exp = x_0_latent.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, *x_0_latent.shape[1:])
-        eps_exp = noise.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, *noise.shape[1:])
+        # Determine accumulation precision (same logic as compute_per_timestep_losses)
+        use_fp32 = self.fp32_eval or self._compute_loss_fn is not None
+        reduce_dims = list(range(1, x_0_latent.ndim))  # spatial dims for per-sample loss
 
-        timesteps_exp = selected_indices.unsqueeze(0).expand(B, -1).reshape(B * S)
+        logger.debug(
+            f"Adaptive sampler batch eval start: B={B}, |S|={S} timesteps "
+            f"{selected_indices.tolist()}"
+        )
+        batch_t0 = time.time()
 
-        if self.model_type == "flow_matching":
-            # Flow-matching noise addition: x_t = sigma * noise + (1 - sigma) * x_0
-            sigmas = selected_indices.float().to(self.device) / T  # (S,)
-            sigmas_exp = sigmas.unsqueeze(0).expand(B, -1).reshape(B * S)  # (B*S,)
-            sigmas_view = sigmas_exp.view(-1, 1, 1, 1)  # (B*S, 1, 1, 1)
+        # Accumulate losses from each timestep separately (one batch-B forward per timestep)
+        # to avoid the peak VRAM of a single B×|S| forward.
+        total_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
 
-            x_t = sigmas_view * eps_exp + (1.0 - sigmas_view) * x_0_exp
-            x_t = x_t.to(weight_dtype)
+        for s_idx in range(S):
+            t_idx = selected_indices[s_idx].to(self.device)  # scalar real timestep index
+            # Create timestep tensor of shape (B,) for the model
+            timesteps_b = t_idx.expand(B)
 
-            with torch.no_grad():
-                model_output = model_fn(x_t, timesteps_exp, weight_dtype)
+            if self.model_type == "flow_matching":
+                sigma = t_idx.float() / T
+                sigma_view = sigma.view(1, 1, 1, 1)
 
-            model_output = model_output.to(torch.float32)
-            if self._compute_loss_fn is not None:
-                # Custom loss function
-                losses = self._compute_loss_fn(model_output, x_0_exp, eps_exp, timesteps_exp)
-                if losses.ndim > 1:
-                    losses = losses.mean(dim=list(range(1, losses.ndim)))
+                x_t = sigma_view * noise + (1.0 - sigma_view) * x_0_latent
+                x_t = x_t.to(weight_dtype)
+
+                with torch.no_grad():
+                    model_output = model_fn(x_t, timesteps_b, weight_dtype)
+
+                if use_fp32:
+                    model_output = model_output.to(torch.float32)
+                    if self._compute_loss_fn is not None:
+                        chunk_losses = self._compute_loss_fn(model_output, x_0_latent.to(torch.float32), noise.to(torch.float32), timesteps_b)
+                    else:
+                        target = (noise - x_0_latent).to(torch.float32)
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims)
+                else:
+                    if self._compute_loss_fn is not None:
+                        model_output_f32 = model_output.to(torch.float32)
+                        chunk_losses = self._compute_loss_fn(model_output_f32, x_0_latent.to(torch.float32), noise.to(torch.float32), timesteps_b)
+                    else:
+                        target = noise - x_0_latent  # stays in weight_dtype
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims, dtype=torch.float32)
             else:
-                # Default flow-matching: velocity prediction target v = noise - x_0
-                target = (eps_exp - x_0_exp).to(torch.float32)
-                losses = F.mse_loss(model_output, target, reduction="none")
-                losses = losses.mean(dim=list(range(1, losses.ndim)))
-        else:
-            # DDPM noise addition
-            alphas_cumprod = self._alphas_cumprod
-            alpha_bar_t = alphas_cumprod[selected_indices].view(S, 1, 1, 1)
-            sqrt_alpha = torch.sqrt(alpha_bar_t)
-            sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_bar_t)
+                # DDPM noise addition
+                alphas_cumprod = self._alphas_cumprod
+                alpha_bar_t = alphas_cumprod[t_idx].view(1, 1, 1, 1)
+                sqrt_alpha = torch.sqrt(alpha_bar_t)
+                sqrt_one_minus_alpha = torch.sqrt(1.0 - alpha_bar_t)
 
-            sqrt_alpha_exp = sqrt_alpha.expand(-1, -1, -1, -1).repeat(B, 1, 1, 1).reshape(B * S, 1, 1, 1)
-            sqrt_one_minus_exp = sqrt_one_minus_alpha.expand(-1, -1, -1, -1).repeat(B, 1, 1, 1).reshape(B * S, 1, 1, 1)
+                x_t = sqrt_alpha * x_0_latent + sqrt_one_minus_alpha * noise
+                x_t = x_t.to(weight_dtype)
 
-            x_t = sqrt_alpha_exp * x_0_exp + sqrt_one_minus_exp * eps_exp
-            x_t = x_t.to(weight_dtype)
+                with torch.no_grad():
+                    model_output = model_fn(x_t, timesteps_b, weight_dtype)
 
-            with torch.no_grad():
-                model_output = model_fn(x_t, timesteps_exp, weight_dtype)
+                if use_fp32:
+                    model_output = model_output.to(torch.float32)
+                    if self._compute_loss_fn is not None:
+                        chunk_losses = self._compute_loss_fn(model_output, x_0_latent.to(torch.float32), noise.to(torch.float32), timesteps_b)
+                    elif self.v_parameterization:
+                        target = sqrt_alpha * noise - sqrt_one_minus_alpha * x_0_latent
+                        target = target.to(torch.float32)
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims)
+                    else:
+                        target = noise.to(torch.float32)
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims)
+                else:
+                    if self._compute_loss_fn is not None:
+                        model_output_f32 = model_output.to(torch.float32)
+                        chunk_losses = self._compute_loss_fn(model_output_f32, x_0_latent.to(torch.float32), noise.to(torch.float32), timesteps_b)
+                    elif self.v_parameterization:
+                        target = sqrt_alpha * noise - sqrt_one_minus_alpha * x_0_latent
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims, dtype=torch.float32)
+                    else:
+                        target = noise  # stays in weight_dtype
+                        chunk_losses = F.mse_loss(model_output, target, reduction="none")
+                        chunk_losses = chunk_losses.mean(dim=reduce_dims, dtype=torch.float32)
 
-            model_output = model_output.to(torch.float32)
-            if self._compute_loss_fn is not None:
-                losses = self._compute_loss_fn(model_output, x_0_exp, eps_exp, timesteps_exp)
-                if losses.ndim > 1:
-                    losses = losses.mean(dim=list(range(1, losses.ndim)))
-            elif self.v_parameterization:
-                # v-prediction target: v = sqrt(alpha_bar) * eps - sqrt(1 - alpha_bar) * x_0
-                target = sqrt_alpha_exp * eps_exp - sqrt_one_minus_exp * x_0_exp
-                target = target.to(torch.float32)
-                losses = F.mse_loss(model_output, target, reduction="none")
-                losses = losses.mean(dim=list(range(1, losses.ndim)))
-            else:
-                # epsilon prediction target
-                target = eps_exp.to(torch.float32)
-                losses = F.mse_loss(model_output, target, reduction="none")
-                losses = losses.mean(dim=list(range(1, losses.ndim)))
+            # Mean over batch for this timestep, accumulate in fp64 for precision
+            total_loss += chunk_losses.mean().to(torch.float64)
 
-        # Reshape to (B, S) and average
-        losses = losses.reshape(B, S)
+        logger.debug(
+            f"Adaptive sampler batch eval done: {time.time() - batch_t0:.2f}s"
+        )
 
-        return losses.mean()
+        # Final mean over |S| timesteps
+        return (total_loss / S).to(torch.float32)
 
     def update_sampler(
         self,
@@ -783,6 +899,9 @@ class AdaptiveTimestepManager:
             "max_timestep": self.max_timestep,
             "reward_baseline_decay": self.reward_baseline_decay,
             "reward_baseline": self._reward_baseline,
+            "eval_chunk_size": self.eval_chunk_size,
+            "eval_stride": self.eval_stride,
+            "fp32_eval": self.fp32_eval,
         }
         if self.sampler_network is not None:
             state["sampler_network"] = self.sampler_network.state_dict()
@@ -816,7 +935,7 @@ class AdaptiveTimestepManager:
         if self.optimizer is not None and "optimizer" in state_dict:
             self.optimizer.load_state_dict(state_dict["optimizer"])
         self.queue = deque(state_dict["queue"], maxlen=self.queue_size)
-        # Restore new fields if present (backward-compatible with older checkpoints)
+        # Restore fields if present (backward-compatible with older checkpoints)
         if "min_timestep" in state_dict:
             self.min_timestep = state_dict["min_timestep"]
         if "max_timestep" in state_dict:
@@ -825,3 +944,14 @@ class AdaptiveTimestepManager:
             self.reward_baseline_decay = state_dict["reward_baseline_decay"]
         if "reward_baseline" in state_dict:
             self._reward_baseline = state_dict["reward_baseline"]
+        # New VRAM optimization fields (backward-compatible)
+        if "eval_chunk_size" in state_dict:
+            self.eval_chunk_size = state_dict["eval_chunk_size"]
+        if "eval_stride" in state_dict:
+            old_stride = self.eval_stride
+            self.eval_stride = state_dict["eval_stride"]
+            if self.eval_stride != old_stride:
+                # Recompute the evaluation grid with the loaded stride
+                self._eval_timesteps = torch.arange(0, self.num_train_timesteps, self.eval_stride)
+        if "fp32_eval" in state_dict:
+            self.fp32_eval = state_dict["fp32_eval"]

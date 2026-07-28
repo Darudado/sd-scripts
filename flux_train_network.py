@@ -583,7 +583,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         # Compute per-timestep losses for a single x_0 at all T timesteps (for the queue)
         self._adaptive_losses_before = self.adaptive_manager.compute_per_timestep_losses(
-            latents, noise, model_fn, weight_dtype
+            latents, noise, model_fn, weight_dtype, label="theta_k pre-step"
         )
 
         # Cache per-timestep losses for the FULL batch at the current |S| timesteps
@@ -623,6 +623,11 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self._adaptive_last_text_conds = None
         self._adaptive_last_args = None
         self._adaptive_last_batch = None
+
+        # Release the caching allocator's reserved pool after Algorithm 2 sweeps
+        # to prevent permanently elevated VRAM.
+        if not self._adaptive_disable_empty_cache and accelerator.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         if args.min_snr_gamma:

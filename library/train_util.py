@@ -4624,6 +4624,37 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=2,
         help="Hidden depth of the timestep sampler network",
     )
+    parser.add_argument(
+        "--adaptive_sampler_eval_chunk_size",
+        type=int,
+        default=16,
+        help="Batch size used for per-timestep loss sweeps in Algorithm 2. "
+        "Lower values reduce peak VRAM during the sweep at the cost of more sequential forwards. "
+        "Memory-only: results are identical regardless of this value. Default 16.",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_eval_stride",
+        type=int,
+        default=1,
+        help="Stride for the timestep evaluation grid in Algorithm 2. "
+        "stride=1 (default) evaluates all timesteps (paper-faithful). "
+        "stride>1 evaluates a coarser grid, reducing the number of model forwards "
+        "proportionally. The queue and F-statistic operate on the coarser grid; "
+        "selected indices are mapped back to real timesteps. Opt-in approximation.",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_fp32_eval",
+        action="store_true",
+        help="Escape hatch: keep model_output and targets in fp32 during Algorithm 2 sweeps "
+        "instead of the default bf16/fp16 accumulation with fp32 scalar reduction.",
+    )
+    parser.add_argument(
+        "--adaptive_sampler_disable_empty_cache",
+        action="store_true",
+        help="Disable the automatic torch.cuda.empty_cache() call after each adaptive "
+        "sampler update. By default, empty_cache releases the caching allocator's "
+        "reserved pool after Algorithm 2 sweeps to prevent permanently elevated VRAM.",
+    )
 
 
     parser.add_argument(

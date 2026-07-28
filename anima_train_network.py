@@ -1046,8 +1046,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 latents, noise_scheduler.config.num_train_timesteps
             )
             # Store latents and args for Algorithm 2. Noise will be stored after it is computed.
-            self._adaptive_last_latents = latents.detach()
-            self._adaptive_last_args = args
+            # Only pin tensors when this is an update step to avoid wasting VRAM.
+            if self._adaptive_update_pending:
+                self._adaptive_last_latents = latents.detach()
+                self._adaptive_last_args = args
 
         noise = torch.randn_like(latents)
 
@@ -1069,7 +1071,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
 
         # Now that noise is computed, store it for Algorithm 2
-        if is_train and self.adaptive_manager is not None and fixed_timesteps is None:
+        if is_train and self.adaptive_manager is not None and fixed_timesteps is None and self._adaptive_update_pending:
             self._adaptive_last_noise = noise.detach()
 
         # Get noisy model input and timesteps

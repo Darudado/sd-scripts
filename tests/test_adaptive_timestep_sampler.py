@@ -1182,3 +1182,341 @@ class TestStateDictBackwardCompat:
         assert new_manager.max_timestep == 800
         assert new_manager.reward_baseline_decay == 0.95
         assert new_manager._reward_baseline == 0.37
+
+
+# ---------------------------------------------------------------------------
+# Tests: VRAM Optimization Parameters
+# ---------------------------------------------------------------------------
+
+class TestVRAMOptimizationParams:
+    """Tests for eval_chunk_size, eval_stride, fp32_eval, and state_dict persistence."""
+
+    def test_eval_chunk_size_init(self, device):
+        """eval_chunk_size should be stored and used as the default chunk."""
+        T = 100
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            eval_chunk_size=8,
+        )
+        assert manager.eval_chunk_size == 8
+
+    def test_eval_stride_grid_shape(self, device):
+        """With stride>1, the eval grid should contain ceil(T/stride) points."""
+        T = 100
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        for stride in [1, 2, 4, 10]:
+            manager = AdaptiveTimestepManager(
+                sampler_network=net, noise_scheduler=scheduler, device=device,
+                eval_stride=stride,
+            )
+            expected_size = len(range(0, T, stride))
+            assert len(manager._eval_timesteps) == expected_size, (
+                f"stride={stride}: expected {expected_size}, got {len(manager._eval_timesteps)}"
+            )
+            # Verify the grid values are correct (_eval_timesteps is always on CPU)
+            expected = torch.arange(0, T, stride)
+            assert torch.equal(manager._eval_timesteps, expected)
+
+    def test_grid_to_timestep_mapping(self, device):
+        """_grid_to_timestep should map grid indices to real timestep indices."""
+        T = 100
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+
+        # stride=4: grid indices [0, 1, 2, ...] → timestep [0, 4, 8, ...]
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            eval_stride=4,
+        )
+        grid_idx = torch.tensor([0, 1, 5, 24], device=device)
+        real_ts = manager._grid_to_timestep(grid_idx)
+        assert torch.equal(real_ts, torch.tensor([0, 4, 20, 96], device=device))
+
+    def test_grid_to_timestep_clamp(self, device):
+        """_grid_to_timestep should clamp to [min_timestep, max_timestep-1]."""
+        T = 100
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            eval_stride=4, min_timestep=10, max_timestep=80,
+        )
+        # Grid index 0 → timestep 0, but clamped to min_timestep=10
+        result = manager._grid_to_timestep(torch.tensor([0], device=device))
+        assert result.item() == 10
+        # Grid index 25 → timestep 100, but clamped to max_timestep-1=79
+        result = manager._grid_to_timestep(torch.tensor([25], device=device))
+        assert result.item() == 79
+
+    def test_state_dict_round_trip_vram_fields(self, device):
+        """eval_chunk_size, eval_stride, fp32_eval should survive round-trip."""
+        T = 100
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            eval_chunk_size=32, eval_stride=5, fp32_eval=True,
+        )
+
+        state = manager.state_dict()
+        assert state["eval_chunk_size"] == 32
+        assert state["eval_stride"] == 5
+        assert state["fp32_eval"] is True
+
+        new_manager = AdaptiveTimestepManager(
+            sampler_network=TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device),
+            noise_scheduler=scheduler, device=device,
+        )
+        # Defaults before load
+        assert new_manager.eval_chunk_size == 16
+        assert new_manager.eval_stride == 1
+        assert new_manager.fp32_eval is False
+
+        new_manager.load_state_dict(state)
+        assert new_manager.eval_chunk_size == 32
+        assert new_manager.eval_stride == 5
+        assert new_manager.fp32_eval is True
+        # Grid should be recomputed with loaded stride (_eval_timesteps is always on CPU)
+        expected_grid = torch.arange(0, T, 5)
+        assert torch.equal(new_manager._eval_timesteps, expected_grid)
+
+    def test_state_dict_backward_compat_missing_vram_fields(self, device):
+        """Loading a state dict without VRAM fields should preserve defaults."""
+        T = 100
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+        )
+
+        state = manager.state_dict()
+        # Remove VRAM fields to simulate an old checkpoint
+        del state["eval_chunk_size"]
+        del state["eval_stride"]
+        del state["fp32_eval"]
+
+        new_manager = AdaptiveTimestepManager(
+            sampler_network=TimestepSamplerNetwork(in_channels=4, hidden_channels=32, hidden_depth=2).to(device),
+            noise_scheduler=scheduler, device=device,
+        )
+        new_manager.load_state_dict(state)
+        # Defaults should be preserved
+        assert new_manager.eval_chunk_size == 16
+        assert new_manager.eval_stride == 1
+        assert new_manager.fp32_eval is False
+
+
+class TestStridedEvalGrid:
+    """Tests for compute_per_timestep_losses with strided eval grid."""
+
+    def test_stride_1_returns_full_losses(self, device):
+        """With stride=1, compute_per_timestep_losses should return T losses (one per timestep)."""
+        T = 50
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            eval_stride=1, eval_chunk_size=8,
+        )
+
+        x = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+        model_fn = lambda xt, ts, wd: xt  # identity
+        losses = manager.compute_per_timestep_losses(x, noise, model_fn, torch.float32)
+        assert losses.shape == (T,), f"Expected shape ({T},), got {losses.shape}"
+
+    def test_stride_4_returns_quarter_losses(self, device):
+        """With stride=4, compute_per_timestep_losses should return T/4 losses."""
+        T = 100
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            eval_stride=4, eval_chunk_size=8,
+        )
+
+        x = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+        model_fn = lambda xt, ts, wd: xt
+        losses = manager.compute_per_timestep_losses(x, noise, model_fn, torch.float32)
+        assert losses.shape == (25,), f"Expected shape (25,), got {losses.shape}"
+
+    def test_different_chunk_sizes_give_same_result(self, device):
+        """Different eval_chunk_size values should produce identical losses."""
+        T = 50
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+
+        x = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+        # Use a model with fixed weights so results are deterministic
+        model = nn.Conv2d(4, 4, 1, bias=False)
+        nn.init.ones_(model.weight)
+        model = model.to(device)
+
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        results = {}
+        for chunk_size in [5, 10, 25]:
+            net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+            manager = AdaptiveTimestepManager(
+                sampler_network=net, noise_scheduler=scheduler, device=device,
+                eval_chunk_size=chunk_size,
+            )
+            with torch.no_grad():
+                losses = manager.compute_per_timestep_losses(x, noise, model_fn, torch.float32)
+            results[chunk_size] = losses
+
+        # All chunk sizes should give identical results
+        torch.testing.assert_close(results[5], results[10], atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(results[10], results[25], atol=1e-6, rtol=1e-6)
+
+    def test_compute_per_timestep_losses_for_batch_loop(self, device):
+        """compute_per_timestep_losses_for_batch should loop over |S| timesteps
+        and return a scalar matching the original B×|S| computation."""
+        T = 50
+        B = 4
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+        )
+
+        model = nn.Conv2d(4, 4, 1, bias=False)
+        nn.init.ones_(model.weight)
+        model = model.to(device)
+
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        x = torch.randn(B, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+        selected_indices = torch.tensor([10, 30, 45], device=device)
+
+        with torch.no_grad():
+            loss = manager.compute_per_timestep_losses_for_batch(
+                x, noise, model_fn, torch.float32, selected_indices
+            )
+        assert loss.ndim == 0, f"Expected scalar, got shape {loss.shape}"
+        assert loss.item() > 0, "Loss should be positive"
+
+
+class TestBF16SweepAccumulation:
+    """Tests for bf16 sweep accumulation with fp32 scalar reduction."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for bf16")
+    def test_bf16_accumulation_close_to_fp32(self, device):
+        """bf16 accumulation should give results close to fp32 path for same inputs."""
+        T = 20
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+
+        model = nn.Conv2d(4, 4, 1, bias=False)
+        nn.init.ones_(model.weight)
+        model = model.to(device)
+
+        x = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        # fp32 path (escape hatch)
+        net32 = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        mgr_fp32 = AdaptiveTimestepManager(
+            sampler_network=net32, noise_scheduler=scheduler, device=device,
+            fp32_eval=True, eval_chunk_size=10,
+        )
+        with torch.no_grad():
+            losses_fp32 = mgr_fp32.compute_per_timestep_losses(x, noise, model_fn, torch.float32)
+
+        # bf16 path (default)
+        net16 = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        mgr_bf16 = AdaptiveTimestepManager(
+            sampler_network=net16, noise_scheduler=scheduler, device=device,
+            fp32_eval=False, eval_chunk_size=10,
+        )
+        with torch.no_grad():
+            losses_bf16 = mgr_bf16.compute_per_timestep_losses(x, noise, model_fn, torch.float32)
+
+        # Should be close (not exact due to dtype differences)
+        torch.testing.assert_close(losses_bf16, losses_fp32, atol=1e-4, rtol=1e-3)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for bf16")
+    def test_bf16_batch_losses_close_to_fp32(self, device):
+        """bf16 batch loss path should give results close to fp32."""
+        T = 20
+        B = 4
+        scheduler = MagicMock()
+        scheduler.alphas_cumprod = torch.linspace(0.999, 0.001, T, device=device)
+        scheduler.config = MagicMock()
+        scheduler.config.num_train_timesteps = T
+
+        model = nn.Conv2d(4, 4, 1, bias=False)
+        nn.init.ones_(model.weight)
+        model = model.to(device)
+
+        x = torch.randn(B, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+        selected = torch.tensor([5, 15], device=device)
+
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        net32 = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        mgr_fp32 = AdaptiveTimestepManager(
+            sampler_network=net32, noise_scheduler=scheduler, device=device,
+            fp32_eval=True,
+        )
+        with torch.no_grad():
+            loss_fp32 = mgr_fp32.compute_per_timestep_losses_for_batch(
+                x, noise, model_fn, torch.float32, selected
+            )
+
+        net16 = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        mgr_bf16 = AdaptiveTimestepManager(
+            sampler_network=net16, noise_scheduler=scheduler, device=device,
+            fp32_eval=False,
+        )
+        with torch.no_grad():
+            loss_bf16 = mgr_bf16.compute_per_timestep_losses_for_batch(
+                x, noise, model_fn, torch.float32, selected
+            )
+
+        torch.testing.assert_close(loss_bf16, loss_fp32, atol=1e-4, rtol=1e-3)

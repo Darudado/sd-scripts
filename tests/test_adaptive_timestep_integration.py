@@ -787,3 +787,286 @@ class TestMinMaxTimestepIntegration:
         new_manager.load_state_dict(state)
         assert new_manager.min_timestep == 30
         assert new_manager.max_timestep == 70
+
+
+# ---------------------------------------------------------------------------
+# Integration Tests: VRAM Optimizations
+# ---------------------------------------------------------------------------
+
+class TestStridedEvalGridIntegration:
+    """Integration tests for strided eval grid in training loops."""
+
+    def test_ddpm_with_stride(self, device):
+        """DDPM training loop with eval_stride>1 should still update the sampler."""
+        T = 100
+        scheduler = _make_ddpm_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            model_type="ddpm", update_freq=3, queue_size=5, num_selected=2,
+            eval_stride=4, eval_chunk_size=10,
+        )
+
+        model = TinyModel(in_channels=4).to(device)
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        for step in range(7):
+            x = torch.randn(2, 4, 8, 8, device=device)
+            timesteps = manager.sample_timesteps(x, num_timesteps=T)
+            noise = torch.randn_like(x)
+
+            if manager.should_update(step):
+                with torch.no_grad():
+                    losses_before = manager.compute_per_timestep_losses(
+                        x[:1], noise[:1], model_fn, torch.float32
+                    )
+                    losses_after = manager.compute_per_timestep_losses(
+                        x[:1], noise[:1], model_fn, torch.float32
+                    )
+                    delta = (losses_before - losses_after).abs().mean()
+                # update_sampler needs gradients for the sampler network — must be outside no_grad
+                manager.update_sampler(delta, x)
+
+        # Verify the queue received entries with the correct grid size
+        if len(manager.queue) > 0:
+            grid_size = len(manager._eval_timesteps)
+            for entry in manager.queue:
+                assert entry.shape == (grid_size,), f"Queue entry shape {entry.shape} != expected ({grid_size},)"
+
+    def test_flow_matching_with_stride(self, device):
+        """Flow-matching training loop with eval_stride>1 should still update the sampler."""
+        T = 100
+        scheduler = _make_flow_matching_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            model_type="flow_matching", update_freq=3, queue_size=5, num_selected=2,
+            eval_stride=5, eval_chunk_size=10,
+        )
+
+        model = TinyModel(in_channels=4).to(device)
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        for step in range(7):
+            x = torch.randn(2, 4, 8, 8, device=device)
+            timesteps = manager.sample_timesteps(x, num_timesteps=T)
+            noise = torch.randn_like(x)
+
+            if manager.should_update(step):
+                with torch.no_grad():
+                    losses_before = manager.compute_per_timestep_losses(
+                        x[:1], noise[:1], model_fn, torch.float32
+                    )
+                    losses_after = manager.compute_per_timestep_losses(
+                        x[:1], noise[:1], model_fn, torch.float32
+                    )
+                    delta = (losses_before - losses_after).abs().mean()
+                # update_sampler needs gradients for the sampler network — must be outside no_grad
+                manager.update_sampler(delta, x)
+
+        if len(manager.queue) > 0:
+            grid_size = len(manager._eval_timesteps)
+            for entry in manager.queue:
+                assert entry.shape == (grid_size,), f"Queue entry shape {entry.shape} != expected ({grid_size},)"
+
+    def test_stride_1_equivalence(self, device):
+        """With stride=1, the output should match the original (no-stride) behavior."""
+        T = 50
+        scheduler = _make_ddpm_scheduler(device, T=T)
+        model = TinyModel(in_channels=4).to(device)
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        x = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+
+        # stride=1 (default)
+        net1 = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        mgr1 = AdaptiveTimestepManager(
+            sampler_network=net1, noise_scheduler=scheduler, device=device,
+            model_type="ddpm", eval_stride=1, eval_chunk_size=10, fp32_eval=True,
+        )
+
+        # stride=100 (evaluates only timestep 0)
+        # Just verify shapes are correct
+        net2 = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        mgr2 = AdaptiveTimestepManager(
+            sampler_network=net2, noise_scheduler=scheduler, device=device,
+            model_type="ddpm", eval_stride=100, eval_chunk_size=10, fp32_eval=True,
+        )
+
+        with torch.no_grad():
+            losses1 = mgr1.compute_per_timestep_losses(x, noise, model_fn, torch.float32)
+            losses2 = mgr2.compute_per_timestep_losses(x, noise, model_fn, torch.float32)
+
+        assert losses1.shape == (T,), f"Expected ({T},), got {losses1.shape}"
+        assert losses2.shape == (1,), f"Expected (1,), got {losses2.shape}"
+        # The single loss from stride=100 should equal the first loss from stride=1
+        # (relaxed tolerance due to different chunk sizes affecting conv kernel selection)
+        torch.testing.assert_close(losses2[0], losses1[0], atol=1e-4, rtol=1e-4)
+
+
+class TestBatchLossLoopIntegration:
+    """Integration tests for the |S|-loop batch loss path."""
+
+    def test_batch_loss_scalar_output(self, device):
+        """compute_per_timestep_losses_for_batch should return a scalar."""
+        T = 50
+        B = 4
+        scheduler = _make_ddpm_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+        )
+
+        model = TinyModel(in_channels=4).to(device)
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        x = torch.randn(B, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+        selected = torch.tensor([10, 30], device=device)
+
+        with torch.no_grad():
+            loss = manager.compute_per_timestep_losses_for_batch(
+                x, noise, model_fn, torch.float32, selected
+            )
+
+        assert loss.ndim == 0, f"Expected scalar, got shape {loss.shape}"
+
+    def test_flow_matching_batch_loss(self, device):
+        """Batch loss for flow-matching should also return a scalar."""
+        T = 50
+        B = 4
+        scheduler = _make_flow_matching_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            model_type="flow_matching",
+        )
+
+        model = TinyModel(in_channels=4).to(device)
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        x = torch.randn(B, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+        selected = torch.tensor([5, 15, 25], device=device)
+
+        with torch.no_grad():
+            loss = manager.compute_per_timestep_losses_for_batch(
+                x, noise, model_fn, torch.float32, selected
+            )
+
+        assert loss.ndim == 0, f"Expected scalar, got shape {loss.shape}"
+
+
+class TestStashGating:
+    """Tests for the stash gating mechanism."""
+
+    def test_stash_skipped_on_non_update_steps(self, device):
+        """When _adaptive_update_pending is False, stashing should be a no-op."""
+        T = 100
+        scheduler = _make_ddpm_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            update_freq=5, queue_size=5, num_selected=2,
+        )
+
+        x = torch.randn(2, 4, 8, 8, device=device)
+        # Simulate: sample timesteps (always needed)
+        timesteps = manager.sample_timesteps(x, num_timesteps=T)
+
+        # On a non-update step (step 0, 1, 2, 3), _adaptive_update_pending should be False
+        # so the trainer would skip stashing. Verify should_update returns False.
+        for step in [0, 1, 2, 3]:
+            assert not manager.should_update(step), f"step {step} should not be an update step"
+
+        # On step 5, should_update returns True
+        assert manager.should_update(5), "step 5 should be an update step"
+
+    def test_should_update_boundary_values(self, device):
+        """should_update should correctly handle boundary values."""
+        T = 100
+        scheduler = _make_ddpm_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            update_freq=10,
+        )
+
+        # step 0 should NOT trigger (global_step > 0 check)
+        assert not manager.should_update(0)
+        # step 10 should trigger
+        assert manager.should_update(10)
+        # step 5 should not trigger
+        assert not manager.should_update(5)
+        # step 20 should trigger
+        assert manager.should_update(20)
+        # step 9 should not trigger
+        assert not manager.should_update(9)
+
+
+class TestEmptyCacheIntegration:
+    """Tests for empty_cache integration."""
+
+    def test_empty_cache_flag_in_manager(self, device):
+        """The manager itself doesn't have empty_cache — it's a trainer-level concern.
+        But verify the disable flag is accessible from args."""
+        # This test verifies the manager doesn't break when used with the new params
+        T = 50
+        scheduler = _make_ddpm_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            eval_chunk_size=16, eval_stride=1, fp32_eval=False,
+        )
+
+        # Run a quick loss computation to verify no errors
+        x = torch.randn(1, 4, 8, 8, device=device)
+        noise = torch.randn_like(x)
+        model = TinyModel(in_channels=4).to(device)
+        def model_fn(xt, ts, wd):
+            return model(xt.to(wd))
+
+        with torch.no_grad():
+            losses = manager.compute_per_timestep_losses(x, noise, model_fn, torch.float32)
+        assert losses.shape[0] == T
+
+
+class TestStateDictVRAMFields:
+    """Integration tests for state_dict with VRAM optimization fields."""
+
+    def test_full_round_trip_with_stride(self, device):
+        """Full state dict round-trip with eval_stride>1 preserves all fields."""
+        T = 100
+        scheduler = _make_ddpm_scheduler(device, T=T)
+        net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        manager = AdaptiveTimestepManager(
+            sampler_network=net, noise_scheduler=scheduler, device=device,
+            eval_chunk_size=32, eval_stride=5, fp32_eval=True,
+            min_timestep=10, max_timestep=90, reward_baseline_decay=0.95,
+        )
+        manager._reward_baseline = 0.42
+
+        state = manager.state_dict()
+
+        new_net = TimestepSamplerNetwork(in_channels=4, hidden_channels=16, hidden_depth=1).to(device)
+        new_manager = AdaptiveTimestepManager(
+            sampler_network=new_net, noise_scheduler=scheduler, device=device,
+        )
+        new_manager.load_state_dict(state)
+
+        assert new_manager.eval_chunk_size == 32
+        assert new_manager.eval_stride == 5
+        assert new_manager.fp32_eval is True
+        assert new_manager.min_timestep == 10
+        assert new_manager.max_timestep == 90
+        assert new_manager.reward_baseline_decay == 0.95
+        assert new_manager._reward_baseline == 0.42
+        # Grid should be recomputed (_eval_timesteps is always on CPU)
+        expected_grid = torch.arange(0, T, 5)
+        assert torch.equal(new_manager._eval_timesteps, expected_grid)
