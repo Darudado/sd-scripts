@@ -1383,6 +1383,11 @@ class NetworkTrainer:
 
         self.restore_rng_state(rng_states, accelerator)
 
+        # Release CUDA caching-allocator reserved memory from validation forward
+        # passes (multiple timesteps × batches accumulate distinct tensor-size
+        # pools that the allocator never frees on its own).
+        clean_memory_on_device(accelerator.device)
+
         return current_val_loss, average_val_loss, logs
 
 
@@ -3301,6 +3306,11 @@ class NetworkTrainer:
                             accelerator.unwrap_model(t_enc).train()
 
             # end of epoch
+
+            # Release CUDA caching-allocator reserved memory accumulated during
+            # this epoch (distinct bucket-shape pools from random-crop
+            # training, validation, and sample-image generation).
+            clean_memory_on_device(accelerator.device)
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
