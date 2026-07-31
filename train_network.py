@@ -1543,6 +1543,44 @@ class NetworkTrainer:
             for ds in train_dataset_group.datasets:
                 ds.log_caption_dropout = True
 
+        # K-variant sampled augmentation caching: precompute augmented latent/caption variants.
+        # Must be set before the cacheability assertions below (they depend on the variant config).
+        latents_aug_variants = int(getattr(args, "cache_aug_variants", 0) or 0)
+        caption_aug_variants = int(getattr(args, "cache_caption_variants", 0) or 0)
+        if latents_aug_variants > 1 or caption_aug_variants > 1:
+            if hasattr(train_dataset_group, "set_aug_variant_config"):
+                train_dataset_group.set_aug_variant_config(latents_aug_variants, caption_aug_variants)
+            if val_dataset_group is not None and hasattr(val_dataset_group, "set_aug_variant_config"):
+                val_dataset_group.set_aug_variant_config(latents_aug_variants, caption_aug_variants)
+
+            if latents_aug_variants > 1:
+                if not cache_latents:
+                    logger.warning("--cache_aug_variants has no effect without --cache_latents / --cache_latentsがないため--cache_aug_variantsは無効です")
+                else:
+                    logger.info(f"caching up to {latents_aug_variants} latent augmentation variants per image.")
+            if caption_aug_variants > 1:
+                if not getattr(args, "cache_text_encoder_outputs", False):
+                    logger.warning(
+                        "--cache_caption_variants has no effect without --cache_text_encoder_outputs / --cache_text_encoder_outputsがないため--cache_caption_variantsは無効です"
+                    )
+                elif getattr(args, "weighted_captions", False):
+                    logger.warning(
+                        "--cache_caption_variants is ignored with --weighted_captions (captions are tokenized per step) / --weighted_captions使用時は--cache_caption_variantsは無視されます"
+                    )
+                else:
+                    logger.info(f"caching up to {caption_aug_variants} caption variants per image.")
+
+        # Epoch-variant refresh configuration
+        aug_refresh_epochs = int(getattr(args, "cache_aug_refresh_epochs", 0) or 0)
+        if aug_refresh_epochs > 0:
+            if latents_aug_variants <= 1 and caption_aug_variants <= 1:
+                logger.warning("--cache_aug_refresh_epochs requires --cache_aug_variants or --cache_caption_variants > 1; ignoring")
+                aug_refresh_epochs = 0
+            else:
+                if hasattr(train_dataset_group, "set_aug_refresh_epochs"):
+                    train_dataset_group.set_aug_refresh_epochs(aug_refresh_epochs)
+                logger.info(f"augmentation variants will be refreshed every {aug_refresh_epochs} epoch(s) in-memory.")
+
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -1565,11 +1603,11 @@ class NetworkTrainer:
         if cache_latents:
             assert (
                 train_dataset_group.is_latent_cacheable()
-            ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
+            ), "when caching latents, either color_aug or random_crop cannot be used (use --cache_aug_variants to cache augmented variants) / latentをキャッシュするときはcolor_augとrandom_cropは使えません（--cache_aug_variantsでaugmentation済みバリアントをキャッシュ可能です）"
             if val_dataset_group is not None:
                 assert (
                     val_dataset_group.is_latent_cacheable()
-                ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
+                ), "when caching latents, either color_aug or random_crop cannot be used (use --cache_aug_variants to cache augmented variants) / latentをキャッシュするときはcolor_augとrandom_cropは使えません（--cache_aug_variantsでaugmentation済みバリアントをキャッシュ可能です）"
 
         self.assert_extra_args(args, train_dataset_group, val_dataset_group)  # may change some args
 
@@ -1608,6 +1646,14 @@ class NetworkTrainer:
             if val_dataset_group is not None:
                 val_dataset_group.new_cache_latents(vae, accelerator)
 
+            # Initial in-memory variant generation (VAE is still on GPU)
+            if aug_refresh_epochs > 0 and latents_aug_variants > 1:
+                vae_encode_fn = lambda imgs: self.encode_images_to_latents(args, vae, imgs)
+                train_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
+                if val_dataset_group is not None:
+                    val_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
+                logger.info("Initial latent augmentation variants generated in-memory.")
+
             vae.to("cpu")
             clean_memory_on_device(accelerator.device)
 
@@ -1624,6 +1670,22 @@ class NetworkTrainer:
         self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, train_dataset_group, weight_dtype)
         if val_dataset_group is not None:
             self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, val_dataset_group, weight_dtype)
+
+        # Initial in-memory caption TE variant generation.
+        # TE models may have been moved back to CPU by cache_text_encoder_outputs_if_needed
+        # (e.g. Anima's trainer). Save/restore device states so we don't change placement.
+        if aug_refresh_epochs > 0 and caption_aug_variants > 1 and getattr(args, "cache_text_encoder_outputs", False):
+            logger.info("Generating initial caption TE variants in-memory...")
+            te_device_states = [(t_enc, next(t_enc.parameters()).device) for t_enc in text_encoders]
+            for t_enc in text_encoders:
+                t_enc.to(accelerator.device, dtype=weight_dtype)
+            train_dataset_group.refresh_caption_te_variants(
+                text_encoders, tokenize_strategy, text_encoding_strategy, accelerator
+            )
+            for t_enc, orig_device in te_device_states:
+                t_enc.to(orig_device)
+            clean_memory_on_device(accelerator.device)
+            logger.info("Initial caption TE variants generated.")
 
         if unet is None:
             # lazy load unet if needed. text encoders may be freed or replaced with dummy models for saving memory
@@ -2895,6 +2957,38 @@ class NetworkTrainer:
             metadata["ss_epoch"] = str(current_epoch.value)
 
             accelerator.unwrap_model(network).on_epoch_start(text_encoder, unet)  # network.train() is called here
+
+            # Epoch-variant refresh: regenerate augmentation variants in-memory
+            if (aug_refresh_epochs > 0
+                and epoch > epoch_to_start
+                and (epoch - epoch_to_start) % aug_refresh_epochs == 0):
+                # Refresh latent variants (requires VAE on GPU)
+                if latents_aug_variants > 1 and cache_latents:
+                    logger.info(f"Refreshing latent augmentation variants for epoch {current_epoch.value}...")
+                    vae.to(accelerator.device, dtype=vae_dtype)
+                    vae_encode_fn = lambda imgs: self.encode_images_to_latents(args, vae, imgs)
+                    train_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
+                    vae.to("cpu")
+                    clean_memory_on_device(accelerator.device)
+                    logger.info("Latent augmentation variants refreshed.")
+                # Refresh caption TE variants (requires TE models on GPU for encoding)
+                if caption_aug_variants > 1 and getattr(args, "cache_text_encoder_outputs", False):
+                    logger.info(f"Refreshing caption TE variants for epoch {current_epoch.value}...")
+                    # Save TE device states and move to GPU for encoding
+                    te_device_states = [(t_enc, next(t_enc.parameters()).device) for t_enc in text_encoders]
+                    for t_enc in text_encoders:
+                        t_enc.to(accelerator.device, dtype=weight_dtype)
+                    train_dataset_group.refresh_caption_te_variants(
+                        text_encoders, tokenize_strategy, text_encoding_strategy, accelerator
+                    )
+                    # Restore TEs to their original devices (CPU for archs that don't train TEs)
+                    for t_enc, orig_device in te_device_states:
+                        t_enc.to(orig_device)
+                    clean_memory_on_device(accelerator.device)
+                    logger.info("Caption TE variants refreshed.")
+
+                # Synchronize all processes after refresh
+                accelerator.wait_for_everyone()
 
             # TRAINING
             skipped_dataloader = None

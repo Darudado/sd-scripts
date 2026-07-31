@@ -1,6 +1,6 @@
 import glob
 import os
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 from transformers import AutoTokenizer, AutoModel, Gemma2Model, GemmaTokenizerFast
@@ -168,10 +168,12 @@ class LuminaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy)
             + LuminaTextEncoderOutputsCachingStrategy.LUMINA_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
         )
 
-    def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
+    def is_disk_cached_outputs_expected(self, npz_path: str, num_caption_variants: int = 0, caption_aug_hash: Optional[str] = None) -> bool:
         """
         Args:
             npz_path (str): Path to the npz file.
+            num_caption_variants (int): Number of caption variants expected (currently unsupported, ignored).
+            caption_aug_hash (Optional[str]): Expected caption augmentation config hash (currently unsupported, ignored).
 
         Returns:
             bool: True if the npz file is expected to be cached.
@@ -197,7 +199,7 @@ class LuminaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy)
 
         return True
 
-    def load_outputs_npz(self, npz_path: str) -> List[np.ndarray]:
+    def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
         """
         Load outputs from a npz file
 
@@ -205,9 +207,9 @@ class LuminaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy)
             List[np.ndarray]: hidden_state, input_ids, attention_mask
         """
         data = np.load(npz_path)
-        hidden_state = data["hidden_state"]
-        attention_mask = data["attention_mask"]
-        input_ids = data["input_ids"]
+        hidden_state = self._npz_get(data, "hidden_state", variant)
+        attention_mask = self._npz_get(data, "attention_mask", variant)
+        input_ids = self._npz_get(data, "input_ids", variant)
         return [hidden_state, input_ids, attention_mask]
 
     @torch.no_grad()
@@ -309,6 +311,8 @@ class LuminaLatentsCachingStrategy(LatentsCachingStrategy):
         npz_path: str,
         flip_aug: bool,
         alpha_mask: bool,
+        num_aug_variants: int = 0,
+        aug_config_hash: Optional[str] = None,
     ) -> bool:
         """
         Args:
@@ -316,24 +320,29 @@ class LuminaLatentsCachingStrategy(LatentsCachingStrategy):
             npz_path (str): Path to the npz file.
             flip_aug (bool): Whether to flip the image.
             alpha_mask (bool): Whether to apply
+            num_aug_variants (int): Number of augmentation variants expected.
+            aug_config_hash (Optional[str]): Expected augmentation config hash.
         """
         return self._default_is_disk_cached_latents_expected(
-            8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True
+            8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True,
+            num_aug_variants=num_aug_variants, aug_config_hash=aug_config_hash,
         )
 
     def load_latents_from_disk(
-        self, npz_path: str, bucket_reso: Tuple[int, int]
+        self, npz_path: str, bucket_reso: Tuple[int, int], variant: int = 0
     ) -> Tuple[
         Optional[np.ndarray],
         Optional[List[int]],
         Optional[List[int]],
         Optional[np.ndarray],
         Optional[np.ndarray],
+        Optional[bool],
     ]:
         """
         Args:
             npz_path (str): Path to the npz file.
             bucket_reso (Tuple[int, int]): The resolution of the bucket.
+            variant (int): Augmentation variant index (0 = canonical/legacy).
 
         Returns:
             Tuple[
@@ -342,10 +351,11 @@ class LuminaLatentsCachingStrategy(LatentsCachingStrategy):
                 Optional[List[int]],
                 Optional[np.ndarray],
                 Optional[np.ndarray],
-            ]: Tuple of latent tensors, attention_mask, input_ids, latents, latents_unet
+                Optional[bool],
+            ]: Tuple of latent tensors, attention_mask, input_ids, latents, latents_unet, variant flipped flag
         """
         return self._default_load_latents_from_disk(
-            8, npz_path, bucket_reso
+            8, npz_path, bucket_reso, variant=variant
         )  # support multi-resolution
 
     # TODO remove circular dependency for ImageInfo
@@ -357,6 +367,9 @@ class LuminaLatentsCachingStrategy(LatentsCachingStrategy):
         alpha_mask: bool,
         random_crop: bool,
         random_crop_padding_percent: float = 0.05,
+        num_aug_variants: int = 0,
+        augmentor: Optional[Callable] = None,
+        aug_config_hash: Optional[str] = None,
     ):
         encode_by_vae = lambda img_tensor: model.encode(img_tensor).to("cpu")
         vae_device = model.device
@@ -372,6 +385,9 @@ class LuminaLatentsCachingStrategy(LatentsCachingStrategy):
             random_crop,
             multi_resolution=True,
             random_crop_padding_percent=random_crop_padding_percent,
+            num_aug_variants=num_aug_variants,
+            augmentor=augmentor,
+            aug_config_hash=aug_config_hash,
         )
 
         if not train_util.HIGH_VRAM:

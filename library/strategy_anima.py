@@ -2,13 +2,13 @@
 
 import os
 import random
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
 from library import anima_utils, train_util
-from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy
+from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, variant_key
 from library import qwen_image_autoencoder_kl
 
 from library.utils import setup_logging
@@ -168,7 +168,7 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         return os.path.splitext(image_abs_path)[0] + self.ANIMA_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
 
-    def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
+    def is_disk_cached_outputs_expected(self, npz_path: str, num_caption_variants: int = 0, caption_aug_hash: Optional[str] = None) -> bool:
         if not self.cache_to_disk:
             return False
         if not os.path.exists(npz_path):
@@ -188,18 +188,21 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 return False
             if "caption_dropout_rate" not in npz:
                 return False
+            required_keys = {"prompt_embeds", "attn_mask", "t5_input_ids", "t5_attn_mask"}
+            if not self._check_cached_variant_keys(npz, required_keys, num_caption_variants, caption_aug_hash):
+                return False
         except Exception as e:
             logger.error(f"Error loading file: {npz_path}")
             raise e
 
         return True
 
-    def load_outputs_npz(self, npz_path: str) -> List[np.ndarray]:
+    def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
         data = np.load(npz_path)
-        prompt_embeds = data["prompt_embeds"]
-        attn_mask = data["attn_mask"]
-        t5_input_ids = data["t5_input_ids"]
-        t5_attn_mask = data["t5_attn_mask"]
+        prompt_embeds = self._npz_get(data, "prompt_embeds", variant)
+        attn_mask = self._npz_get(data, "attn_mask", variant)
+        t5_input_ids = self._npz_get(data, "t5_input_ids", variant)
+        t5_attn_mask = self._npz_get(data, "t5_attn_mask", variant)
         caption_dropout_rate = data["caption_dropout_rate"]
         return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, caption_dropout_rate]
 
@@ -211,40 +214,64 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         infos: List,
     ):
         anima_text_encoding_strategy: AnimaTextEncodingStrategy = text_encoding_strategy
-        captions = [info.caption for info in infos]
 
-        tokens_and_masks = tokenize_strategy.tokenize(captions)
-        with torch.no_grad():
-            prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = anima_text_encoding_strategy.encode_tokens(
-                tokenize_strategy, models, tokens_and_masks
-            )
+        canonical_captions, variant_groups = self._get_variant_caption_groups(infos)
 
-        # Convert to numpy for caching
-        if prompt_embeds.dtype == torch.bfloat16:
-            prompt_embeds = prompt_embeds.float()
-        prompt_embeds = prompt_embeds.cpu().numpy()
-        attn_mask = attn_mask.cpu().numpy()
-        t5_input_ids = t5_input_ids.cpu().numpy().astype(np.int32)
-        t5_attn_mask = t5_attn_mask.cpu().numpy().astype(np.int32)
+        def encode_captions(captions: List[str]) -> dict:
+            tokens_and_masks = tokenize_strategy.tokenize(captions)
+            with torch.no_grad():
+                prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = anima_text_encoding_strategy.encode_tokens(
+                    tokenize_strategy, models, tokens_and_masks
+                )
+
+            # Convert to numpy for caching
+            if prompt_embeds.dtype == torch.bfloat16:
+                prompt_embeds = prompt_embeds.float()
+            return {
+                "prompt_embeds": prompt_embeds.cpu().numpy(),
+                "attn_mask": attn_mask.cpu().numpy(),
+                "t5_input_ids": t5_input_ids.cpu().numpy().astype(np.int32),
+                "t5_attn_mask": t5_attn_mask.cpu().numpy().astype(np.int32),
+            }
+
+        batched = encode_captions(canonical_captions)
+        variant_batched = [(group, encode_captions([c for _, c in group])) for group in variant_groups]
+
+        base_keys = ["prompt_embeds", "attn_mask", "t5_input_ids", "t5_attn_mask"]
 
         for i, info in enumerate(infos):
-            prompt_embeds_i = prompt_embeds[i]
-            attn_mask_i = attn_mask[i]
-            t5_input_ids_i = t5_input_ids[i]
-            t5_attn_mask_i = t5_attn_mask[i]
-            caption_dropout_rate = torch.tensor(info.caption_dropout_rate, dtype=torch.float32)
+            n_variants = len(info.caption_variants) if getattr(info, "caption_variants", None) else 0
+
+            # when caption variants are cached, dropout is carried inside the variants:
+            # zero the stored rate so the train-time dropout hook becomes inert
+            effective_dropout_rate = info.caption_dropout_rate if n_variants <= 1 else 0.0
+            caption_dropout_rate = torch.tensor(effective_dropout_rate, dtype=torch.float32)
 
             if self.cache_to_disk:
-                np.savez(
-                    info.text_encoder_outputs_npz,
-                    prompt_embeds=prompt_embeds_i,
-                    attn_mask=attn_mask_i,
-                    t5_input_ids=t5_input_ids_i,
-                    t5_attn_mask=t5_attn_mask_i,
-                    caption_dropout_rate=caption_dropout_rate,
-                )
+                save_kwargs = {key: batched[key][i] for key in base_keys}
+                save_kwargs["caption_dropout_rate"] = caption_dropout_rate
+                for k, (group, vb) in enumerate(variant_batched, start=1):
+                    idxs = [idx for idx, _ in group]
+                    if i not in idxs:
+                        continue
+                    j = idxs.index(i)
+                    for key in base_keys:
+                        save_kwargs[variant_key(key, k)] = vb[key][j]
+                if n_variants > 1:
+                    save_kwargs["caption_variants"] = np.array(n_variants)
+                    save_kwargs["caption_aug_hash"] = np.array(getattr(info, "caption_aug_hash", None) or "")
+                np.savez(info.text_encoder_outputs_npz, **save_kwargs)
             else:
-                info.text_encoder_outputs = (prompt_embeds_i, attn_mask_i, t5_input_ids_i, t5_attn_mask_i, caption_dropout_rate)
+                info.text_encoder_outputs = tuple([batched[key][i] for key in base_keys] + [caption_dropout_rate])
+                if n_variants > 1:
+                    variants_outputs = []
+                    for k, (group, vb) in enumerate(variant_batched, start=1):
+                        idxs = [idx for idx, _ in group]
+                        if i not in idxs:
+                            continue
+                        j = idxs.index(i)
+                        variants_outputs.append(tuple([vb[key][j] for key in base_keys] + [caption_dropout_rate]))
+                    info.text_encoder_outputs_variants = variants_outputs
 
 
 class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
@@ -266,15 +293,29 @@ class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
     def get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
         return os.path.splitext(absolute_path)[0] + f"_{image_size[0]:04d}x{image_size[1]:04d}" + self.ANIMA_LATENTS_NPZ_SUFFIX
 
-    def is_disk_cached_latents_expected(self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool):
-        return self._default_is_disk_cached_latents_expected(8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True)
+    def is_disk_cached_latents_expected(
+        self,
+        bucket_reso: Tuple[int, int],
+        npz_path: str,
+        flip_aug: bool,
+        alpha_mask: bool,
+        num_aug_variants: int = 0,
+        aug_config_hash: Optional[str] = None,
+    ):
+        return self._default_is_disk_cached_latents_expected(
+            8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True,
+            num_aug_variants=num_aug_variants, aug_config_hash=aug_config_hash,
+        )
 
     def load_latents_from_disk(
-        self, npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
-        return self._default_load_latents_from_disk(8, npz_path, bucket_reso)
+        self, npz_path: str, bucket_reso: Tuple[int, int], variant: int = 0
+    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray], Optional[bool]]:
+        return self._default_load_latents_from_disk(8, npz_path, bucket_reso, variant=variant)
 
-    def cache_batch_latents(self, vae, image_infos: List, flip_aug: bool, alpha_mask: bool, random_crop: bool, random_crop_padding_percent: float = 0.05):
+    def cache_batch_latents(
+        self, vae, image_infos: List, flip_aug: bool, alpha_mask: bool, random_crop: bool, random_crop_padding_percent: float = 0.05,
+        num_aug_variants: int = 0, augmentor: Optional[Callable] = None, aug_config_hash: Optional[str] = None,
+    ):
         """Cache batch of latents using Qwen Image VAE.
 
         vae is expected to be the Qwen Image VAE (AutoencoderKLQwenImage).
@@ -295,7 +336,9 @@ class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
             return latents.to("cpu")
 
         self._default_cache_batch_latents(
-            encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop, multi_resolution=True, random_crop_padding_percent=random_crop_padding_percent
+            encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop, multi_resolution=True,
+            random_crop_padding_percent=random_crop_padding_percent,
+            num_aug_variants=num_aug_variants, augmentor=augmentor, aug_config_hash=aug_config_hash,
         )
 
         if not train_util.HIGH_VRAM:

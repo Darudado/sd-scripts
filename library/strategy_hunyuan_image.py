@@ -1,5 +1,5 @@
 import os
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 import torch
 import numpy as np
 from transformers import AutoTokenizer, Qwen2TokenizerFast
@@ -93,7 +93,7 @@ class HunyuanImageTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStr
             + HunyuanImageTextEncoderOutputsCachingStrategy.HUNYUAN_IMAGE_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
         )
 
-    def is_disk_cached_outputs_expected(self, npz_path: str):
+    def is_disk_cached_outputs_expected(self, npz_path: str, num_caption_variants: int = 0, caption_aug_hash: Optional[str] = None):
         if not self.cache_to_disk:
             return False
         if not os.path.exists(npz_path):
@@ -119,13 +119,13 @@ class HunyuanImageTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStr
 
         return True
 
-    def load_outputs_npz(self, npz_path: str) -> List[np.ndarray]:
+    def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
         data = np.load(npz_path)
-        vln_embed = data["vlm_embed"]
-        vlm_mask = data["vlm_mask"]
-        byt5_embed = data["byt5_embed"]
-        byt5_mask = data["byt5_mask"]
-        ocr_mask = data["ocr_mask"]
+        vln_embed = self._npz_get(data, "vlm_embed", variant)
+        vlm_mask = self._npz_get(data, "vlm_mask", variant)
+        byt5_embed = self._npz_get(data, "byt5_embed", variant)
+        byt5_mask = self._npz_get(data, "byt5_mask", variant)
+        ocr_mask = self._npz_get(data, "ocr_mask", variant)
         return [vln_embed, vlm_mask, byt5_embed, byt5_mask, ocr_mask]
 
     def cache_batch_outputs(
@@ -188,17 +188,29 @@ class HunyuanImageLatentsCachingStrategy(LatentsCachingStrategy):
             + HunyuanImageLatentsCachingStrategy.HUNYUAN_IMAGE_LATENTS_NPZ_SUFFIX
         )
 
-    def is_disk_cached_latents_expected(self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool):
-        return self._default_is_disk_cached_latents_expected(32, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True)
+    def is_disk_cached_latents_expected(
+        self,
+        bucket_reso: Tuple[int, int],
+        npz_path: str,
+        flip_aug: bool,
+        alpha_mask: bool,
+        num_aug_variants: int = 0,
+        aug_config_hash: Optional[str] = None,
+    ):
+        return self._default_is_disk_cached_latents_expected(
+            32, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True,
+            num_aug_variants=num_aug_variants, aug_config_hash=aug_config_hash,
+        )
 
     def load_latents_from_disk(
-        self, npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
-        return self._default_load_latents_from_disk(32, npz_path, bucket_reso)  # support multi-resolution
+        self, npz_path: str, bucket_reso: Tuple[int, int], variant: int = 0
+    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray], Optional[bool]]:
+        return self._default_load_latents_from_disk(32, npz_path, bucket_reso, variant=variant)  # support multi-resolution
 
     # TODO remove circular dependency for ImageInfo
     def cache_batch_latents(
-        self, vae: hunyuan_image_vae.HunyuanVAE2D, image_infos: List, flip_aug: bool, alpha_mask: bool, random_crop: bool, random_crop_padding_percent: float = 0.05
+        self, vae: hunyuan_image_vae.HunyuanVAE2D, image_infos: List, flip_aug: bool, alpha_mask: bool, random_crop: bool, random_crop_padding_percent: float = 0.05,
+        num_aug_variants: int = 0, augmentor: Optional[Callable] = None, aug_config_hash: Optional[str] = None,
     ):
         # encode_by_vae = lambda img_tensor: vae.encode(img_tensor).sample()
         def encode_by_vae(img_tensor):
@@ -211,7 +223,9 @@ class HunyuanImageLatentsCachingStrategy(LatentsCachingStrategy):
         vae_dtype = vae.dtype
 
         self._default_cache_batch_latents(
-            encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop, multi_resolution=True, random_crop_padding_percent=random_crop_padding_percent
+            encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop, multi_resolution=True,
+            random_crop_padding_percent=random_crop_padding_percent,
+            num_aug_variants=num_aug_variants, augmentor=augmentor, aug_config_hash=aug_config_hash,
         )
 
         if not train_util.HIGH_VRAM:

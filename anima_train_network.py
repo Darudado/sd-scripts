@@ -178,7 +178,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if args.cache_text_encoder_outputs:
             assert train_dataset_group.is_text_encoder_output_cacheable(
                 cache_supports_dropout=True
-            ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
+            ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used (use --cache_caption_variants for all but token_warmup_step)"
 
         if args.ileco:
             assert not args.addift, "--ileco and --addift cannot be enabled at the same time"

@@ -42,7 +42,13 @@ from packaging.version import Version
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from library.device_utils import init_ipex, clean_memory_on_device
-from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
+from library.strategy_base import (
+    LatentsCachingStrategy,
+    TokenizeStrategy,
+    TextEncoderOutputsCachingStrategy,
+    TextEncodingStrategy,
+    compute_aug_config_hash,
+)
 from library.strategy_sdxl import SdxlTokenizeStrategy
 
 init_ipex()
@@ -225,6 +231,10 @@ class ImageInfo:
 
         self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
         self.resize_interpolation: Optional[str] = None
+        self.latents_aug_variants: Optional[List[Dict[str, Any]]] = None  # cached augmentation variants 1..K-1 (in-RAM path)
+        self.caption_variants: Optional[List[str]] = None  # processed caption variants (index 0 = canonical)
+        self.caption_aug_hash: Optional[str] = None  # caption augmentation config hash for cache invalidation
+        self.text_encoder_outputs_variants: Optional[List[Any]] = None  # per-variant TE outputs for k=1..K-1 (in-RAM path)
 
 
 class BucketManager:
@@ -775,6 +785,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.debug_dataset = debug_dataset
         self.log_caption_tag_dropout = False
         self.log_caption_dropout = False
+        self.latents_aug_variant_count = 0  # >1 enables cached augmentation variants for latents
+        self.caption_aug_variant_count = 0  # >1 enables cached caption variants for text encoder outputs
 
         self.subsets: List[Union[DreamBoothSubset, FineTuningSubset]] = []
 
@@ -824,6 +836,17 @@ class BaseDataset(torch.utils.data.Dataset):
         self.tokenize_strategy = None
         self.text_encoder_output_caching_strategy = None
         self.latents_caching_strategy = None
+
+    def set_aug_variant_config(self, latents_aug_variants: int = 0, caption_aug_variants: int = 0):
+        """Configure K-variant sampled augmentation caching.
+
+        Args:
+            latents_aug_variants: number of latent augmentation variants K (0/1 = legacy caching)
+            caption_aug_variants: number of caption augmentation variants K (0/1 = legacy caching)
+        """
+        self.latents_aug_variant_count = int(latents_aug_variants) if latents_aug_variants else 0
+        self.caption_aug_variant_count = int(caption_aug_variants) if caption_aug_variants else 0
+        self.aug_refresh_epochs = 0  # >0 enables per-epoch in-memory variant regeneration
 
     def set_current_strategies(self):
         self.tokenize_strategy = TokenizeStrategy.get_strategy()
@@ -1069,6 +1092,263 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return caption
 
+    def process_caption_canonical(self, subset: BaseSubset, caption: str) -> str:
+        """Deterministic caption processing for the canonical variant (variant 0).
+
+        Applies prefix/suffix, secondary separator and replacements, takes the first line of
+        multiline captions and the first option of wildcards, and skips all stochastic
+        processing (dropout, shuffle, tag dropout, random wildcard/line selection).
+        """
+        if subset.caption_prefix:
+            caption = subset.caption_prefix + " " + caption
+        if subset.caption_suffix:
+            caption = caption + " " + subset.caption_suffix
+
+        # multiline: first line (matches the non-wildcard behavior of process_caption)
+        caption = caption.split("\n")[0]
+
+        # wildcards: deterministic first option, with the same escaping as process_caption
+        replacer1 = "⦅"
+        replacer2 = "⦆"
+        while replacer1 in caption or replacer2 in caption:
+            replacer1 += "⦅"
+            replacer2 += "⦆"
+        caption = caption.replace("{{", replacer1).replace("}}", replacer2)
+        caption = re.sub(r"\{([^}]+)\}", lambda m: m.group(1).split("|")[0], caption)
+        caption = caption.replace(replacer1, "{").replace(replacer2, "}")
+
+        # process secondary separator
+        if subset.secondary_separator:
+            caption = caption.replace(subset.secondary_separator, subset.caption_separator)
+
+        # textual inversion対応 (deterministic: first candidate for list replacements)
+        for str_from, str_to in self.replacements.items():
+            if str_from == "":
+                caption = str_to[0] if type(str_to) == list else str_to
+            else:
+                caption = caption.replace(str_from, str_to)
+
+        return caption
+
+    def get_effective_caption_variant_count(self, subset: BaseSubset) -> int:
+        """Number of caption variants to cache for the subset (0 = legacy caching).
+
+        Variants are only worthwhile when a stochastic caption augmentation is enabled
+        (shuffle, full dropout, tag dropout or wildcards); otherwise the canonical
+        caption is the only possible outcome of process_caption.
+        """
+        if self.caption_aug_variant_count <= 1:
+            return 0
+        if subset.shuffle_caption or subset.caption_dropout_rate > 0 or subset.caption_tag_dropout_rate > 0 or subset.enable_wildcard:
+            return self.caption_aug_variant_count
+        return 0
+
+    def get_caption_aug_config_hash(self, subset: BaseSubset) -> str:
+        """Hash of the subset's caption augmentation config (excludes the variant count itself)."""
+        return compute_aug_config_hash(
+            {
+                "shuffle_caption": subset.shuffle_caption,
+                "keep_tokens": subset.keep_tokens,
+                "keep_tokens_separator": getattr(subset, "keep_tokens_separator", None),
+                "caption_dropout_rate": subset.caption_dropout_rate,
+                "caption_tag_dropout_rate": subset.caption_tag_dropout_rate,
+                "caption_prefix": subset.caption_prefix,
+                "caption_suffix": subset.caption_suffix,
+                "caption_separator": subset.caption_separator,
+                "secondary_separator": subset.secondary_separator,
+                "enable_wildcard": subset.enable_wildcard,
+                "replacements": self.replacements,
+            }
+        )
+
+    def build_caption_variants(self):
+        """Build processed caption variants for every image (info.caption_variants).
+
+        Variant 0 is canonical (deterministic). Variants >= 1 are sampled with
+        process_caption. Epoch/step-dependent triggers (caption_dropout_every_n_epochs,
+        token_warmup_step) are neutralized during sampling because a cache is a static
+        snapshot; token_warmup_step remains incompatible with TE output caching.
+        """
+        for info in self.image_data.values():
+            subset = self.image_to_subset[info.image_key]
+            num_variants = self.get_effective_caption_variant_count(subset)
+            if num_variants <= 1:
+                info.caption_variants = None
+                continue
+
+            variants = [self.process_caption_canonical(subset, info.caption)]
+
+            saved_every_n = subset.caption_dropout_every_n_epochs
+            saved_warmup = subset.token_warmup_step
+            subset.caption_dropout_every_n_epochs = 0
+            subset.token_warmup_step = 0
+            try:
+                for _ in range(num_variants - 1):
+                    variants.append(self.process_caption(subset, info.caption))
+            finally:
+                subset.caption_dropout_every_n_epochs = saved_every_n
+                subset.token_warmup_step = saved_warmup
+
+            info.caption_variants = variants
+
+    def refresh_latent_variants(self, vae_encode_fn, device, dtype):
+        """Regenerate K latent augmentation variants in-memory using VAE.
+
+        Called at epoch boundaries when --cache_aug_refresh_epochs > 0. Moves pixel
+        data through load_image_variants_for_caching + VAE encode to produce fresh
+        augmented latents each epoch. Variant 0 (canonical) is left on disk; only
+        the in-memory ``info.latents_aug_variants`` list is populated.
+
+        Args:
+            vae_encode_fn: callable (img_tensor [B,C,H,W]) -> latents [B,C',H',W']
+            device: torch.device for VAE encoding
+            dtype: torch.dtype for VAE encoding
+        """
+        K = self.latents_aug_variant_count
+        if K <= 1:
+            return
+
+        logger.info(f"Refreshing {K} latent augmentation variants in-memory...")
+        for info in tqdm(self.image_data.values(), desc="Refreshing latent variants"):
+            # Skip validation images — they always use canonical (variant 0)
+            if info.is_val:
+                continue
+            subset = self.image_to_subset[info.image_key]
+            num_variants = self.get_effective_aug_variant_count(subset)
+            if num_variants <= 1:
+                info.latents_aug_variants = None
+                continue
+
+            augmentor = self.aug_helper.get_augmentor(
+                subset.color_aug, subset.gamma_aug, subset.gamma_aug_range, subset.gamma_aug_rate
+            )
+
+            imgs, alphas, orig_sizes, crop_ltrbs, flippeds = load_image_variants_for_caching(
+                [info], num_variants, subset.alpha_mask, subset.flip_aug,
+                augmentor, subset.random_crop, subset.random_crop_padding_percent,
+            )
+
+            aug_variants = []
+            for k in range(1, num_variants):
+                img_tensor = imgs[k].to(device=device, dtype=dtype)
+                with torch.no_grad():
+                    latents_k = vae_encode_fn(img_tensor)
+                latents_k = latents_k[0].cpu()  # [C', H', W']
+                del img_tensor  # free GPU tensor before next variant
+                aug_variants.append({
+                    "latents": latents_k,
+                    "crop_ltrb": crop_ltrbs[k][0],
+                    "flipped": flippeds[k][0],
+                    "alpha_mask": alphas[k][0] if alphas[k][0] is not None else None,
+                })
+
+            info.latents_aug_variants = aug_variants
+
+            # Also refresh canonical if it was stored in RAM (not disk-only)
+            if info.latents is not None:
+                img_tensor = imgs[0].to(device=device, dtype=dtype)
+                with torch.no_grad():
+                    canonical = vae_encode_fn(img_tensor)
+                info.latents = canonical[0].cpu()
+                info.latents_original_size = orig_sizes[0]
+                info.latents_crop_ltrb = crop_ltrbs[0][0]
+                info.alpha_mask = alphas[0][0] if alphas[0][0] is not None else None
+                del img_tensor
+
+    def refresh_caption_te_variants(self, text_encoders, tokenize_strategy, text_encoding_strategy, accelerator):
+        """Regenerate K caption variants and re-encode through text encoders.
+
+        Called at epoch boundaries when --cache_aug_refresh_epochs > 0 and
+        --cache_caption_variants > 1. Re-generates caption strings via
+        build_caption_variants() and re-encodes each variant through the
+        architecture-specific text encoding strategy. Results are stored
+        in-memory on info.text_encoder_outputs and info.text_encoder_outputs_variants.
+
+        Args:
+            text_encoders: list of text encoder models (will be on accelerator.device)
+            tokenize_strategy: active TokenizeStrategy
+            text_encoding_strategy: active TextEncodingStrategy
+            accelerator: Accelerator instance
+        """
+        K = self.caption_aug_variant_count
+        if K <= 1:
+            return
+
+        caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
+        if caching_strategy is None:
+            return
+
+        logger.info(f"Refreshing {K} caption TE variants in-memory...")
+        self.build_caption_variants()
+
+        # Build variant info groups per image (don't encode yet — chunked processing below)
+        variant_groups = []  # list of (real_info, [variant_info_0, ..., variant_info_K-1])
+        for info in self.image_data.values():
+            if info.is_val:
+                continue
+            subset = self.image_to_subset[info.image_key]
+            num_variants = self.get_effective_caption_variant_count(subset)
+            info.caption_aug_hash = self.get_caption_aug_config_hash(subset)
+            if num_variants <= 1:
+                info.text_encoder_outputs_variants = None
+                continue
+
+            vis = []
+            for k in range(num_variants):
+                vi = type(info)(info.image_key, info.num_repeats,
+                    info.caption_variants[k] if info.caption_variants else info.caption,
+                    info.is_reg, info.is_val, info.absolute_path, info.caption_dropout_rate)
+                vi.text_encoder_outputs_npz = None  # prevent disk writes
+                vi.caption_aug_hash = info.caption_aug_hash
+                vis.append(vi)
+            variant_groups.append((info, vis))
+
+        if not variant_groups:
+            logger.info("No caption variants to refresh.")
+            return
+
+        # Process in mini-batches: each mini-batch produces at most batch_size variant infos
+        # to keep memory bounded (avoids encoding K*N captions in one forward pass)
+        batch_size = caching_strategy.batch_size or 8
+        images_per_batch = max(1, batch_size // K)
+        old_cache_to_disk = caching_strategy._cache_to_disk
+        caching_strategy._cache_to_disk = False  # force RAM path only
+
+        try:
+            for chunk_start in tqdm(range(0, len(variant_groups), images_per_batch),
+                                    desc="Refreshing caption TE variants"):
+                chunk = variant_groups[chunk_start : chunk_start + images_per_batch]
+                # Flatten all variant infos for this chunk into one batch
+                chunk_variant_infos = [vi for _, vis in chunk for vi in vis]
+
+                # Encode this chunk's variants
+                caching_strategy.cache_batch_outputs(
+                    tokenize_strategy, text_encoders, text_encoding_strategy, chunk_variant_infos
+                )
+
+                # Extract and store results immediately, then free the temp infos
+                for real_info, vis in chunk:
+                    canonical_outputs = vis[0].text_encoder_outputs
+                    variant_outputs = ([vi.text_encoder_outputs for vi in vis[1:]]
+                                       if len(vis) > 1 else None)
+
+                    if canonical_outputs is not None:
+                        real_info.text_encoder_outputs = canonical_outputs
+                    real_info.text_encoder_outputs_variants = variant_outputs
+
+                    # For Anima: zero the stored dropout_rate when variants are active
+                    if (canonical_outputs is not None and len(canonical_outputs) >= 5
+                            and len(vis) > 1):
+                        real_info.text_encoder_outputs = tuple(
+                            [canonical_outputs[0], canonical_outputs[1], canonical_outputs[2],
+                             canonical_outputs[3], torch.tensor(0.0, dtype=torch.float32)]
+                        )
+
+                # Free temp infos from this chunk
+                del chunk_variant_infos
+        finally:
+            caching_strategy._cache_to_disk = old_cache_to_disk
+
     def get_input_ids(self, caption, tokenizer=None):
         if tokenizer is None:
             tokenizer = self.tokenizers[0]
@@ -1236,17 +1516,48 @@ class BaseDataset(torch.utils.data.Dataset):
         )
 
     def is_latent_cacheable(self):
+        if self.latents_aug_variant_count > 1:
+            return True  # augmentations are pre-computed as cached variants
         return all([not subset.color_aug and not subset.gamma_aug and not subset.random_crop for subset in self.subsets])
 
+    def get_effective_aug_variant_count(self, subset: BaseSubset) -> int:
+        """Number of latent augmentation variants to cache for the subset (0 = legacy caching).
+
+        Variants are only worthwhile when pixel-level augmentations (color/gamma/random crop)
+        are enabled. Flip-only subsets keep the legacy flipped-latents path (2x storage),
+        because flip is already cached exactly by encoding the flipped pixels.
+        """
+        if self.latents_aug_variant_count <= 1:
+            return 0
+        if subset.color_aug or subset.gamma_aug or subset.random_crop:
+            return self.latents_aug_variant_count
+        return 0
+
+    def get_latent_aug_config_hash(self, subset: BaseSubset) -> str:
+        """Hash of the subset's image augmentation config (excludes the variant count itself)."""
+        return compute_aug_config_hash(
+            {
+                "color_aug": subset.color_aug,
+                "gamma_aug": subset.gamma_aug,
+                "gamma_aug_range": subset.gamma_aug_range,
+                "gamma_aug_rate": subset.gamma_aug_rate,
+                "flip_aug": subset.flip_aug,
+                "random_crop": subset.random_crop,
+                "random_crop_padding_percent": subset.random_crop_padding_percent,
+                "alpha_mask": subset.alpha_mask,
+            }
+        )
+
     def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False):
+        variants_enabled = self.caption_aug_variant_count > 1
         return all(
             [
                 not (
                     subset.caption_dropout_rate > 0
-                    and not cache_supports_dropout
-                    or subset.shuffle_caption
-                    or subset.token_warmup_step > 0
-                    or subset.caption_tag_dropout_rate > 0
+                    and not (cache_supports_dropout or variants_enabled)
+                    or (subset.shuffle_caption and not variants_enabled)
+                    or subset.token_warmup_step > 0  # step-dependent: can never be cached
+                    or (subset.caption_tag_dropout_rate > 0 and not variants_enabled)
                 )
                 for subset in self.subsets
             ]
@@ -1266,12 +1577,15 @@ class BaseDataset(torch.utils.data.Dataset):
 
         # split by resolution and some conditions
         class Condition:
-            def __init__(self, reso, flip_aug, alpha_mask, random_crop, random_crop_padding_percent):
+            def __init__(self, reso, flip_aug, alpha_mask, random_crop, random_crop_padding_percent, num_aug_variants=0, augmentor=None, aug_config_hash=None):
                 self.reso = reso
                 self.flip_aug = flip_aug
                 self.alpha_mask = alpha_mask
                 self.random_crop = random_crop
                 self.random_crop_padding_percent = random_crop_padding_percent
+                self.num_aug_variants = num_aug_variants
+                self.augmentor = augmentor
+                self.aug_config_hash = aug_config_hash
 
             def __eq__(self, other):
                 return (
@@ -1281,6 +1595,8 @@ class BaseDataset(torch.utils.data.Dataset):
                     and self.alpha_mask == other.alpha_mask
                     and self.random_crop == other.random_crop
                     and self.random_crop_padding_percent == other.random_crop_padding_percent
+                    and self.num_aug_variants == other.num_aug_variants
+                    and self.aug_config_hash == other.aug_config_hash
                 )
 
         batch: List[ImageInfo] = []
@@ -1295,7 +1611,10 @@ class BaseDataset(torch.utils.data.Dataset):
             for info in batch:
                 if info.image is not None and isinstance(info.image, Future):
                     info.image = info.image.result()  # future to image
-            caching_strategy.cache_batch_latents(model, batch, cond.flip_aug, cond.alpha_mask, cond.random_crop, cond.random_crop_padding_percent)
+            caching_strategy.cache_batch_latents(
+                model, batch, cond.flip_aug, cond.alpha_mask, cond.random_crop, cond.random_crop_padding_percent,
+                num_aug_variants=cond.num_aug_variants, augmentor=cond.augmentor, aug_config_hash=cond.aug_config_hash,
+            )
 
             # remove image from memory
             for info in batch:
@@ -1328,14 +1647,32 @@ class BaseDataset(torch.utils.data.Dataset):
 
                     # print(f"{process_index}/{num_processes} {i}/{len(image_infos)} {info.latents_npz}")
 
+                    # When refresh is enabled, only cache canonical to disk (variants are in-memory)
+                    refresh_mode = self.aug_refresh_epochs > 0
+                    disk_variants = 0 if refresh_mode else self.get_effective_aug_variant_count(subset)
+                    disk_hash = None if refresh_mode else self.get_latent_aug_config_hash(subset)
                     cache_available = caching_strategy.is_disk_cached_latents_expected(
-                        info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
+                        info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask,
+                        num_aug_variants=disk_variants,
+                        aug_config_hash=disk_hash,
                     )
                     if cache_available:  # do not add to batch
                         continue
 
                 # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
-                condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop, subset.random_crop_padding_percent)
+                num_aug_variants = self.get_effective_aug_variant_count(subset)
+                # When refresh is enabled, disk writes use canonical only (variants generated at epoch boundaries)
+                refresh_mode = self.aug_refresh_epochs > 0
+                disk_variants = 0 if refresh_mode else num_aug_variants
+                augmentor = (
+                    self.aug_helper.get_augmentor(subset.color_aug, subset.gamma_aug, subset.gamma_aug_range, subset.gamma_aug_rate)
+                    if num_aug_variants > 1 and not refresh_mode
+                    else None
+                )
+                condition = Condition(
+                    info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop, subset.random_crop_padding_percent,
+                    disk_variants, augmentor, None if refresh_mode else self.get_latent_aug_config_hash(subset),
+                )
                 if len(batch) > 0 and current_condition != condition:
                     submit_batch(batch, current_condition)
                     batch = []
@@ -1448,6 +1785,13 @@ class BaseDataset(torch.utils.data.Dataset):
         batch_size = caching_strategy.batch_size or self.batch_size
 
         logger.info("caching Text Encoder outputs with caching strategy.")
+
+        # When refresh is enabled, skip variant generation at cache time — variants are
+        # generated fresh at epoch boundaries by refresh_caption_te_variants().
+        if self.caption_aug_variant_count > 1 and self.aug_refresh_epochs == 0:
+            logger.info(f"building up to {self.caption_aug_variant_count} caption variants per image for cached Text Encoder outputs.")
+            self.build_caption_variants()
+
         image_infos = list(self.image_data.values())
 
         # split by resolution
@@ -1470,7 +1814,15 @@ class BaseDataset(torch.utils.data.Dataset):
                 if i % num_processes != process_index:
                     continue
 
-                cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
+                subset = self.image_to_subset[info.image_key]
+                info.caption_aug_hash = self.get_caption_aug_config_hash(subset)
+                # When refresh is enabled, only check for canonical TE outputs on disk
+                refresh_mode = self.aug_refresh_epochs > 0
+                cache_available = caching_strategy.is_disk_cached_outputs_expected(
+                    te_out_npz,
+                    num_caption_variants=0 if refresh_mode else self.get_effective_caption_variant_count(subset),
+                    caption_aug_hash=None if refresh_mode else info.caption_aug_hash,
+                )
                 if cache_available:  # do not add to batch
                     continue
 
@@ -1733,30 +2085,82 @@ class BaseDataset(torch.utils.data.Dataset):
             loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
 
             flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
+            is_canonical_only = image_info.is_val or not getattr(self, "is_training_dataset", True)  # validation always uses variant 0
 
             # image/latentsを処理する
             if image_info.latents is not None:  # cache_latents=Trueの場合
-                original_size = image_info.latents_original_size
-                crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
-                if not flipped:
-                    latents = image_info.latents
-                    alpha_mask = image_info.alpha_mask
+                aug_variants = image_info.latents_aug_variants
+                if aug_variants:
+                    # variant caching: sample one variant (validation always uses the canonical variant 0)
+                    k = 0 if is_canonical_only else random.randrange(len(aug_variants) + 1)
+                    if k == 0:
+                        original_size = image_info.latents_original_size
+                        crop_ltrb = image_info.latents_crop_ltrb
+                        latents = image_info.latents
+                        alpha_mask = image_info.alpha_mask
+                        flipped = False
+                    else:
+                        var = aug_variants[k - 1]
+                        original_size = image_info.latents_original_size
+                        crop_ltrb = var["crop_ltrb"]
+                        latents = var["latents"]
+                        alpha_mask = var["alpha_mask"]
+                        flipped = var["flipped"]  # flip is baked into the variant latents
                 else:
-                    latents = image_info.latents_flipped
-                    alpha_mask = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, [1])
+                    original_size = image_info.latents_original_size
+                    crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
+                    if not flipped:
+                        latents = image_info.latents
+                        alpha_mask = image_info.alpha_mask
+                    else:
+                        latents = image_info.latents_flipped
+                        alpha_mask = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, [1])
 
                 image = None
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
-                latents, original_size, crop_ltrb, flipped_latents, alpha_mask = (
-                    self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso)
-                )
-                if flipped:
-                    latents = flipped_latents
-                    alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
-                    del flipped_latents
-                latents = torch.FloatTensor(latents)
-                if alpha_mask is not None:
-                    alpha_mask = torch.FloatTensor(alpha_mask)
+                # Check for in-memory variants first (populated by epoch refresh or RAM-first caching)
+                aug_variants = getattr(image_info, "latents_aug_variants", None)
+                if aug_variants:
+                    # In-memory variant path: sample from RAM variants + disk canonical
+                    k = 0 if is_canonical_only else random.randrange(len(aug_variants) + 1)
+                    if k == 0:
+                        # load canonical from disk
+                        latents, original_size, crop_ltrb, flipped_latents, alpha_mask, variant_flipped = (
+                            self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso, variant=0)
+                        )
+                        if variant_flipped is not None:
+                            flipped = variant_flipped
+                        elif flipped:
+                            latents = flipped_latents
+                            alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()
+                            del flipped_latents
+                        latents = torch.FloatTensor(latents)
+                        if alpha_mask is not None:
+                            alpha_mask = torch.FloatTensor(alpha_mask)
+                    else:
+                        var = aug_variants[k - 1]
+                        original_size = image_info.latents_original_size
+                        crop_ltrb = var["crop_ltrb"]
+                        latents = var["latents"]
+                        alpha_mask = var["alpha_mask"]
+                        flipped = var["flipped"]
+                else:
+                    # sample an augmentation variant from disk npz if variant caching is enabled (validation uses variant 0)
+                    num_variants = self.get_effective_aug_variant_count(subset)
+                    k = 0 if is_canonical_only or num_variants <= 1 else random.randrange(num_variants)
+                    latents, original_size, crop_ltrb, flipped_latents, alpha_mask, variant_flipped = (
+                        self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso, variant=k)
+                    )
+                    if variant_flipped is not None:
+                        # variant cache: flip is baked into the latents; only the flag is needed for conditioning
+                        flipped = variant_flipped
+                    elif flipped:
+                        latents = flipped_latents
+                        alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
+                        del flipped_latents
+                    latents = torch.FloatTensor(latents)
+                    if alpha_mask is not None:
+                        alpha_mask = torch.FloatTensor(alpha_mask)
 
                 image = None
             else:
@@ -1859,16 +2263,46 @@ class BaseDataset(torch.utils.data.Dataset):
             input_ids = None
             masks = None
 
+            # sample a caption variant if cached (validation always uses the canonical variant 0)
+            num_caption_variants = len(image_info.caption_variants) if image_info.caption_variants else 0
+            k_cap = 0 if is_canonical_only or num_caption_variants <= 1 else random.randrange(num_caption_variants)
+            if k_cap > 0:
+                caption = image_info.caption_variants[k_cap]  # for logging/debug; overwritten below if tokenization is required
+
             if image_info.text_encoder_outputs is not None:
                 # cached
-                text_encoder_outputs = image_info.text_encoder_outputs
+                if k_cap > 0 and image_info.text_encoder_outputs_variants and len(image_info.text_encoder_outputs_variants) >= k_cap:
+                    text_encoder_outputs = image_info.text_encoder_outputs_variants[k_cap - 1]
+                else:
+                    text_encoder_outputs = image_info.text_encoder_outputs
             elif image_info.text_encoder_outputs_npz is not None:
                 # on disk
                 text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
-                    image_info.text_encoder_outputs_npz
+                    image_info.text_encoder_outputs_npz, variant=k_cap
                 )
             else:
                 tokenization_required = True
+
+            # Epoch-based caption dropout on cached TE outputs: when current_epoch is a
+            # multiple of caption_dropout_every_n_epochs, replace cached outputs with
+            # zeros (≈ unconditional/empty-caption embedding). This mirrors the per-step
+            # process_caption() logic that sets caption="" when the epoch condition is met,
+            # enabling caption_dropout_every_n_epochs to work with cached TE outputs.
+            if (
+                not is_canonical_only
+                and text_encoder_outputs is not None
+                and getattr(subset, "caption_dropout_every_n_epochs", 0) > 0
+                and self.current_epoch % subset.caption_dropout_every_n_epochs == 0
+            ):
+                caption = ""  # reflect dropout in caption for logging/debug
+                if isinstance(text_encoder_outputs, (list, tuple)):
+                    text_encoder_outputs = [
+                        torch.zeros_like(t) if isinstance(t, torch.Tensor) else np.zeros_like(t) if isinstance(t, np.ndarray) else t
+                        for t in text_encoder_outputs
+                    ]
+                elif isinstance(text_encoder_outputs, torch.Tensor):
+                    text_encoder_outputs = torch.zeros_like(text_encoder_outputs)
+
             text_encoder_outputs_list.append(text_encoder_outputs)
 
             if tokenization_required:
@@ -3083,6 +3517,40 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False) -> bool:
         return all([dataset.is_text_encoder_output_cacheable(cache_supports_dropout) for dataset in self.datasets])
 
+    def set_aug_variant_config(self, latents_aug_variants: int = 0, caption_aug_variants: int = 0):
+        """Configure K-variant sampled augmentation caching on all datasets (incl. delegates)."""
+        for dataset in self.datasets:
+            if hasattr(dataset, "set_aug_variant_config"):
+                dataset.set_aug_variant_config(latents_aug_variants, caption_aug_variants)
+            elif hasattr(dataset, "dreambooth_dataset_delegate"):
+                dataset.dreambooth_dataset_delegate.set_aug_variant_config(latents_aug_variants, caption_aug_variants)
+
+    def set_aug_refresh_epochs(self, refresh_epochs: int):
+        """Set the epoch refresh interval on all datasets."""
+        for dataset in self.datasets:
+            if hasattr(dataset, "aug_refresh_epochs"):
+                dataset.aug_refresh_epochs = refresh_epochs
+            elif hasattr(dataset, "dreambooth_dataset_delegate"):
+                dataset.dreambooth_dataset_delegate.aug_refresh_epochs = refresh_epochs
+
+    def refresh_latent_variants(self, vae_encode_fn, device, dtype):
+        """Regenerate K latent augmentation variants in-memory on all datasets."""
+        for dataset in self.datasets:
+            if hasattr(dataset, "refresh_latent_variants"):
+                dataset.refresh_latent_variants(vae_encode_fn, device, dtype)
+            elif hasattr(dataset, "dreambooth_dataset_delegate"):
+                dataset.dreambooth_dataset_delegate.refresh_latent_variants(vae_encode_fn, device, dtype)
+
+    def refresh_caption_te_variants(self, text_encoders, tokenize_strategy, text_encoding_strategy, accelerator):
+        """Regenerate K caption TE variants in-memory on all datasets."""
+        for dataset in self.datasets:
+            if hasattr(dataset, "refresh_caption_te_variants"):
+                dataset.refresh_caption_te_variants(text_encoders, tokenize_strategy, text_encoding_strategy, accelerator)
+            elif hasattr(dataset, "dreambooth_dataset_delegate"):
+                dataset.dreambooth_dataset_delegate.refresh_caption_te_variants(
+                    text_encoders, tokenize_strategy, text_encoding_strategy, accelerator
+                )
+
     def set_current_strategies(self):
         for dataset in self.datasets:
             dataset.set_current_strategies()
@@ -3458,6 +3926,117 @@ def load_images_and_masks_for_caching(
 
     img_tensor = torch.stack(images, dim=0)
     return img_tensor, alpha_masks, original_sizes, crop_ltrbs
+
+
+# for new_cache_latents with augmentation variants
+def load_image_variants_for_caching(
+    image_infos: List[ImageInfo],
+    num_variants: int,
+    use_alpha_mask: bool,
+    flip_aug: bool,
+    augmentor: Optional[Callable],
+    random_crop: bool,
+    random_crop_padding_percent: float = 0.05,
+) -> Tuple[List[torch.Tensor], List[List[Optional[torch.Tensor]]], List[Tuple[int, int]], List[List[Tuple[int, int, int, int]]], List[List[bool]]]:
+    r"""
+    Load each image once, resize once, then build num_variants augmented variants per image.
+
+    Variant 0 is canonical: center crop, unflipped, no color/gamma augmentation (matching the
+    legacy cache for subsets without augmentation). Variants >= 1 sample a random crop offset
+    (if random_crop), a random flip (if flip_aug) and color/gamma augmentation (if augmentor
+    is not None). All augmentations are applied in pixel space BEFORE VAE encoding, so every
+    cached latent is exact (crop-then-encode, flip-then-encode).
+
+    requires image_infos to have: [absolute_path or image], bucket_reso, resized_size
+
+    returns:
+        images_per_variant: List of torch.Tensor [B, 3, H, W] per variant, normalized to [-1, 1]
+        alpha_masks_per_variant: List per variant of per-image alpha masks (torch.Tensor [H,W] or None)
+        original_sizes: per-image original sizes (shared across variants)
+        crop_ltrbs_per_variant: List per variant of per-image crop_ltrb
+        flippeds_per_variant: List per variant of per-image flip flags
+    """
+    images_per_variant: List[List[torch.Tensor]] = [[] for _ in range(num_variants)]
+    alpha_masks_per_variant: List[List[Optional[torch.Tensor]]] = [[] for _ in range(num_variants)]
+    original_sizes: List[Tuple[int, int]] = []
+    crop_ltrbs_per_variant: List[List[Tuple[int, int, int, int]]] = [[] for _ in range(num_variants)]
+    flippeds_per_variant: List[List[bool]] = [[] for _ in range(num_variants)]
+
+    for info in image_infos:
+        image = load_image(info.absolute_path, use_alpha_mask) if info.image is None else np.array(info.image, np.uint8)
+
+        image_height, image_width = image.shape[0:2]
+        original_size = (image_width, image_height)  # size before resize
+        original_sizes.append(original_size)
+
+        # resize once (with random crop padding); all variants crop from this resized image
+        resized_size = info.resized_size
+        if random_crop:
+            resized_size = (
+                int(resized_size[0] * (1.0 + random_crop_padding_percent)),
+                int(resized_size[1] * (1.0 + random_crop_padding_percent)),
+            )
+        if image_width != resized_size[0] or image_height != resized_size[1]:
+            image = resize_image(image, image_width, image_height, resized_size[0], resized_size[1], info.resize_interpolation)
+        image_height, image_width = image.shape[0:2]
+
+        reso = info.bucket_reso
+        trim_w = max(0, image_width - reso[0])
+        trim_h = max(0, image_height - reso[1])
+
+        for k in range(num_variants):
+            # crop offset: canonical is center; variants sample randomly when random_crop is enabled
+            if k == 0 or not random_crop:
+                crop_left, crop_top = trim_w // 2, trim_h // 2
+            else:
+                crop_left = random.randint(0, trim_w) if trim_w > 0 else 0
+                crop_top = random.randint(0, trim_h) if trim_h > 0 else 0
+
+            img_k = image[crop_top : crop_top + reso[1], crop_left : crop_left + reso[0]]
+
+            # color/gamma augmentation on RGB channels only (mirrors __getitem__ ordering: crop -> aug -> flip)
+            if k > 0 and augmentor is not None:
+                img_rgb = img_k[:, :, :3]
+                img_rgb = augmentor(image=img_rgb)["image"]
+                img_k = np.concatenate([img_rgb, img_k[:, :, 3:]], axis=2) if img_k.shape[2] == 4 else img_rgb
+
+            # flip: pixels are flipped BEFORE encoding, so the cached latents are exact
+            flipped = k > 0 and flip_aug and random.random() < 0.5
+            if flipped:
+                img_k = img_k[:, ::-1, :].copy()  # copy to avoid negative stride problem
+
+            # crop_ltrb in original pixel coordinates. Variant 0 uses get_crop_ltrb for
+            # backward compatibility with legacy caches; variants use the true sampled offsets.
+            if k == 0:
+                crop_ltrb = BucketManager.get_crop_ltrb(reso, original_size)
+            else:
+                scale_w = original_size[0] / image_width
+                scale_h = original_size[1] / image_height
+                crop_ltrb = (
+                    int(round(crop_left * scale_w)),
+                    int(round(crop_top * scale_h)),
+                    int(round((crop_left + reso[0]) * scale_w)),
+                    int(round((crop_top + reso[1]) * scale_h)),
+                )
+
+            if use_alpha_mask:
+                if img_k.shape[2] == 4:
+                    alpha_mask = img_k[:, :, 3]  # [H,W]
+                    alpha_mask = alpha_mask.astype(np.float32) / 255.0  # 0.0~1.0
+                    alpha_mask = torch.FloatTensor(alpha_mask)
+                else:
+                    alpha_mask = torch.ones((img_k.shape[0], img_k.shape[1]), dtype=torch.float32)
+            else:
+                alpha_mask = None
+
+            img_k = img_k[:, :, :3]  # remove alpha channel
+            images_per_variant[k].append(IMAGE_TRANSFORMS(img_k))
+            alpha_masks_per_variant[k].append(alpha_mask)
+            crop_ltrbs_per_variant[k].append(crop_ltrb)
+            flippeds_per_variant[k].append(flipped)
+
+    img_tensors = [torch.stack(images, dim=0) for images in images_per_variant]
+    return img_tensors, alpha_masks_per_variant, original_sizes, crop_ltrbs_per_variant, flippeds_per_variant
 
 
 def cache_batch_latents(
@@ -5170,6 +5749,27 @@ def add_dataset_arguments(
         action="store_true",
         help="skip the content validation of cache (latent and text encoder output). Cache file existence check is always performed, and cache processing is performed if the file does not exist"
         " / cacheの内容の検証をスキップする（latentとテキストエンコーダの出力）。キャッシュファイルの存在確認は常に行われ、ファイルがなければキャッシュ処理が行われる",
+    )
+    parser.add_argument(
+        "--cache_aug_variants",
+        type=int,
+        default=0,
+        help="precompute K augmentation variants per image (random crop, flip, color/gamma) when caching latents, sampled per training step. 0=disabled (legacy). Requires --cache_latents; --cache_latents_to_disk recommended"
+        " / latentキャッシュ時にaugmentation（random crop, flip, color/gamma）をKパターン事前計算してキャッシュし、学習ステップごとに1つを選択する。0=無効（従来通り）。--cache_latentsが必要。--cache_latents_to_disk推奨",
+    )
+    parser.add_argument(
+        "--cache_caption_variants",
+        type=int,
+        default=0,
+        help="precompute K caption variants per image (shuffle, tag dropout, caption dropout, wildcards) when caching text encoder outputs, sampled per training step. 0=disabled (legacy). Requires --cache_text_encoder_outputs; incompatible with --weighted_captions and token_warmup_step"
+        " / text encoder出力キャッシュ時にcaption augmentation（shuffle, tag dropout, caption dropout, wildcard）をKパターン事前計算してキャッシュし、学習ステップごとに1つを選択する。0=無効（従来通り）。--cache_text_encoder_outputsが必要。--weighted_captionsとtoken_warmup_stepとは併用不可",
+    )
+    parser.add_argument(
+        "--cache_aug_refresh_epochs",
+        type=int,
+        default=0,
+        help="re-generate augmentation variants in-memory every N epochs (0=disabled). When enabled, variants are NOT written to disk — only canonical (variant 0) is disk-cached. Requires --cache_aug_variants or --cache_caption_variants. VAE/TE models are moved to GPU at each refresh boundary"
+        " / augmentation variantをNエポックごとにメモリ上で再生成する（0=無効）。有効時、variantはディスクに書き込まれず、canonical（variant 0）のみキャッシュされる。--cache_aug_variantsまたは--cache_caption_variantsが必要。各リフレッシュ時にVAE/TEモデルがGPUに移動される",
     )
     parser.add_argument(
         "--enable_bucket",
