@@ -347,6 +347,11 @@ class NetworkTrainer:
         return noise_pred
 
     def all_reduce_network(self, accelerator, network):
+        # With a single process there is nothing to synchronize; iterating every
+        # parameter here would only add per-step Python overhead (DDP handles
+        # the multi-GPU case natively via accelerator.accumulate).
+        if accelerator.num_processes <= 1:
+            return
         for param in network.parameters():
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
@@ -355,9 +360,20 @@ class NetworkTrainer:
         """Manually synchronize EDM2 model gradients across GPUs."""
         if edm2_model is None:
             return
+        if accelerator.num_processes <= 1:
+            return
         for param in edm2_model.parameters():
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
+
+    def should_sync_ramtorch(self, args, accelerator) -> bool:
+        """Whether a full CUDA synchronize is required after backward for RamTorch.
+
+        RamTorch offloads linear weights to CPU; a synchronize is only needed at
+        gradient-synchronization boundaries (end of gradient accumulation), not
+        after every micro-batch, to avoid serializing CPU/GPU per micro-step.
+        """
+        return (args.use_ramtorch or args.use_ramtorch_network) and accelerator.sync_gradients
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizers[0], text_encoder, unet)
@@ -3078,8 +3094,8 @@ class NetworkTrainer:
 
                     accelerator.backward(loss)
 
-                    if args.use_ramtorch or args.use_ramtorch_network:
-                        torch.cuda.synchronize() 
+                    if self.should_sync_ramtorch(args, accelerator):
+                        torch.cuda.synchronize()
 
                     edm2_loss = loss
                     loss = pre_scaling_loss

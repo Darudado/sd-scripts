@@ -47,6 +47,24 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self.ileco_text_encoder_conds = None
         self.ileco_prompt_pairs = None
         self.addift_pair_settings = None
+        # Cache of zero padding masks keyed by (batch, height, width, dtype, device).
+        # The Anima DiT consumes padding_mask read-only (resize/expand/concat, never
+        # mutated in place), so a single reusable buffer per key avoids a fresh CUDA
+        # allocation on every forward pass.
+        self._padding_mask_cache = {}
+
+    def get_padding_mask(self, batch_size: int, height: int, width: int, dtype: torch.dtype, device) -> torch.Tensor:
+        """Return a cached zero padding mask for the given shape/dtype/device.
+
+        Creates and caches the buffer on first use; subsequent calls with the same
+        key return the identical tensor, eliminating per-forward allocation churn.
+        """
+        key = (batch_size, height, width, dtype, str(device))
+        mask = self._padding_mask_cache.get(key)
+        if mask is None:
+            mask = torch.zeros(batch_size, 1, height, width, dtype=dtype, device=device)
+            self._padding_mask_cache[key] = mask
+        return mask
 
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
@@ -126,7 +144,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             # Create padding mask matching the latent spatial dimensions
             h_latent = noisy_latents.shape[-2]
             w_latent = noisy_latents.shape[-1]
-            padding_mask = torch.zeros(N, 1, h_latent, w_latent, dtype=wdtype, device=noisy_latents.device)
+            padding_mask = self.get_padding_mask(N, h_latent, w_latent, wdtype, noisy_latents.device)
 
             # Autocast is required: the training forward pass runs under
             # accelerator.autocast(), which casts the float32 timestep embedding to
@@ -771,7 +789,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         bs = latents.shape[0]
         h_latent = latents.shape[-2]
         w_latent = latents.shape[-1]
-        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        padding_mask = self.get_padding_mask(bs, h_latent, w_latent, weight_dtype, accelerator.device)
         noisy_model_input = noisy_model_input.unsqueeze(2)
 
         pair_index = torch.randint(len(self.ileco_text_encoder_conds), (1,)).item()
@@ -920,7 +938,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         bs = latents.shape[0]
         h_latent = latents.shape[-2]
         w_latent = latents.shape[-1]
-        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        padding_mask = self.get_padding_mask(bs, h_latent, w_latent, weight_dtype, accelerator.device)
         noisy_model_input = noisy_model_input.unsqueeze(2)
         target_noisy_model_input = target_noisy_model_input.unsqueeze(2)
 
@@ -1121,7 +1139,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         bs = latents.shape[0]
         h_latent = latents.shape[-2]
         w_latent = latents.shape[-1]
-        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        padding_mask = self.get_padding_mask(bs, h_latent, w_latent, weight_dtype, accelerator.device)
 
         # Call model
         noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, [B, C, H, W] -> [B, C, 1, H, W]
