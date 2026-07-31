@@ -3,6 +3,7 @@
 NPZ supports compression transparently through NumPy, but it does not have a
 native bfloat16 dtype on all supported NumPy versions.  BF16 cache entries are
 therefore stored as their uint16 bit representation with per-entry metadata.
+
 """
 
 import json
