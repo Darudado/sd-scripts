@@ -764,6 +764,23 @@ class TestEpochRefresh:
         ds.aug_refresh_epochs = 3
         assert ds.aug_refresh_epochs == 3
 
+    def test_aug_refresh_epochs_initialized_without_set_aug_variant_config(self):
+        """Regression: DreamBoothDataset must expose aug_refresh_epochs even when
+        set_aug_variant_config is never called.
+
+        Previously aug_refresh_epochs was only created inside set_aug_variant_config(),
+        which is only invoked when --cache_aug_variants/--cache_caption_variants > 1.
+        Plain --cache_latents therefore crashed in new_cache_latents() with
+        AttributeError: 'DreamBoothDataset' object has no attribute 'aug_refresh_epochs'.
+        """
+        from library.train_util import MinimalDataset
+
+        ds = MinimalDataset(resolution=(512, 512), network_multiplier=1.0)
+        assert hasattr(ds, "aug_refresh_epochs"), "aug_refresh_epochs must be initialized by BaseDataset.__init__"
+        assert ds.aug_refresh_epochs == 0
+        # The exact read that previously crashed in new_cache_latents / new_cache_text_encoder_outputs
+        assert (ds.aug_refresh_epochs > 0) is False
+
 
 # ============================================================================
 # 6. TE output npz schema round-trip (SDXL)

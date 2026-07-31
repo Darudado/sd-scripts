@@ -788,6 +788,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.log_caption_dropout = False
         self.latents_aug_variant_count = 0  # >1 enables cached augmentation variants for latents
         self.caption_aug_variant_count = 0  # >1 enables cached caption variants for text encoder outputs
+        self.aug_refresh_epochs = 0  # >0 enables per-epoch in-memory variant regeneration
 
         self.subsets: List[Union[DreamBoothSubset, FineTuningSubset]] = []
 
