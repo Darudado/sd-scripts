@@ -200,12 +200,19 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return True
 
     def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
-        data = load_npz(npz_path)
+        data, dtypes = load_npz(npz_path, return_dtypes=True)
         prompt_embeds = self._npz_get(data, "prompt_embeds", variant)
         attn_mask = self._npz_get(data, "attn_mask", variant)
         t5_input_ids = self._npz_get(data, "t5_input_ids", variant)
         t5_attn_mask = self._npz_get(data, "t5_attn_mask", variant)
         caption_dropout_rate = data["caption_dropout_rate"]
+        # BF16 entries are stored as their uint16 bit layout on disk and decoded
+        # to widened fp32 by load_npz (numpy has no native BF16). Reconstruct the
+        # compact bf16 tensor here so the batch stays bf16 in RAM/queue until the
+        # weight_dtype cast at the model boundary. Legacy fp32/fp16 caches (no
+        # bf16 metadata) keep the historical numpy behavior.
+        if dtypes.get("prompt_embeds") == "bf16":
+            prompt_embeds = torch.from_numpy(np.ascontiguousarray(prompt_embeds)).to(dtype=torch.bfloat16)
         return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, caption_dropout_rate]
 
     def cache_batch_outputs(
@@ -226,11 +233,19 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                     tokenize_strategy, models, tokens_and_masks
                 )
 
-            # Convert to numpy for caching
+            # Preserve the TE's native precision (bf16/fp16) end-to-end instead of
+            # widening to fp32. Widening doubled the disk/RAM/queue footprint and
+            # required a re-cast to weight_dtype at the model boundary anyway.
+            # bf16 has no numpy dtype, so keep it as a CPU tensor; save_npz
+            # encodes it to its uint16 bit layout and load_outputs_npz()
+            # reconstructs bf16. fp16/fp32 are stored as numpy arrays as before.
+            prompt_embeds = prompt_embeds.detach().to("cpu")
             if prompt_embeds.dtype == torch.bfloat16:
-                prompt_embeds = prompt_embeds.float()
+                prompt_embeds_cached = prompt_embeds
+            else:
+                prompt_embeds_cached = prompt_embeds.numpy()
             return {
-                "prompt_embeds": prompt_embeds.cpu().numpy(),
+                "prompt_embeds": prompt_embeds_cached,
                 "attn_mask": attn_mask.cpu().numpy(),
                 "t5_input_ids": t5_input_ids.cpu().numpy().astype(np.int32),
                 "t5_attn_mask": t5_attn_mask.cpu().numpy().astype(np.int32),

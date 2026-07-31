@@ -768,6 +768,29 @@ class ControlNetSubset(BaseSubset):
         return self.image_dir == other.image_dir and self.conditioning_data_dir == other.conditioning_data_dir
 
 
+def convert_te_output_for_batch(x):
+    """Convert one cached text-encoder output to a torch tensor for batch stacking.
+
+    Preserves compact bf16 caches (e.g. Anima) end-to-end instead of widening to
+    fp32; all other inputs keep the historical ``torch.FloatTensor`` behavior.
+    """
+    if isinstance(x, torch.Tensor) and x.dtype == torch.bfloat16:
+        return x
+    return torch.FloatTensor(x)
+
+
+def target_size_from_latents(latents, vae_scale_factor: int = 8):
+    """Pixel-space target size ``(W, H)`` for a cached latent tensor.
+
+    Latents are channels-first with spatial dims trailing: ``[B, C, H, W]``
+    (4D) or ``[B, C, 1, H, W]`` (5D, e.g. Anima). The last two dims are always
+    ``(H, W)`` in both layouts — the same invariant the cache-key resolution
+    relies on (see ``LatentsCachingStrategy``). Returns width-first ``(W, H)``
+    to match the image-path convention in ``BaseDataset.__getitem__``.
+    """
+    return (latents.shape[-1] * vae_scale_factor, latents.shape[-2] * vae_scale_factor)
+
+
 class BaseDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -2242,7 +2265,7 @@ class BaseDataset(torch.utils.data.Dataset):
             latents_list.append(latents)
             alpha_mask_list.append(alpha_mask)
 
-            target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
+            target_size = (image.shape[2], image.shape[1]) if image is not None else target_size_from_latents(latents)
 
             if not flipped:
                 crop_left_top = (crop_ltrb[0], crop_ltrb[1])
@@ -2385,7 +2408,7 @@ class BaseDataset(torch.utils.data.Dataset):
         example = {}
         example["custom_attributes"] = custom_attributes  # may be list of empty dict
         example["loss_weights"] = torch.FloatTensor(loss_weights)
-        example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
+        example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, convert_te_output_for_batch)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
         example["attn_mask_list"] = none_or_stack_elements(attn_mask_list, lambda x: x)
 
@@ -2400,7 +2423,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         alpha_mask_list[i] = torch.ones((images[i].shape[1], images[i].shape[2]), dtype=torch.float32)
                     else:
                         alpha_mask_list[i] = torch.ones(
-                            (latents_list[i].shape[1] * 8, latents_list[i].shape[2] * 8), dtype=torch.float32
+                            (latents_list[i].shape[-2] * 8, latents_list[i].shape[-1] * 8), dtype=torch.float32
                         )
             example["alpha_masks"] = torch.stack(alpha_mask_list)
         else:

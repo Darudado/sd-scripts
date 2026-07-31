@@ -109,15 +109,27 @@ def _decode_bf16(array: np.ndarray) -> np.ndarray:
     return torch.from_numpy(raw_bits).view(dtype=torch.bfloat16).float().numpy()
 
 
-def load_npz(path: str) -> Dict[str, np.ndarray]:
-    """Load compressed or uncompressed NPZ and decode cache BF16 entries."""
+def load_npz(path: str, return_dtypes: bool = False) -> Dict[str, np.ndarray]:
+    """Load compressed or uncompressed NPZ and decode cache BF16 entries.
+
+    Args:
+        path: Path to the npz file.
+        return_dtypes: If True, also return the per-key stored dtype metadata
+            as a second dict. This lets callers reconstruct compact BF16
+            tensors: NumPy has no native BF16, so decoded BF16 entries are
+            returned as widened fp32 arrays, and the metadata is the only way
+            to know they originated as BF16.
+
+    Returns:
+        ``(data, dtypes)`` when ``return_dtypes`` is True, otherwise ``data``.
+    """
     with np.load(path, allow_pickle=False) as archive:
         data = {key: archive[key] for key in archive.files if key != CACHE_DTYPE_METADATA_KEY}
         if CACHE_DTYPE_METADATA_KEY not in archive:
-            return data
+            return (data, {}) if return_dtypes else data
         metadata = json.loads(str(archive[CACHE_DTYPE_METADATA_KEY].tolist()))
 
     for key, dtype in metadata.items():
         if key in data and dtype == "bf16":
             data[key] = _decode_bf16(data[key])
-    return data
+    return (data, metadata) if return_dtypes else data
