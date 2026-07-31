@@ -2801,7 +2801,11 @@ class NetworkTrainer:
             loss_scaled_recorder = train_util.EMARecorder()
             loss_edm2_recorder = train_util.EMARecorder()
 
-        del train_dataset_group
+        # NOTE: train_dataset_group is intentionally NOT deleted here.
+        # The DataLoader holds a reference regardless (so `del` never freed
+        # the object), and the epoch-variant refresh path
+        # (cache_aug_refresh_epochs) needs the name to call
+        # refresh_latent_variants / refresh_caption_te_variants.
         if val_dataset_group is not None:
             del val_dataset_group
 
@@ -2837,7 +2841,14 @@ class NetworkTrainer:
 
         # if text_encoder is not needed for training, delete it to save memory.
         # TODO this can be automated after SDXL sample prompt cache is implemented
-        if self.is_text_encoder_not_needed_for_training(args):
+        # Keep TE models alive when caption-variant epoch refresh is active,
+        # because refresh_caption_te_variants() needs them on GPU each epoch.
+        _need_te_for_refresh = (
+            aug_refresh_epochs > 0
+            and caption_aug_variants > 1
+            and getattr(args, "cache_text_encoder_outputs", False)
+        )
+        if self.is_text_encoder_not_needed_for_training(args) and not _need_te_for_refresh:
             logger.info("text_encoder is not needed for training. deleting to save memory.")
             for t_enc in text_encoders:
                 del t_enc
