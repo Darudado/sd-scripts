@@ -5,6 +5,7 @@ import numpy as np
 from transformers import AutoTokenizer, Qwen2TokenizerFast
 
 from library import hunyuan_image_text_encoder, hunyuan_image_vae, train_util
+from library.cache_utils import load_npz, save_npz
 from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy
 
 from library.utils import setup_logging
@@ -83,9 +84,9 @@ class HunyuanImageTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStr
     HUNYUAN_IMAGE_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX = "_hi_te.npz"
 
     def __init__(
-        self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool, is_partial: bool = False
+        self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool, is_partial: bool = False, cache_dtype: str = "auto"
     ) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial)
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, cache_dtype=cache_dtype)
 
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         return (
@@ -102,7 +103,7 @@ class HunyuanImageTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStr
             return True
 
         try:
-            npz = np.load(npz_path)
+            npz = load_npz(npz_path)
             if "vlm_embed" not in npz:
                 return False
             if "vlm_mask" not in npz:
@@ -120,7 +121,7 @@ class HunyuanImageTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStr
         return True
 
     def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
-        data = np.load(npz_path)
+        data = load_npz(npz_path)
         vln_embed = self._npz_get(data, "vlm_embed", variant)
         vlm_mask = self._npz_get(data, "vlm_mask", variant)
         byt5_embed = self._npz_get(data, "byt5_embed", variant)
@@ -159,13 +160,16 @@ class HunyuanImageTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStr
             ocr_mask_i = ocr_mask[i]
 
             if self.cache_to_disk:
-                np.savez(
+                save_npz(
                     info.text_encoder_outputs_npz,
-                    vlm_embed=vlm_embed_i,
-                    vlm_mask=vlm_mask_i,
-                    byt5_embed=byt5_embed_i,
-                    byt5_mask=byt5_mask_i,
-                    ocr_mask=ocr_mask_i,
+                    {
+                        "vlm_embed": vlm_embed_i,
+                        "vlm_mask": vlm_mask_i,
+                        "byt5_embed": byt5_embed_i,
+                        "byt5_mask": byt5_mask_i,
+                        "ocr_mask": ocr_mask_i,
+                    },
+                    cache_dtype=self.cache_dtype,
                 )
             else:
                 info.text_encoder_outputs = (vlm_embed_i, vlm_mask_i, byt5_embed_i, byt5_mask_i, ocr_mask_i)
@@ -174,8 +178,8 @@ class HunyuanImageTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStr
 class HunyuanImageLatentsCachingStrategy(LatentsCachingStrategy):
     HUNYUAN_IMAGE_LATENTS_NPZ_SUFFIX = "_hi.npz"
 
-    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check)
+    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool, cache_dtype: str = "auto") -> None:
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, cache_dtype=cache_dtype)
 
     @property
     def cache_suffix(self) -> str:

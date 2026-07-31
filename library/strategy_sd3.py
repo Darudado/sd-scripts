@@ -8,6 +8,7 @@ from transformers import CLIPTokenizer, T5TokenizerFast, CLIPTextModel, CLIPText
 
 from library import sd3_utils, train_util
 from library import sd3_models
+from library.cache_utils import load_npz, save_npz
 from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, variant_key
 
 from library.utils import setup_logging
@@ -264,8 +265,9 @@ class Sd3TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         is_partial: bool = False,
         apply_lg_attn_mask: bool = False,
         apply_t5_attn_mask: bool = False,
+        cache_dtype: str = "auto",
     ) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial)
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, cache_dtype=cache_dtype)
         self.apply_lg_attn_mask = apply_lg_attn_mask
         self.apply_t5_attn_mask = apply_t5_attn_mask
 
@@ -281,7 +283,7 @@ class Sd3TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             return True
 
         try:
-            npz = np.load(npz_path)
+            npz = load_npz(npz_path)
             if "lg_out" not in npz:
                 return False
             if "lg_pooled" not in npz:
@@ -312,7 +314,7 @@ class Sd3TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return True
 
     def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
-        data = np.load(npz_path)
+        data = load_npz(npz_path)
         lg_out = self._npz_get(data, "lg_out", variant)
         lg_pooled = self._npz_get(data, "lg_pooled", variant)
         t5_out = self._npz_get(data, "t5_out", variant)
@@ -382,7 +384,7 @@ class Sd3TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 if n_variants > 1:
                     save_kwargs["caption_variants"] = np.array(n_variants)
                     save_kwargs["caption_aug_hash"] = np.array(getattr(info, "caption_aug_hash", None) or "")
-                np.savez(info.text_encoder_outputs_npz, **save_kwargs)
+                save_npz(info.text_encoder_outputs_npz, save_kwargs, cache_dtype=self.cache_dtype)
             else:
                 # it's fine that attn mask is not None. it's overwritten before calling the model if necessary
                 info.text_encoder_outputs = tuple(batched[key][i] for key in base_keys)
@@ -400,8 +402,8 @@ class Sd3TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
 class Sd3LatentsCachingStrategy(LatentsCachingStrategy):
     SD3_LATENTS_NPZ_SUFFIX = "_sd3.npz"
 
-    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check)
+    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool, cache_dtype: str = "auto") -> None:
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, cache_dtype=cache_dtype)
 
     @property
     def cache_suffix(self) -> str:

@@ -104,7 +104,10 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         return [tokenize_strategy.tokenizer]
 
     def get_latents_caching_strategy(self, args):
-        return strategy_lumina.LuminaLatentsCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, False)
+        return strategy_lumina.LuminaLatentsCachingStrategy(
+            args.cache_latents_to_disk, args.vae_batch_size, False,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
+        )
 
     def get_text_encoding_strategy(self, args):
         return strategy_lumina.LuminaTextEncodingStrategy()
@@ -120,6 +123,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 args.text_encoder_batch_size,
                 args.skip_cache_check,
                 is_partial=self.train_gemma2,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         else:
             return None

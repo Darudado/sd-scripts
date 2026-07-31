@@ -4,6 +4,7 @@ from typing import Any, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
+from library.cache_utils import load_npz, save_npz
 from library.strategy_base import TokenizeStrategy, TextEncodingStrategy, TextEncoderOutputsCachingStrategy, variant_key
 
 
@@ -331,8 +332,9 @@ class SdxlTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         is_partial: bool = False,
         is_weighted: bool = False,
         use_attention_mask: bool = True,
+        cache_dtype: str = "auto",
     ) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, is_weighted)
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, is_weighted, cache_dtype)
         self.use_attention_mask = use_attention_mask
 
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
@@ -347,11 +349,11 @@ class SdxlTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             return True
 
         try:
-            npz = np.load(npz_path)
+            npz = load_npz(npz_path)
             required_keys = {"hidden_state1", "hidden_state2", "pool2"}
             if self.use_attention_mask:
                 required_keys.update({"attention_mask1", "attention_mask2"})
-            if not required_keys.issubset(npz.files):
+            if not required_keys.issubset(npz.keys()):
                 return False
             if not self._check_cached_variant_keys(npz, required_keys, num_caption_variants, caption_aug_hash):
                 return False
@@ -362,7 +364,7 @@ class SdxlTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return True
 
     def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
-        data = np.load(npz_path)
+        data = load_npz(npz_path)
         hidden_state1 = self._npz_get(data, "hidden_state1", variant)
         hidden_state2 = self._npz_get(data, "hidden_state2", variant)
         pool2 = self._npz_get(data, "pool2", variant)
@@ -442,7 +444,7 @@ class SdxlTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 if n_variants > 1:
                     save_kwargs["caption_variants"] = np.array(n_variants)
                     save_kwargs["caption_aug_hash"] = np.array(getattr(info, "caption_aug_hash", None) or "")
-                np.savez(info.text_encoder_outputs_npz, **save_kwargs)
+                save_npz(info.text_encoder_outputs_npz, save_kwargs, cache_dtype=self.cache_dtype)
             else:
                 info.text_encoder_outputs = [batched[key][i] for key in base_keys]
                 if n_variants > 1:

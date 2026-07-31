@@ -431,7 +431,10 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         return [tokenize_strategy.vlm_tokenizer, tokenize_strategy.byt5_tokenizer]
 
     def get_latents_caching_strategy(self, args):
-        return strategy_hunyuan_image.HunyuanImageLatentsCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, False)
+        return strategy_hunyuan_image.HunyuanImageLatentsCachingStrategy(
+            args.cache_latents_to_disk, args.vae_batch_size, False,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
+        )
 
     def get_text_encoding_strategy(self, args):
         return strategy_hunyuan_image.HunyuanImageTextEncodingStrategy()
@@ -452,7 +455,8 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
             return strategy_hunyuan_image.HunyuanImageTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False
+                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         else:
             return None

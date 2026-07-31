@@ -342,7 +342,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return [tokenize_strategy.qwen3_tokenizer]
 
     def get_latents_caching_strategy(self, args):
-        return strategy_anima.AnimaLatentsCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check)
+        return strategy_anima.AnimaLatentsCachingStrategy(
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
+        )
 
     def get_text_encoding_strategy(self, args):
         return strategy_anima.AnimaTextEncodingStrategy()
@@ -358,7 +361,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
             return strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False
+                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         return None
 
@@ -545,7 +549,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                         continue
                     if os.path.exists(cache_path):
                         try:
-                            data = np.load(cache_path)
+                            data = train_util.load_npz(cache_path)
                             if "latents" in data and "latents_flipped" in data:
                                 continue
                         except Exception:
@@ -573,10 +577,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                         flipped_latents = self.encode_images_to_latents(args, vae, flipped_image_tensor).to("cpu")
 
                     for info, latent, flipped_latent in zip(batch_infos, latents, flipped_latents):
-                        np.savez(
+                        train_util.save_npz(
                             info.addift_conditioning_latents_npz,
-                            latents=latent.float().numpy(),
-                            latents_flipped=flipped_latent.float().numpy(),
+                            {"latents": latent, "latents_flipped": flipped_latent},
+                            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
                         )
         finally:
             if accelerator.is_main_process:

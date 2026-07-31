@@ -87,7 +87,8 @@ def train(args):
     # prepare caching strategy: must be set before preparing dataset
     if args.cache_latents:
         latents_caching_strategy = strategy_anima.AnimaLatentsCachingStrategy(
-            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
         )
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
@@ -157,7 +158,8 @@ def train(args):
         if args.cache_text_encoder_outputs:
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(
                 strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
-                    args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, False, False
+                    args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, False, False,
+                    cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
                 )
             )
         train_dataset_group.set_current_strategies()
@@ -210,7 +212,8 @@ def train(args):
         qwen3_text_encoder.eval()
 
         text_encoder_caching_strategy = strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
-            args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, is_partial=False
+            args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check,
+            is_partial=False, cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto")
         )
         strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_caching_strategy)
 

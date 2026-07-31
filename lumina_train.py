@@ -93,7 +93,8 @@ def train(args):
     # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
     if args.cache_latents:
         latents_caching_strategy = strategy_lumina.LuminaLatentsCachingStrategy(
-            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
         )
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
@@ -164,6 +165,7 @@ def train(args):
                     args.text_encoder_batch_size,
                     args.skip_cache_check,
                     False,
+                    cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
                 )
             )
         strategy_base.TokenizeStrategy.set_strategy(
@@ -248,6 +250,7 @@ def train(args):
                 args.text_encoder_batch_size,
                 False,
                 False,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         )
         strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(

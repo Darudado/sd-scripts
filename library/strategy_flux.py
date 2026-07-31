@@ -6,6 +6,7 @@ import numpy as np
 from transformers import CLIPTokenizer, T5TokenizerFast
 
 from library import flux_utils, train_util
+from library.cache_utils import load_npz, save_npz
 from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, variant_key
 
 from library.utils import setup_logging
@@ -95,8 +96,9 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         skip_disk_cache_validity_check: bool,
         is_partial: bool = False,
         apply_t5_attn_mask: bool = False,
+        cache_dtype: str = "auto",
     ) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial)
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, cache_dtype=cache_dtype)
         self.apply_t5_attn_mask = apply_t5_attn_mask
 
         self.warn_fp8_weights = False
@@ -113,7 +115,7 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             return True
 
         try:
-            npz = np.load(npz_path)
+            npz = load_npz(npz_path)
             if "l_pooled" not in npz:
                 return False
             if "t5_out" not in npz:
@@ -137,7 +139,7 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return True
 
     def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
-        data = np.load(npz_path)
+        data = load_npz(npz_path)
         l_pooled = self._npz_get(data, "l_pooled", variant)
         t5_out = self._npz_get(data, "t5_out", variant)
         txt_ids = self._npz_get(data, "txt_ids", variant)
@@ -201,7 +203,7 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 if n_variants > 1:
                     save_kwargs["caption_variants"] = np.array(n_variants)
                     save_kwargs["caption_aug_hash"] = np.array(getattr(info, "caption_aug_hash", None) or "")
-                np.savez(info.text_encoder_outputs_npz, **save_kwargs)
+                save_npz(info.text_encoder_outputs_npz, save_kwargs, cache_dtype=self.cache_dtype)
             else:
                 # it's fine that attn mask is not None. it's overwritten before calling the model if necessary
                 info.text_encoder_outputs = tuple(batched[key][i] for key in base_keys)
@@ -219,8 +221,8 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
 class FluxLatentsCachingStrategy(LatentsCachingStrategy):
     FLUX_LATENTS_NPZ_SUFFIX = "_flux.npz"
 
-    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check)
+    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool, cache_dtype: str = "auto") -> None:
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, cache_dtype=cache_dtype)
 
     @property
     def cache_suffix(self) -> str:

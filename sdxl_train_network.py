@@ -75,7 +75,8 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
 
     def get_latents_caching_strategy(self, args):
         latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
-            False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            False, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
         )
         return latents_caching_strategy
 
@@ -88,7 +89,9 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
             return strategy_sdxl.SdxlTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check, is_weighted=args.weighted_captions
+                args.cache_text_encoder_outputs_to_disk, None, args.skip_cache_check,
+                is_weighted=args.weighted_captions,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         else:
             return None

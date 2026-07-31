@@ -221,7 +221,10 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
     def get_latents_caching_strategy(self, args):
         if self.model_type == "chroma_radiance":
             return None  # pixel-space model, no latent caching needed
-        latents_caching_strategy = strategy_flux.FluxLatentsCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, False)
+        latents_caching_strategy = strategy_flux.FluxLatentsCachingStrategy(
+            args.cache_latents_to_disk, args.vae_batch_size, False,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
+        )
         return latents_caching_strategy
 
     def get_text_encoding_strategy(self, args):
@@ -257,6 +260,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 args.skip_cache_check,
                 is_partial=self.train_clip_l or self.train_t5xxl,
                 apply_t5_attn_mask=args.apply_t5_attn_mask,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         else:
             return None

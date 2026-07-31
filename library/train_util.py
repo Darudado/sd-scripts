@@ -42,6 +42,7 @@ from packaging.version import Version
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from library.device_utils import init_ipex, clean_memory_on_device
+from library.cache_utils import CACHE_DTYPE_CHOICES, load_npz, save_npz
 from library.strategy_base import (
     LatentsCachingStrategy,
     TokenizeStrategy,
@@ -3390,7 +3391,7 @@ class ControlNetDataset(BaseDataset):
             alpha_mask_mode = getattr(image_info, "addift_alpha_mask", None)
 
             if hasattr(image_info, "addift_conditioning_latents_npz"):
-                data = np.load(image_info.addift_conditioning_latents_npz)
+                data = load_npz(image_info.addift_conditioning_latents_npz)
                 key = "latents_flipped" if flipped else "latents"
                 addift_conditioning_latents.append(torch.FloatTensor(data[key]))
             else:
@@ -3579,7 +3580,7 @@ def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool, alph
         return False
 
     try:
-        npz = np.load(npz_path)
+        npz = load_npz(npz_path)
         if "latents" not in npz or "original_size" not in npz or "crop_ltrb" not in npz:  # old ver?
             return False
         if npz["latents"].shape[1:3] != expected_latents_size:
@@ -4117,7 +4118,8 @@ def cache_batch_latents(
 
 
 def cache_batch_text_encoder_outputs(
-    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, use_zero_cond_dropout, input_ids1, input_ids2, dtype
+    image_infos, tokenizers, text_encoders, max_token_length, cache_to_disk, use_zero_cond_dropout, input_ids1, input_ids2, dtype,
+    cache_dtype="auto",
 ):
     input_ids1 = input_ids1.to(text_encoders[0].device)
     input_ids2 = input_ids2.to(text_encoders[1].device)
@@ -4142,7 +4144,7 @@ def cache_batch_text_encoder_outputs(
 
     for info, hidden_state1, hidden_state2, pool2 in zip(image_infos, b_hidden_state1, b_hidden_state2, b_pool2):
         if cache_to_disk:
-            save_text_encoder_outputs_to_disk(info.text_encoder_outputs_npz, hidden_state1, hidden_state2, pool2)
+            save_text_encoder_outputs_to_disk(info.text_encoder_outputs_npz, hidden_state1, hidden_state2, pool2, cache_dtype)
         else:
             info.text_encoder_outputs1 = hidden_state1
             info.text_encoder_outputs2 = hidden_state2
@@ -4150,7 +4152,7 @@ def cache_batch_text_encoder_outputs(
 
 
 def cache_batch_text_encoder_outputs_sd3(
-    image_infos, tokenizer, text_encoders, max_token_length, cache_to_disk, input_ids, output_dtype
+    image_infos, tokenizer, text_encoders, max_token_length, cache_to_disk, input_ids, output_dtype, cache_dtype="auto"
 ):
     # make input_ids for each text encoder
     l_tokens, g_tokens, t5_tokens = input_ids
@@ -4170,27 +4172,26 @@ def cache_batch_text_encoder_outputs_sd3(
             raise RuntimeError(f"NaN detected in text encoder outputs: {info.absolute_path}")
 
         if cache_to_disk:
-            save_text_encoder_outputs_to_disk(info.text_encoder_outputs_npz, lg_out, t5_out, pool)
+            save_text_encoder_outputs_to_disk(info.text_encoder_outputs_npz, lg_out, t5_out, pool, cache_dtype)
         else:
             info.text_encoder_outputs1 = lg_out
             info.text_encoder_outputs2 = t5_out
             info.text_encoder_pool2 = pool
 
 
-def save_text_encoder_outputs_to_disk(npz_path, hidden_state1, hidden_state2, pool2):
-    np.savez(
+def save_text_encoder_outputs_to_disk(npz_path, hidden_state1, hidden_state2, pool2, cache_dtype="auto"):
+    save_npz(
         npz_path,
-        hidden_state1=hidden_state1.cpu().float().numpy(),
-        hidden_state2=hidden_state2.cpu().float().numpy(),
-        pool2=pool2.cpu().float().numpy(),
+        {"hidden_state1": hidden_state1, "hidden_state2": hidden_state2, "pool2": pool2},
+        cache_dtype=cache_dtype,
     )
 
 
 def load_text_encoder_outputs_from_disk(npz_path):
-    with np.load(npz_path) as f:
-        hidden_state1 = torch.from_numpy(f["hidden_state1"])
-        hidden_state2 = torch.from_numpy(f["hidden_state2"]) if "hidden_state2" in f else None
-        pool2 = torch.from_numpy(f["pool2"]) if "pool2" in f else None
+    f = load_npz(npz_path)
+    hidden_state1 = torch.from_numpy(f["hidden_state1"])
+    hidden_state2 = torch.from_numpy(f["hidden_state2"]) if "hidden_state2" in f else None
+    pool2 = torch.from_numpy(f["pool2"]) if "pool2" in f else None
     return hidden_state1, hidden_state2, pool2
 
 
@@ -5404,6 +5405,13 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
         help="cache text encoder outputs to disk / text encoderの出力をディスクにキャッシュする",
     )
     parser.add_argument(
+        "--cache_text_encoder_outputs_dtype",
+        type=str,
+        choices=CACHE_DTYPE_CHOICES,
+        default="auto",
+        help="floating-point dtype policy for text encoder output caches: auto, fp16, bf16, or fp32",
+    )
+    parser.add_argument(
         "--text_encoder_batch_size",
         type=int,
         default=None,
@@ -5743,6 +5751,13 @@ def add_dataset_arguments(
         "--cache_latents_to_disk",
         action="store_true",
         help="cache latents to disk to reduce VRAM usage (augmentations must be disabled) / VRAM削減のためにlatentをディスクにcacheする（augmentationは使用不可）",
+    )
+    parser.add_argument(
+        "--cache_latents_dtype",
+        type=str,
+        choices=CACHE_DTYPE_CHOICES,
+        default="auto",
+        help="floating-point dtype policy for latent caches: auto, fp16, bf16, or fp32",
     )
     parser.add_argument(
         "--skip_cache_check",

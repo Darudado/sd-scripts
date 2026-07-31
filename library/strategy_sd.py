@@ -139,8 +139,8 @@ class SdSdxlLatentsCachingStrategy(LatentsCachingStrategy):
     SD_LATENTS_NPZ_SUFFIX = "_sd.npz"
     SDXL_LATENTS_NPZ_SUFFIX = "_sdxl.npz"
 
-    def __init__(self, sd: bool, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check)
+    def __init__(self, sd: bool, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool, cache_dtype: str = "auto") -> None:
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, cache_dtype=cache_dtype)
         self.sd = sd
         self.suffix = (
             SdSdxlLatentsCachingStrategy.SD_LATENTS_NPZ_SUFFIX if sd else SdSdxlLatentsCachingStrategy.SDXL_LATENTS_NPZ_SUFFIX

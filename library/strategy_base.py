@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 from library.offline_utils import safe_from_pretrained
+from library.cache_utils import load_npz, normalize_cache_dtype, save_npz
 
 
 # TODO remove circular import by moving ImageInfo to a separate file
@@ -459,12 +460,14 @@ class TextEncoderOutputsCachingStrategy:
         skip_disk_cache_validity_check: bool,
         is_partial: bool = False,
         is_weighted: bool = False,
+        cache_dtype: str = "auto",
     ) -> None:
         self._cache_to_disk = cache_to_disk
         self._batch_size = batch_size
         self.skip_disk_cache_validity_check = skip_disk_cache_validity_check
         self._is_partial = is_partial
         self._is_weighted = is_weighted
+        self.cache_dtype = normalize_cache_dtype(cache_dtype)
 
     @classmethod
     def set_strategy(cls, strategy):
@@ -564,10 +567,17 @@ class LatentsCachingStrategy:
 
     _warned_fallback_to_old_npz = False  # to avoid spamming logs about fallback
 
-    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
+    def __init__(
+        self,
+        cache_to_disk: bool,
+        batch_size: int,
+        skip_disk_cache_validity_check: bool,
+        cache_dtype: str = "auto",
+    ) -> None:
         self._cache_to_disk = cache_to_disk
         self._batch_size = batch_size
         self.skip_disk_cache_validity_check = skip_disk_cache_validity_check
+        self.cache_dtype = normalize_cache_dtype(cache_dtype)
 
     @classmethod
     def set_strategy(cls, strategy):
@@ -661,7 +671,7 @@ class LatentsCachingStrategy:
         key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}" if multi_resolution else ""
 
         try:
-            npz = np.load(npz_path)
+            npz = load_npz(npz_path)
 
             # In old SD/SDXL npz files, if the actual latents shape does not match the expected shape, it doesn't raise an error as long as "latents" key exists (backward compatibility)
             # In non-SD/SDXL npz files (multi-resolution support), the latents key always has the resolution suffix, and no latents key without suffix exists, so it raises an error if the expected resolution suffix key is not found (this doesn't change the behavior for non-SD/SDXL npz files).
@@ -929,7 +939,7 @@ class LatentsCachingStrategy:
             expected_latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
             key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}"  # e.g. "_32x64", HxW
 
-        npz = np.load(npz_path)
+        npz = load_npz(npz_path)
         latents_key = variant_key("latents", variant) + key_reso_suffix
         if latents_key not in npz:
             if variant > 0:
@@ -1001,9 +1011,7 @@ class LatentsCachingStrategy:
 
         if os.path.exists(npz_path):
             # load existing npz and update it
-            npz = np.load(npz_path)
-            for key in npz.files:
-                kwargs[key] = npz[key]
+            kwargs.update(load_npz(npz_path))
 
         # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
         kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
@@ -1026,4 +1034,4 @@ class LatentsCachingStrategy:
         if aug_config_hash is not None:
             kwargs["aug_config_hash"] = np.array(aug_config_hash)
 
-        np.savez(npz_path, **kwargs)
+        save_npz(npz_path, kwargs, cache_dtype=self.cache_dtype)

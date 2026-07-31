@@ -170,7 +170,8 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
 
     def get_latents_caching_strategy(self, args):
         latents_caching_strategy = strategy_sd3.Sd3LatentsCachingStrategy(
-            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
+            args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check,
+            cache_dtype=getattr(args, "cache_latents_dtype", "auto"),
         )
         return latents_caching_strategy
 
@@ -214,6 +215,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
                 is_partial=self.train_clip or self.train_t5xxl,
                 apply_lg_attn_mask=args.apply_lg_attn_mask,
                 apply_t5_attn_mask=args.apply_t5_attn_mask,
+                cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
             )
         else:
             return None

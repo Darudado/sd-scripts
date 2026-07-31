@@ -92,6 +92,9 @@ Caching is effective for SDXL due to its high computational cost.
 *   `--cache_latents_to_disk`: Used with `--cache_latents` to cache to disk. Particularly effective for large datasets or multiple training runs. Caches are generated on disk during the first run and loaded from there on subsequent runs.
 *   `--cache_text_encoder_outputs`: Caches Text Encoder outputs in memory. Skips Text Encoder computation, reducing VRAM usage and speeding up training. **Note:** Caption augmentations (`shuffle_caption`, `caption_dropout_rate`, etc.) will be disabled. **Also, when using this option, Text Encoder LoRA modules cannot be trained (requires `--network_train_unet_only`).**
 *   `--cache_text_encoder_outputs_to_disk`: Used with `--cache_text_encoder_outputs` to cache to disk.
+*   `--cache_text_encoder_outputs_dtype={auto,fp16,bf16,fp32}`: Controls the floating-point representation used in disk text-encoder caches. `auto` preserves the existing precision; `fp16` provides the largest broadly compatible reduction; `bf16` stores BF16 bit patterns with cache metadata and decodes them transparently; `fp32` is lossless relative to the current cache behavior. Integer token IDs and masks are not converted.
+*   `--cache_latents_dtype={auto,fp16,bf16,fp32}`: Controls the floating-point representation used in disk latent caches. `auto` preserves the existing precision, while `fp16` or `bf16` reduces storage. Existing uncompressed NPZ caches remain readable.
+*   Disk caches are written with DEFLATE compression. Compression is most effective for repeated or low-entropy values; dtype selection is the main size reduction for model outputs.
 *   `--skip_cache_check`: Skips validation of cache file contents. File existence is checked, and if not found, caches are generated. Usually not needed unless intentionally re-caching for debugging, etc.
 
 ### 1.7. Sample Image Generation
