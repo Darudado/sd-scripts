@@ -30,6 +30,7 @@ from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
+from library import hf_token_loss
 from library.strategy_sdxl import SdxlTextEncodingStrategy
 
 import library.train_util as train_util
@@ -137,6 +138,16 @@ class NetworkTrainer:
         self._noisy_latents = None  # stored by get_noise_pred_and_target for wavelet map computation
         self._wavelet_mask_ratio = 0.0  # fraction of loss elements masked (for logging)
 
+        # High-Frequency Token latent loss config (see library/hf_token_loss.py)
+        self.hf_scale = 0.0              # lambda; 0 = off (bit-identical no-op)
+        self.hf_exponent = 1.0           # gamma, must be > 0
+        self.hf_patch = 2                # token patch size; must equal model's patchify size
+        self.hf_prediction_mode = None   # set by setup_hf_objective / subclasses (None => base derives)
+        self.hf_timesteps_in_sigma = False  # True for Anima (timesteps already in [0, 1])
+        self.hf_eps_train = 5e-2         # train-time epsilon for x0-residual models (ChromaRadiance raw)
+        self._hf_noisy_latents = None    # stored by get_noise_pred_and_target (4D pre-pack)
+        self.hf_loss_value = None        # detached scaled HF contribution for logging (tensor)
+
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
         self,
@@ -163,6 +174,7 @@ class NetworkTrainer:
         current_patch_topology_weight=None,
         current_wav_mask_ratio=None,
         current_weight_noise_norm=None,
+        current_hf_loss=None,
         it_s: float = 0.0,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
@@ -189,6 +201,9 @@ class NetworkTrainer:
 
         if current_weight_noise_norm is not None:
             logs["weight_noise/noise_norm"] = current_weight_noise_norm
+
+        if current_hf_loss is not None:
+            logs["loss/current_hf"] = current_hf_loss
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -448,6 +463,11 @@ class NetworkTrainer:
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_latents.detach() if isinstance(noisy_latents, torch.Tensor) else None
 
+        # Store noisy latents for High-Frequency Token loss (must be 4D pre-pack;
+        # for inpainting this is the 4-channel latent, before the mask concat below).
+        if is_train:
+            self._hf_noisy_latents = noisy_latents.detach() if isinstance(noisy_latents, torch.Tensor) else None
+
         # ensure the hidden state will require grad
         if is_train and args.gradient_checkpointing:
             for x in noisy_latents:
@@ -549,6 +569,29 @@ class NetworkTrainer:
                 loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
         return loss
 
+    def setup_hf_objective(self, args):
+        """Resolve the High-Frequency Token latent loss config from args.
+
+        Base objective resolution: eps/v-pred/flow (DDPM-family). Subclasses set
+        `self.hf_prediction_mode` (and optionally `hf_timesteps_in_sigma`) in their
+        `__init__` or override this method; a non-None mode is never clobbered here.
+        """
+        self.hf_scale = float(getattr(args, "hf_scale", 0.0) or 0.0)
+        self.hf_exponent = float(getattr(args, "hf_exponent", 1.0) or 1.0)
+        self.hf_patch = int(getattr(args, "hf_patch", 2) or 2)
+        hf_token_loss.validate_hf_args(self.hf_scale, self.hf_exponent, self.hf_patch)
+        if self.hf_prediction_mode is None:
+            if getattr(args, "flow_model", False):
+                self.hf_prediction_mode = "flow"
+            elif args.v_parameterization:
+                self.hf_prediction_mode = "vpred_ddpm"
+            else:
+                self.hf_prediction_mode = "eps_ddpm"
+        if self.hf_scale > 0.0:
+            logger.info(
+                f"High-Frequency Token latent loss enabled: scale={self.hf_scale}, "
+                f"exponent={self.hf_exponent}, patch={self.hf_patch}, mode={self.hf_prediction_mode}"
+            )
 
     def build_adaptive_model_fn(self, unet, accelerator, weight_dtype):
         """Build a model_fn(noisy_latents, timesteps, wdtype) -> noise_pred for Algorithm 2.
@@ -1144,6 +1187,30 @@ class NetworkTrainer:
                     self.patch_topology_effective_weight = effective_weight
                     final_loss = final_loss + effective_weight * patch_topo_loss_mean
 
+        # --- High-Frequency Token latent loss: per-token x0-MSE weighted by clean-token detail ---
+        # Opt-in auxiliary (hf_scale > 0). The Python-level gate inside hf_apply_term makes
+        # the off-mode bit-identical (no extra ops/allocations/RNG). Weights derive from the
+        # clean target only (never from the prediction), and the term is differentiable only
+        # through x0_hat. The detached scaled value is stored for logging (materialized at the
+        # existing periodic sync, not on the hot path).
+        self.hf_loss_value = None
+        if is_train and self._hf_noisy_latents is not None:
+            final_loss, self.hf_loss_value = hf_token_loss.hf_apply_term(
+                final_loss,
+                noise_pred,
+                clean=latents,
+                noisy=self._hf_noisy_latents,
+                timesteps=timesteps,
+                weighting=weighting,
+                scale=self.hf_scale,
+                exponent=self.hf_exponent,
+                patch=self.hf_patch,
+                mode=self.hf_prediction_mode,
+                noise_scheduler=noise_scheduler,
+                timesteps_in_sigma=self.hf_timesteps_in_sigma,
+                eps_train=self.hf_eps_train,
+            )
+
         return final_loss, pre_scaling_loss, loss_scaled
     
     def process_val_batch(
@@ -1413,6 +1480,7 @@ class NetworkTrainer:
         training_started_at = time.time()
         train_util.verify_training_args(args)
         train_util.prepare_dataset_args(args, True)
+        self.setup_hf_objective(args)  # High-Frequency Token latent loss (validates hf_scale/hf_exponent/hf_patch)
         train_util.set_torch_cuda_reduced_precision(args)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
@@ -2438,6 +2506,9 @@ class NetworkTrainer:
             "ss_patch_topology_dwa_temperature": getattr(args, "patch_topology_dwa_temperature", 2.0),
             "ss_patch_topology_gradnorm_alpha": getattr(args, "patch_topology_gradnorm_alpha", 1.5),
             "ss_patch_topology_dynamic_max_weight": getattr(args, "patch_topology_dynamic_max_weight", 10.0),
+            "ss_hf_scale": self.hf_scale if self.hf_scale > 0.0 else 0.0,
+            "ss_hf_exponent": self.hf_exponent if self.hf_scale > 0.0 else None,
+            "ss_hf_patch": self.hf_patch if self.hf_scale > 0.0 else None,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -2887,6 +2958,7 @@ class NetworkTrainer:
         current_global_step_patch_topo = 0.0 if self.patch_topology_enabled else None
         current_global_step_wav_mask = 0.0 if self.wavelet_masking_enabled else None
         current_global_step_wnoise = 0.0 if self.weight_noise_enabled else None
+        current_global_step_hf = 0.0 if self.hf_scale > 0.0 else None
         avr_loss = 0.0
         accumulation_counter = 0
         accumulated_samples = 0  # Tracks actual samples across micro-batches for dynamic sigma
@@ -2951,6 +3023,7 @@ class NetworkTrainer:
                 average_val_loss=average_val_loss,
                 current_ffl_loss=None,
                 current_patch_topology_loss=None,
+                current_hf_loss=None,
                 it_s=rate_tracker.it_per_sec,
             )
             if val_logs:
@@ -3088,6 +3161,11 @@ class NetworkTrainer:
                     # Track wavelet mask ratio for logging
                     if self.wavelet_masking_enabled:
                         current_global_step_wav_mask = (current_global_step_wav_mask or 0.0) + self._wavelet_mask_ratio
+
+                    # Track High-Frequency Token loss for logging (materialized at the
+                    # existing periodic sync — the hot path keeps a detached tensor)
+                    if self.hf_scale > 0.0 and self.hf_loss_value is not None:
+                        current_global_step_hf = (current_global_step_hf or 0.0) + self.hf_loss_value.item()
 
                     if loss.ndim != 0:
                         loss = loss.mean()
@@ -3355,6 +3433,7 @@ class NetworkTrainer:
                             current_patch_topology_weight=self.patch_topology_effective_weight if self.patch_topology_enabled else None,
                             current_wav_mask_ratio=(current_global_step_wav_mask / accumulation_counter) if self.wavelet_masking_enabled and current_global_step_wav_mask is not None else None,
                             current_weight_noise_norm=(current_global_step_wnoise / accumulation_counter) if self.weight_noise_enabled and current_global_step_wnoise is not None else None,
+                            current_hf_loss=(current_global_step_hf / accumulation_counter) if self.hf_scale > 0.0 and current_global_step_hf is not None else None,
                             it_s=rate_tracker.it_per_sec,
                         )
                         if val_logs:
@@ -3372,6 +3451,8 @@ class NetworkTrainer:
                         current_global_step_wav_mask = 0.0
                     if self.weight_noise_enabled:
                         current_global_step_wnoise = 0.0
+                    if self.hf_scale > 0.0:
+                        current_global_step_hf = 0.0
                     accumulation_counter = 0
                     accumulated_samples = 0
 
@@ -3933,6 +4014,31 @@ def setup_parser() -> argparse.ArgumentParser:
         default=0.3,
         help="Lower bound l for wavelet masking (default: 0.3). All spatial regions receive at least "
         "l*T supervision steps. Paper ablation shows 0.3 is optimal. Range: [0.0, 1.0].",
+    )
+
+    # High-Frequency Token latent loss arguments (see library/hf_token_loss.py)
+    parser.add_argument(
+        "--hf_scale",
+        type=float,
+        default=0.0,
+        help="High-Frequency token latent loss weight (lambda, 0 = off, must be >= 0). "
+        "L_total = L_mse + hf_scale * L_hf. Concentrates training effort on image tokens "
+        "carrying fine (high-frequency) detail.",
+    )
+    parser.add_argument(
+        "--hf_exponent",
+        type=float,
+        default=1.0,
+        help="HF token weight concentration exponent (gamma, must be > 0). 1 = linear in detail, "
+        "> 1 concentrates on the highest-detail tokens, < 1 flattens toward uniform.",
+    )
+    parser.add_argument(
+        "--hf_patch",
+        type=int,
+        default=2,
+        help="HF token patch size; MUST equal the model's own patchify size. "
+        "2 for latent-space models (SD1.5/SD2/SDXL/Flux/SD3/Lumina/Hunyuan/Anima), "
+        "16 for pixel-space models (e.g. ChromaRadiance).",
     )
 
     parser.add_argument(

@@ -37,6 +37,8 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.sample_prompts_te_outputs = None
         self.is_swapping_blocks: bool = False
+        # Lumina is a flow-matching model: model_pred is velocity, x0_hat = noisy - sigmas * v
+        self.hf_prediction_mode = "flow"
 
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
@@ -279,6 +281,10 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_model_input.detach()
 
+        # Store noisy latents for High-Frequency Token loss (4D pre-pack; Lumina never packs)
+        if is_train:
+            self._hf_noisy_latents = noisy_model_input.detach()
+
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
             noisy_model_input.requires_grad_(True)
@@ -348,7 +354,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         if args.min_snr_gamma:

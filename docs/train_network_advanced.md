@@ -267,6 +267,61 @@ Composes with masked loss, wavelet masking, min-SNR weighting, and per-sample `l
 
 Supported in: `train_network.py` Rectified Flow path (`--flow_model`), Flux trainers (`--timestep_sampling uniform|sigmoid|shift|flux_shift` and the weighting-scheme density path), SD3 trainers (`--weighting_scheme` density path with `--training_shift`), and Lumina trainers.
 
+## 2.10 High-Frequency Token Latent Loss
+
+An opt-in auxiliary loss term that **concentrates training effort on the image tokens that
+carry fine (high-frequency) detail**. The model's predicted clean estimate (Tweedie `x0_hat`)
+is compared against the clean latent, and the per-token error is weighted by a measure of
+each token's local high-frequency content derived from the **clean target itself**:
+
+```
+L_total = L_mse + hf_scale * L_hf
+L_hf    = mean over batch of  mean over tokens of  w_token * ||x0_hat_token - x0_token||^2
+```
+
+The weights `w_token` are computed per micro-batch, on-GPU, from the clean batch — no cache,
+no extractor network, no RNG draw. `hf_scale == 0` (the default) is bit-identical to the
+loss without the feature.
+
+*   `--hf_scale` (default `0.0`, must be `>= 0`): term weight (λ); `0.0` disables the term.
+*   `--hf_exponent` (default `1.0`, must be `> 0`): weight concentration exponent (γ);
+    `1` weights tokens linearly in detail, `> 1` concentrates on the highest-detail tokens,
+    `< 1` flattens toward uniform. The per-sample weights are always renormalized to mean 1,
+    so the term's scale stays comparable to the plain x0-MSE.
+*   `--hf_patch` (default `2`): token patch size; **must equal the model's own patchify size**.
+    Use `2` for all latent-space models (SD1.5/SD2/SDXL/Flux/SD3/Lumina/Hunyuan/Anima) and
+    `16` for pixel-space models such as ChromaRadiance. `H`/`W` must be divisible by the patch.
+
+**How it works:** the per-token weight is the mean squared Laplacian response of the clean
+latent inside each patch (replication padding — load-bearing: a constant input gives exactly
+0), normalized with a `1e-6` robustness epsilon and renormalized to mean 1 per sample. The
+term regresses the Tweedie reconstruction `x0_hat` (model-class-specific: `noisy - t*v` for
+flow/v-pred, direct x0 for SD3, `noisy - v*(t + 5e-2)` for ChromaRadiance raw) against the
+clean target.
+
+**Behavior & invariants:**
+
+* **RNG-neutral & deterministic**: weights are a pure function of the clean batch; the
+  global RNG stream position is identical whether the term is on or off.
+* **No timestep gate**: the term applies at all `t` (the t² factor from the x0 domain is
+  accepted). Per-sample timestep importance weights (e.g. the SD3/Flux `weighting_scheme`
+  weights) are applied to the HF term with the same convention as the main MSE.
+* **Caption-independent**: CFG-dropped rows contribute normally; the term never touches
+  `target_v` or the dropout mask.
+* **Compatible with auxiliary features**: composes with token mining, wavelet masking,
+  FFL, Patch Topology Loss, min-SNR weighting, best-of-K noise exploration (selection stays
+  pure velocity-MSE), stochastic-OT and antithetic noise pairing.
+* **Skips teacher-distillation paths**: on Anima's `--ileco` / `--addift` modes the training
+  target is a teacher's velocity with no analytic clean x0, so the HF term is skipped there.
+* **Logging & metadata**: the scaled contribution is reported as `loss/current_hf`, and
+  `ss_hf_scale`, `ss_hf_exponent`, `ss_hf_patch` are recorded in the saved model metadata.
+
+Reference implementation: `library/hf_token_loss.py` (ported from
+`plans/high-frequency-token-loss (1).md`). Test battery: `tests/test_hf_token_loss.py`.
+
+Supported in: all `train_network` family trainers (base, SDXL, Flux, SD3, Lumina,
+HunyuanImage, Anima).
+
 ## 3. Conclusion / おわりに
 
 `sdxl_train_network.py` offers many options to customize SDXL LoRA training. Refer to `--help`, other documents and the source code for further details.

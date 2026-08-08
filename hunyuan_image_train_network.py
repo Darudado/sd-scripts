@@ -314,6 +314,8 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         self.sample_prompts_te_outputs = None
         self.is_swapping_blocks: bool = False
         self.rotary_pos_emb_cache = {}
+        # HunyuanImage is a flow-matching model: model_pred is velocity, x0_hat = noisy - sigmas * v
+        self.hf_prediction_mode = "flow"
 
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
@@ -566,6 +568,10 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_model_input.detach()
 
+        # Store noisy latents for High-Frequency Token loss (4D pre-pack; HunyuanImage never packs)
+        if is_train:
+            self._hf_noisy_latents = noisy_model_input.detach()
+
         # bfloat16 is too low precision for 0-1000 TODO fix get_noisy_model_input_and_timesteps
         timesteps = (sigmas[:, 0, 0, 0] * 1000).to(torch.int64)
         # print(
@@ -606,7 +612,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
 
         # differential output preservation is not used for HunyuanImage-2.1 currently
 
-        return model_pred, target, timesteps, weighting
+        return model_pred, target, timesteps, weighting, noise
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         if args.min_snr_gamma:

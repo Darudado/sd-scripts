@@ -40,6 +40,17 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_schnell: Optional[bool] = None
         self.is_swapping_blocks: bool = False
         self.model_type: Optional[str] = None
+        # Flux is a flow-matching model: model_pred is velocity, x0_hat = noisy - sigmas * v.
+        # ChromaRadiance `raw` prediction is special-cased in setup_hf_objective below.
+        self.hf_prediction_mode = "flow"
+
+    def setup_hf_objective(self, args):
+        super().setup_hf_objective(args)
+        if getattr(args, "model_type", None) == "chroma_radiance":
+            # ChromaRadiance raw: model outputs v = (noisy - x0) / (t + 5e-2); the Tweedie
+            # must use the same train-time epsilon as the forward path (spec §2.2).
+            self.hf_prediction_mode = "x0_residual_eps"
+            self.hf_eps_train = 5e-2
 
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
@@ -383,6 +394,11 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_model_input.detach()
+
+        # Store noisy latents for High-Frequency Token loss (4D pre-pack; this is before the
+        # chroma pixel-space branch and before pack_latents, so it covers both paths)
+        if is_train:
+            self._hf_noisy_latents = noisy_model_input.detach()
 
         # --- ChromaRadiance: pixel-space forward (no pack/unpack) ---
         if self.model_type == "chroma_radiance":

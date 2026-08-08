@@ -42,6 +42,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.sample_prompts_te_outputs = None
+        # Anima is a flow-matching model; timesteps are returned already in [0, 1]
+        # (divided by 1000), so the HF Tweedie must treat them as sigmas directly.
+        self.hf_prediction_mode = "flow"
+        self.hf_timesteps_in_sigma = True
         self._ot_logged = False    # fires a one-time first-batch OT log
         self._cfm_logged = False   # fires a one-time first-batch CFM log
         self.ileco_text_encoder_conds = None
@@ -753,6 +757,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         weight_dtype,
         is_train=True,
     ):
+        # iLECO is a teacher-distillation path: the training target is the teacher's
+        # velocity, so there is no analytic clean x0 for the HF token term — skip it.
+        self._hf_noisy_latents = None
         anima: anima_models.Anima = unet
 
         if self.ileco_text_encoder_conds is None:
@@ -850,6 +857,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         weight_dtype,
         is_train=True,
     ):
+        # ADDifT is a teacher-distillation path: the student regresses the teacher's
+        # velocity (x0_hat converges to a sigma-dependent blend), so there is no analytic
+        # clean x0 for the HF token term — skip it.
+        self._hf_noisy_latents = None
         anima: anima_models.Anima = unet
 
         if network is None or not hasattr(network, "set_multiplier"):
@@ -1111,6 +1122,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Must be stored BEFORE unsqueeze to 5D (wavelet DWT expects 4D)
         if is_train and getattr(self, "wavelet_masking_enabled", False):
             self._noisy_latents = noisy_model_input.detach()
+
+        # Store noisy latents for High-Frequency Token loss (4D, before 5D unsqueeze)
+        if is_train:
+            self._hf_noisy_latents = noisy_model_input.detach()
 
         # Set T-LoRA timestep mask before timestep scaling (mask expects [0, max_timestep] range)
         self.apply_tlora_mask(timesteps)
