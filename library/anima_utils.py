@@ -28,6 +28,13 @@ FP8_OPTIMIZATION_TARGET_KEYS = ["blocks", ""]
 # ".embed." excludes Embedding in LLMAdapter
 FP8_OPTIMIZATION_EXCLUDE_KEYS = ["_embedder", "norm", "adaln", "final_layer", ".embed."]
 
+def _rename_hook(k: str) -> str:
+    if k.startswith("model.diffusion_model."):
+        return k[len("model.diffusion_model."):]
+    if k.startswith("net."):
+        return k[len("net."):]
+    return k
+
 def load_anima_model(
     device: Union[str, torch.device],
     dit_path: str,
@@ -102,7 +109,8 @@ def load_anima_model(
 
     # load model weights with dynamic fp8 optimization and LoRA merging if needed
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")
-    rename_hooks = WeightTransformHooks(rename_hook=lambda k: k[len("net.") :] if k.startswith("net.") else k)
+
+    rename_hooks = WeightTransformHooks(rename_hook=_rename_hook)
     sd = load_safetensors_with_lora_and_fp8(
         model_files=dit_path,
         lora_weights_list=lora_weights_list,
