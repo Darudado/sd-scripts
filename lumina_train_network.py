@@ -282,7 +282,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
             self._noisy_latents = noisy_model_input.detach()
 
         # Store noisy latents for High-Frequency Token loss (4D pre-pack; Lumina never packs)
-        if is_train:
+        if is_train and self.hf_scale > 0.0:
             self._hf_noisy_latents = noisy_model_input.detach()
 
         # ensure the hidden state will require grad

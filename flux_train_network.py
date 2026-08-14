@@ -397,7 +397,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         # Store noisy latents for High-Frequency Token loss (4D pre-pack; this is before the
         # chroma pixel-space branch and before pack_latents, so it covers both paths)
-        if is_train:
+        if is_train and self.hf_scale > 0.0:
             self._hf_noisy_latents = noisy_model_input.detach()
 
         # --- ChromaRadiance: pixel-space forward (no pack/unpack) ---

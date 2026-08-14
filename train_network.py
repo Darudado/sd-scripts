@@ -465,7 +465,7 @@ class NetworkTrainer:
 
         # Store noisy latents for High-Frequency Token loss (must be 4D pre-pack;
         # for inpainting this is the 4-channel latent, before the mask concat below).
-        if is_train:
+        if is_train and self.hf_scale > 0.0:
             self._hf_noisy_latents = noisy_latents.detach() if isinstance(noisy_latents, torch.Tensor) else None
 
         # ensure the hidden state will require grad
@@ -1955,12 +1955,6 @@ class NetworkTrainer:
                 persistent_workers=args.persistent_data_loader_workers,
                 pin_memory=args.pin_data_loader_memory or args.pin_memory,
             )
-
-        if val_dataset_group is not None:
-            val_dataloader = accelerator.prepare(val_dataloader)
-            cyclic_val_dataloader = itertools.cycle(val_dataloader)
-        else:
-            val_dataloader, cyclic_val_dataloader = None, None
 
         # 学習ステップ数を計算する
         if args.max_train_epochs is not None:

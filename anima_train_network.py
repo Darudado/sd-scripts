@@ -1124,7 +1124,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             self._noisy_latents = noisy_model_input.detach()
 
         # Store noisy latents for High-Frequency Token loss (4D, before 5D unsqueeze)
-        if is_train:
+        if is_train and self.hf_scale > 0.0:
             self._hf_noisy_latents = noisy_model_input.detach()
 
         # Set T-LoRA timestep mask before timestep scaling (mask expects [0, max_timestep] range)

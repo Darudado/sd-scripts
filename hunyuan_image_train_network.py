@@ -569,7 +569,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
             self._noisy_latents = noisy_model_input.detach()
 
         # Store noisy latents for High-Frequency Token loss (4D pre-pack; HunyuanImage never packs)
-        if is_train:
+        if is_train and self.hf_scale > 0.0:
             self._hf_noisy_latents = noisy_model_input.detach()
 
         # bfloat16 is too low precision for 0-1000 TODO fix get_noisy_model_input_and_timesteps
