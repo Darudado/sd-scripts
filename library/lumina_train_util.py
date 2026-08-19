@@ -957,8 +957,8 @@ def get_noisy_model_input_and_timesteps(
             device=device,
             rank=PartialState().process_index if getattr(args, "qmc_timestep_sampling", None) is not None else 0,
         )
-        indices = (u * num_timesteps).long()
-        timesteps = noise_scheduler.timesteps[indices].to(device=device)
+        indices = (u * num_timesteps).long().clamp(0, len(noise_scheduler.timesteps) - 1)
+        timesteps = noise_scheduler.timesteps.to(device=device)[indices]
         sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
 
     # Broadcast sigmas to latent shape
