@@ -5,6 +5,7 @@ from library.anima_resolution_schedule import (
     ResolutionSchedule,
     ResolutionScheduleError,
     apply_stage_to_dataset_group,
+    prepare_rebuilt_dataloader,
 )
 
 
@@ -164,6 +165,22 @@ class ResolutionScheduleTest(unittest.TestCase):
         self.assertEqual(dataset.batch_size, 4)
         self.assertEqual(dataset.bucket_manager, {"resolution": 512})
         self.assertEqual(dataset.image_data["image"].latents, "512-latents")
+
+    def test_rebuilt_dataloader_is_prepared_for_accelerator_device_transfer(self):
+        class Accelerator:
+            def __init__(self):
+                self.prepared = None
+
+            def prepare_data_loader(self, dataloader):
+                self.prepared = dataloader
+                return ("prepared", dataloader)
+
+        accelerator = Accelerator()
+
+        rebuilt = prepare_rebuilt_dataloader(accelerator, lambda: "raw-stage-loader")
+
+        self.assertEqual(accelerator.prepared, "raw-stage-loader")
+        self.assertEqual(rebuilt, ("prepared", "raw-stage-loader"))
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ from library.config_util import (
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
 from library.adaptive_timestep_sampler import AdaptiveTimestepManager
-from library.anima_resolution_schedule import ResolutionStageCache, apply_stage_to_dataset_group
+from library.anima_resolution_schedule import ResolutionStageCache, apply_stage_to_dataset_group, prepare_rebuilt_dataloader
 from library.custom_train_functions import (
     apply_snr_weight,
     apply_snr_weight_for_flow_matching,
@@ -3152,7 +3152,7 @@ class NetworkTrainer:
                             apply_stage_to_dataset_group(train_dataset_group, stage)
                         args.train_batch_size = stage.batch_size
                         train_dataset_group.set_current_strategies()
-                        train_dataloader = create_train_dataloader()
+                        train_dataloader = prepare_rebuilt_dataloader(accelerator, create_train_dataloader)
                         train_dataset_group.set_max_train_steps(args.max_train_steps)
                     active_resolution_stage = stage
             current_epoch.value = epoch + 1

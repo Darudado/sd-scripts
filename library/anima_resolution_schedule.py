@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 class ResolutionScheduleError(ValueError):
@@ -185,6 +185,12 @@ class ResolutionStageCache:
                 image_info = dataset.image_data[image_key]
                 for attribute, value in values.items():
                     setattr(image_info, attribute, value)
+
+
+def prepare_rebuilt_dataloader(accelerator: Any, factory: Callable[[], Any]) -> Any:
+    """Build a stage DataLoader and apply Accelerate's device-transfer wrapper."""
+
+    return accelerator.prepare_data_loader(factory())
 
 
 def apply_stage_to_dataset_group(dataset_group: Any, stage: ResolutionStage) -> None:
