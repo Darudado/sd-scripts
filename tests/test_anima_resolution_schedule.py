@@ -8,6 +8,14 @@ from library.anima_resolution_schedule import (
 
 
 class ResolutionScheduleTest(unittest.TestCase):
+    def test_accepts_ui_toml_list_or_cli_json(self):
+        entries = [{"resolution": 512, "percent": 40, "batch_size": 4}, {"resolution": 1024, "batch_size": 2}]
+
+        from_toml = ResolutionSchedule.from_value(entries, total_steps=100)
+        from_cli = ResolutionSchedule.from_value(str(entries).replace("'", '"'), total_steps=100)
+
+        self.assertEqual(from_toml.to_dict(), from_cli.to_dict())
+
     def test_final_stage_receives_remaining_percentage_and_exact_step_range(self):
         schedule = ResolutionSchedule.from_entries(
             [

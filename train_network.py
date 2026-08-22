@@ -9,6 +9,7 @@ import sys
 import random
 import time
 import json
+import hashlib
 from multiprocessing import Value
 import numpy as np
 import ast
@@ -46,6 +47,7 @@ from library.config_util import (
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
 from library.adaptive_timestep_sampler import AdaptiveTimestepManager
+from library.anima_resolution_schedule import apply_stage_to_dataset_group
 from library.custom_train_functions import (
     apply_snr_weight,
     apply_snr_weight_for_flow_matching,
@@ -1615,6 +1617,19 @@ class NetworkTrainer:
             train_dataset_group = train_util.load_arbitrary_dataset(args)
             val_dataset_group = None  # placeholder until validation dataset supported for arbitrary
 
+        resolution_schedule = getattr(args, "_resolution_schedule", None)
+        if resolution_schedule is not None:
+            if args.dataset_class is not None:
+                raise ValueError("resolution_schedule does not support custom dataset_class")
+            initial_stage = resolution_schedule.stage_for_step(0)
+            apply_stage_to_dataset_group(train_dataset_group, initial_stage)
+            args.train_batch_size = initial_stage.batch_size
+            logger.info(
+                "Resolution schedule stage 1/%s: max=%s, batch=%s, steps=%s-%s",
+                len(resolution_schedule.stages), initial_stage.resolution, initial_stage.batch_size,
+                initial_stage.start_step, initial_stage.end_step,
+            )
+
         if args.protected_tags_file:
             logger.info("Injecting protected_tags_file into datasets...")
             for ds in train_dataset_group.datasets:
@@ -1934,16 +1949,19 @@ class NetworkTrainer:
         train_dataloader_generator = torch.Generator(device="cpu")
         train_dataloader_generator_init_seed = train_dataloader_generator.initial_seed()
 
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset_group,
-            batch_size=1,
-            shuffle=True,
-            collate_fn=collator,
-            num_workers=n_workers,
-            persistent_workers=args.persistent_data_loader_workers,
-            pin_memory=args.pin_data_loader_memory or args.pin_memory,
-            generator=train_dataloader_generator,
-        )
+        def create_train_dataloader():
+            return torch.utils.data.DataLoader(
+                train_dataset_group,
+                batch_size=1,
+                shuffle=True,
+                collate_fn=collator,
+                num_workers=n_workers,
+                persistent_workers=args.persistent_data_loader_workers,
+                pin_memory=args.pin_data_loader_memory or args.pin_memory,
+                generator=train_dataloader_generator,
+            )
+
+        train_dataloader = create_train_dataloader()
 
         if val_dataset_group is not None:
             val_dataloader = torch.utils.data.DataLoader(
@@ -1964,6 +1982,11 @@ class NetworkTrainer:
             accelerator.print(
                 f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
             )
+
+        if resolution_schedule is not None:
+            # Stage boundaries can interrupt a natural dataset epoch. Use the
+            # global optimizer-step budget as the only termination condition.
+            num_train_epochs = args.max_train_steps
 
         # データセット側にも学習ステップを送信
         train_dataset_group.set_max_train_steps(args.max_train_steps)
@@ -2276,6 +2299,18 @@ class NetworkTrainer:
             train_util.patch_accelerator_for_fp16_training(accelerator)
 
         # before resuming make hook for saving/loading to save/load the network weights only
+        def get_resolution_schedule_state():
+            if resolution_schedule is None:
+                return None
+            images = [
+                (info.absolute_path, info.image_size, info.num_repeats)
+                for info in train_dataset_group.image_data.values()
+            ]
+            dataset_signature = hashlib.sha256(
+                json.dumps(sorted(images), default=str, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            return {"fingerprint": resolution_schedule.fingerprint, "dataset_signature": dataset_signature}
+
         def save_model_hook(models, weights, output_dir):
             # pop weights of other models than network to save only network weights
             # only main process or deepspeed https://github.com/huggingface/diffusers/issues/2606
@@ -2295,6 +2330,11 @@ class NetworkTrainer:
             logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
             with open(train_state_file, "w", encoding="utf-8") as f:
                 json.dump({"current_epoch": current_epoch.value, "current_step": current_step.value + 1}, f)
+
+            schedule_state = get_resolution_schedule_state()
+            if schedule_state is not None:
+                with open(os.path.join(output_dir, "resolution_schedule_state.json"), "w", encoding="utf-8") as f:
+                    json.dump(schedule_state, f)
 
             # save adaptive timestep sampler state if enabled
             if self.adaptive_manager is not None:
@@ -2348,6 +2388,17 @@ class NetworkTrainer:
                     data = json.load(f)
                 steps_from_state = data["current_step"]
                 logger.info(f"load train state from {train_state_file}: {data}")
+
+            schedule_state_file = os.path.join(input_dir, "resolution_schedule_state.json")
+            if resolution_schedule is not None:
+                if not os.path.exists(schedule_state_file):
+                    if not args.resolution_schedule_force_resume:
+                        raise ValueError("resume state has no resolution schedule metadata; use --resolution_schedule_force_resume to override")
+                else:
+                    with open(schedule_state_file, "r", encoding="utf-8") as f:
+                        saved_schedule_state = json.load(f)
+                    if saved_schedule_state != get_resolution_schedule_state() and not args.resolution_schedule_force_resume:
+                        raise ValueError("resume resolution schedule or dataset differs from saved state; use --resolution_schedule_force_resume to override")
 
             # load adaptive timestep sampler state if available
             if self.adaptive_manager is not None:
@@ -3045,7 +3096,30 @@ class NetworkTrainer:
             bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]",
         )
 
+        active_resolution_stage = None
+
         for epoch in range(epoch_to_start, num_train_epochs):
+            if resolution_schedule is not None:
+                stage = resolution_schedule.stage_for_step(global_step)
+                if active_resolution_stage != stage:
+                    if active_resolution_stage is not None or stage.start_step != 0:
+                        accelerator.print(
+                            f"Switching Anima resolution stage: {active_resolution_stage.resolution} -> {stage.resolution}, "
+                            f"batch {active_resolution_stage.batch_size} -> {stage.batch_size}"
+                        )
+                        apply_stage_to_dataset_group(train_dataset_group, stage)
+                        args.train_batch_size = stage.batch_size
+                        train_dataset_group.set_current_strategies()
+                        if cache_latents:
+                            vae.to(accelerator.device, dtype=vae_dtype)
+                            vae.requires_grad_(False)
+                            vae.eval()
+                            train_dataset_group.new_cache_latents(vae, accelerator)
+                            vae.to("cpu")
+                            clean_memory_on_device(accelerator.device)
+                        train_dataloader = create_train_dataloader()
+                        train_dataset_group.set_max_train_steps(args.max_train_steps)
+                    active_resolution_stage = stage
             current_epoch.value = epoch + 1
             accelerator.print(f"\nepoch {current_epoch.value}/{num_train_epochs}\n")
 
@@ -3451,6 +3525,8 @@ class NetworkTrainer:
                     accumulated_samples = 0
 
                 if global_step >= args.max_train_steps:
+                    break
+                if resolution_schedule is not None and resolution_schedule.stage_for_step(global_step) != active_resolution_stage:
                     break
 
             # END OF EPOCH

@@ -27,6 +27,17 @@ class ResolutionSchedule:
         self.total_steps = total_steps
 
     @classmethod
+    def from_value(cls, value: Any, total_steps: int) -> "ResolutionSchedule":
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ResolutionScheduleError("resolution_schedule must be a JSON array") from error
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            raise ResolutionScheduleError("resolution_schedule must be a list of stages")
+        return cls.from_entries(value, total_steps)
+
+    @classmethod
     def from_entries(cls, entries: Sequence[Mapping[str, Any]], total_steps: int) -> "ResolutionSchedule":
         if total_steps <= 0:
             raise ResolutionScheduleError("total_steps must be greater than zero")

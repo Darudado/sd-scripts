@@ -28,6 +28,7 @@ from library.custom_train_functions import (
     apply_snr_weight_for_flow_matching,
     maybe_apply_antithetic_noise_pairing,
 )
+from library.anima_resolution_schedule import ResolutionSchedule
 import train_network
 from library.utils import setup_logging
 from library.ramtorch_util import apply_ramtorch_to_module
@@ -1296,6 +1297,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return train_util.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
 
     def update_metadata(self, metadata, args):
+        if getattr(args, "_resolution_schedule", None) is not None:
+            metadata["ss_resolution_schedule"] = json.dumps(args._resolution_schedule.to_dict(), separators=(",", ":"))
+            metadata["ss_resolution_schedule_fingerprint"] = args._resolution_schedule.fingerprint
         metadata["ss_weighting_scheme"] = args.weighting_scheme
         metadata["ss_logit_mean"] = args.logit_mean
         metadata["ss_logit_std"] = args.logit_std
@@ -1390,6 +1394,17 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     # Anima-specific default: lower cfm_lambda than the SDXL default of 0.05
     parser.set_defaults(cfm_lambda=0.02)
+    parser.add_argument(
+        "--resolution_schedule",
+        type=str,
+        default=None,
+        help="JSON/TOML list of sequential Anima stages: resolution, percent (except final automatic stage), batch_size.",
+    )
+    parser.add_argument(
+        "--resolution_schedule_force_resume",
+        action="store_true",
+        help="allow resuming despite a changed resolution schedule or dataset signature",
+    )
     parser.add_argument("--ileco", action="store_true", help="enable dataset-backed iLECO prompt-to-prompt training")
     parser.add_argument("--ileco_original_prompt", type=str, default="", help="original prompt for single-pair iLECO")
     parser.add_argument("--ileco_target_prompt", type=str, default=None, help="target prompt for single-pair iLECO")
@@ -1425,6 +1440,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
+
+    if args.resolution_schedule is not None:
+        if args.max_train_epochs is not None:
+            parser.error("resolution_schedule requires max_train_steps, not max_train_epochs")
+        args._resolution_schedule = ResolutionSchedule.from_value(args.resolution_schedule, args.max_train_steps)
 
     # Automatically switch to Anima-specific LoRA module if generic one is provided
     if args.network_module == "networks.lora":
