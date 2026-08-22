@@ -115,6 +115,40 @@ class ResolutionScheduleTest(unittest.TestCase):
         self.assertIsNone(image.latents_npz)
         self.assertIsNone(image.latents_aug_variants)
 
+    def test_stage_rebuild_refreshes_concat_dataset_lengths(self):
+        class Image:
+            latents = None
+            latents_flipped = None
+            latents_npz = None
+            latents_aug_variants = None
+
+        class Dataset:
+            width = height = size = 1024
+            batch_size = 1
+            enable_bucket = False
+            bucket_no_upscale = False
+            bucket_manager = None
+            image_data = {"image": Image()}
+
+            def __init__(self):
+                self.buckets_indices = [object(), object(), object(), object(), object()]
+
+            def __len__(self):
+                return len(self.buckets_indices)
+
+            def make_buckets(self):
+                self.buckets_indices = [object(), object()]
+
+        dataset = Dataset()
+        group = type("Group", (), {"datasets": [dataset], "cumulative_sizes": [len(dataset)]})()
+        stage = ResolutionSchedule.from_entries(
+            [{"resolution": 512, "batch_size": 4}], total_steps=10
+        ).stages[0]
+
+        apply_stage_to_dataset_group(group, stage)
+
+        self.assertEqual(group.cumulative_sizes, [len(dataset)])
+
     def test_stage_cache_restores_precomputed_latents_without_rebuilding(self):
         class Image:
             def __init__(self):
@@ -135,12 +169,15 @@ class ResolutionScheduleTest(unittest.TestCase):
                 self.buckets_indices = None
                 self.image_data = {"image": Image()}
 
+            def __len__(self):
+                return len(self.buckets_indices or [])
+
             def make_buckets(self):
                 image = self.image_data["image"]
                 image.bucket_reso = (self.width, self.height)
                 image.resized_size = (self.width, self.height)
                 self.bucket_manager = {"resolution": self.width}
-                self.buckets_indices = [self.width]
+                self.buckets_indices = [self.width] * (2 if self.width == 512 else 1)
 
         stages = ResolutionSchedule.from_entries(
             [
@@ -150,7 +187,7 @@ class ResolutionScheduleTest(unittest.TestCase):
             total_steps=10,
         ).stages
         dataset = Dataset()
-        group = type("Group", (), {"datasets": [dataset]})()
+        group = type("Group", (), {"datasets": [dataset], "cumulative_sizes": [1]})()
         cache = ResolutionStageCache()
 
         apply_stage_to_dataset_group(group, stages[0])
@@ -167,6 +204,7 @@ class ResolutionScheduleTest(unittest.TestCase):
         self.assertEqual(dataset.batch_size, 4)
         self.assertEqual(dataset.bucket_manager, {"resolution": 512})
         self.assertEqual(dataset.image_data["image"].latents, "512-latents")
+        self.assertEqual(group.cumulative_sizes, [2])
 
     def test_rebuilt_dataloader_is_prepared_for_accelerator_device_transfer(self):
         class Accelerator:

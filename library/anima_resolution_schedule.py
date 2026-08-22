@@ -197,6 +197,19 @@ class ResolutionStageCache:
                 image_info = dataset.image_data[image_key]
                 for attribute, value in values.items():
                     setattr(image_info, attribute, value)
+        refresh_dataset_group_cumulative_sizes(dataset_group)
+
+
+def refresh_dataset_group_cumulative_sizes(dataset_group: Any) -> None:
+    """Refresh ConcatDataset's cached child lengths after a stage changes them."""
+
+    if hasattr(dataset_group, "cumulative_sizes"):
+        total = 0
+        cumulative_sizes = []
+        for dataset in dataset_group.datasets:
+            total += len(dataset)
+            cumulative_sizes.append(total)
+        dataset_group.cumulative_sizes = cumulative_sizes
 
 
 def prepare_rebuilt_dataloader(accelerator: Any, factory: Callable[[], Any], previous: Any = None) -> Any:
@@ -232,3 +245,4 @@ def apply_stage_to_dataset_group(dataset_group: Any, stage: ResolutionStage) -> 
             image_info.latents_aug_variants = None
 
         dataset.make_buckets()
+    refresh_dataset_group_cumulative_sizes(dataset_group)
