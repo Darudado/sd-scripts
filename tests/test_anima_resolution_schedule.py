@@ -5,7 +5,9 @@ from library.anima_resolution_schedule import (
     ResolutionSchedule,
     ResolutionScheduleError,
     apply_stage_to_dataset_group,
+    has_remaining_training_steps,
     prepare_rebuilt_dataloader,
+    resolution_disk_cache_key,
 )
 
 
@@ -169,6 +171,7 @@ class ResolutionScheduleTest(unittest.TestCase):
     def test_rebuilt_dataloader_is_prepared_for_accelerator_device_transfer(self):
         class Accelerator:
             def __init__(self):
+                self._dataloaders = ["old-stage-loader"]
                 self.prepared = None
 
             def prepare_data_loader(self, dataloader):
@@ -177,10 +180,27 @@ class ResolutionScheduleTest(unittest.TestCase):
 
         accelerator = Accelerator()
 
-        rebuilt = prepare_rebuilt_dataloader(accelerator, lambda: "raw-stage-loader")
+        rebuilt = prepare_rebuilt_dataloader(accelerator, lambda: "raw-stage-loader", previous="old-stage-loader")
 
         self.assertEqual(accelerator.prepared, "raw-stage-loader")
         self.assertEqual(rebuilt, ("prepared", "raw-stage-loader"))
+        self.assertNotIn("old-stage-loader", accelerator._dataloaders)
+
+    def test_resolution_cache_key_reuses_disk_latents_for_same_resolution(self):
+        stages = ResolutionSchedule.from_entries(
+            [
+                {"resolution": 512, "percent": 50, "batch_size": 4},
+                {"resolution": 512, "batch_size": 2},
+            ],
+            total_steps=100,
+        ).stages
+
+        self.assertEqual(resolution_disk_cache_key(stages[0]), resolution_disk_cache_key(stages[1]))
+        self.assertEqual(resolution_disk_cache_key(stages[0]), "resolution-512")
+
+    def test_training_stops_before_looking_up_a_stage_past_total_steps(self):
+        self.assertTrue(has_remaining_training_steps(9, 10))
+        self.assertFalse(has_remaining_training_steps(10, 10))
 
 
 if __name__ == "__main__":

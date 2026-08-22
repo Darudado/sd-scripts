@@ -118,6 +118,18 @@ class ResolutionSchedule:
         return sha256(encoded).hexdigest()
 
 
+def has_remaining_training_steps(global_step: int, total_steps: int) -> bool:
+    """Return whether a resolution stage can be selected for this step."""
+
+    return global_step < total_steps
+
+
+def resolution_disk_cache_key(stage: ResolutionStage) -> str:
+    """Stable disk-cache namespace for a target resolution, independent of its schedule position."""
+
+    return f"resolution-{stage.resolution}"
+
+
 class ResolutionStageCache:
     """In-memory snapshots of dataset/bucket state prepared before training.
 
@@ -187,10 +199,14 @@ class ResolutionStageCache:
                     setattr(image_info, attribute, value)
 
 
-def prepare_rebuilt_dataloader(accelerator: Any, factory: Callable[[], Any]) -> Any:
-    """Build a stage DataLoader and apply Accelerate's device-transfer wrapper."""
+def prepare_rebuilt_dataloader(accelerator: Any, factory: Callable[[], Any], previous: Any = None) -> Any:
+    """Build a stage DataLoader and replace its predecessor in Accelerate's checkpoint registry."""
 
-    return accelerator.prepare_data_loader(factory())
+    prepared = accelerator.prepare_data_loader(factory())
+    dataloaders = getattr(accelerator, "_dataloaders", None)
+    if previous is not None and isinstance(dataloaders, list) and previous in dataloaders:
+        dataloaders.remove(previous)
+    return prepared
 
 
 def apply_stage_to_dataset_group(dataset_group: Any, stage: ResolutionStage) -> None:

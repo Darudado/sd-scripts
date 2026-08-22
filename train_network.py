@@ -47,7 +47,13 @@ from library.config_util import (
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
 from library.adaptive_timestep_sampler import AdaptiveTimestepManager
-from library.anima_resolution_schedule import ResolutionStageCache, apply_stage_to_dataset_group, prepare_rebuilt_dataloader
+from library.anima_resolution_schedule import (
+    ResolutionStageCache,
+    apply_stage_to_dataset_group,
+    has_remaining_training_steps,
+    prepare_rebuilt_dataloader,
+    resolution_disk_cache_key,
+)
 from library.custom_train_functions import (
     apply_snr_weight,
     apply_snr_weight_for_flow_matching,
@@ -1745,9 +1751,7 @@ class NetworkTrainer:
 
             if resolution_schedule is not None and latents_caching_strategy.cache_to_disk:
                 initial_stage = resolution_schedule.stage_for_step(0)
-                latents_caching_strategy.resolution_schedule_cache_key = (
-                    f"{initial_stage.start_step}-{initial_stage.end_step}-{initial_stage.resolution}"
-                )
+                latents_caching_strategy.resolution_schedule_cache_key = resolution_disk_cache_key(initial_stage)
             train_dataset_group.new_cache_latents(vae, accelerator)
             if val_dataset_group is not None:
                 val_dataset_group.new_cache_latents(vae, accelerator)
@@ -1771,9 +1775,7 @@ class NetworkTrainer:
                     )
                     apply_stage_to_dataset_group(train_dataset_group, stage)
                     if latents_caching_strategy.cache_to_disk:
-                        latents_caching_strategy.resolution_schedule_cache_key = (
-                            f"{stage.start_step}-{stage.end_step}-{stage.resolution}"
-                        )
+                        latents_caching_strategy.resolution_schedule_cache_key = resolution_disk_cache_key(stage)
                     train_dataset_group.set_current_strategies()
                     train_dataset_group.new_cache_latents(vae, accelerator)
                     if aug_refresh_epochs > 0 and latents_aug_variants > 1:
@@ -3138,6 +3140,8 @@ class NetworkTrainer:
         active_resolution_stage = None
 
         for epoch in range(epoch_to_start, num_train_epochs):
+            if not has_remaining_training_steps(global_step, args.max_train_steps):
+                break
             if resolution_schedule is not None:
                 stage = resolution_schedule.stage_for_step(global_step)
                 if active_resolution_stage != stage:
@@ -3152,7 +3156,9 @@ class NetworkTrainer:
                             apply_stage_to_dataset_group(train_dataset_group, stage)
                         args.train_batch_size = stage.batch_size
                         train_dataset_group.set_current_strategies()
-                        train_dataloader = prepare_rebuilt_dataloader(accelerator, create_train_dataloader)
+                        train_dataloader = prepare_rebuilt_dataloader(
+                            accelerator, create_train_dataloader, previous=train_dataloader
+                        )
                         train_dataset_group.set_max_train_steps(args.max_train_steps)
                     active_resolution_stage = stage
             current_epoch.value = epoch + 1
