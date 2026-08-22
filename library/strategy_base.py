@@ -578,6 +578,9 @@ class LatentsCachingStrategy:
         self._batch_size = batch_size
         self.skip_disk_cache_validity_check = skip_disk_cache_validity_check
         self.cache_dtype = normalize_cache_dtype(cache_dtype)
+        # Set temporarily by scheduled training so each stage has independent
+        # disk-cache files even when source images are the same.
+        self.resolution_schedule_cache_key: Optional[str] = None
 
     @classmethod
     def set_strategy(cls, strategy):

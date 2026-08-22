@@ -47,7 +47,7 @@ from library.config_util import (
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
 from library.adaptive_timestep_sampler import AdaptiveTimestepManager
-from library.anima_resolution_schedule import apply_stage_to_dataset_group
+from library.anima_resolution_schedule import ResolutionStageCache, apply_stage_to_dataset_group
 from library.custom_train_functions import (
     apply_snr_weight,
     apply_snr_weight_for_flow_matching,
@@ -1737,19 +1737,59 @@ class NetworkTrainer:
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
         # prepare dataset for latents caching if needed
+        resolution_stage_cache = None
         if cache_latents:
             vae.to(accelerator.device, dtype=vae_dtype)
             vae.requires_grad_(False)
             vae.eval()
 
+            if resolution_schedule is not None and latents_caching_strategy.cache_to_disk:
+                initial_stage = resolution_schedule.stage_for_step(0)
+                latents_caching_strategy.resolution_schedule_cache_key = (
+                    f"{initial_stage.start_step}-{initial_stage.end_step}-{initial_stage.resolution}"
+                )
             train_dataset_group.new_cache_latents(vae, accelerator)
             if val_dataset_group is not None:
                 val_dataset_group.new_cache_latents(vae, accelerator)
 
+            # Cache every scheduled resolution while the VAE is already loaded.
+            # Later stage changes only restore their cached bucket/latent state.
+            if resolution_schedule is not None:
+                resolution_stage_cache = ResolutionStageCache()
+                initial_stage = resolution_schedule.stage_for_step(0)
+                if aug_refresh_epochs > 0 and latents_aug_variants > 1:
+                    vae_encode_fn = lambda imgs: self.encode_images_to_latents(args, vae, imgs)
+                    train_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
+                resolution_stage_cache.capture(train_dataset_group, initial_stage)
+                for stage in resolution_schedule.stages[1:]:
+                    logger.info(
+                        "Pre-caching Anima resolution stage: max=%s, batch=%s, steps=%s-%s",
+                        stage.resolution,
+                        stage.batch_size,
+                        stage.start_step,
+                        stage.end_step,
+                    )
+                    apply_stage_to_dataset_group(train_dataset_group, stage)
+                    if latents_caching_strategy.cache_to_disk:
+                        latents_caching_strategy.resolution_schedule_cache_key = (
+                            f"{stage.start_step}-{stage.end_step}-{stage.resolution}"
+                        )
+                    train_dataset_group.set_current_strategies()
+                    train_dataset_group.new_cache_latents(vae, accelerator)
+                    if aug_refresh_epochs > 0 and latents_aug_variants > 1:
+                        vae_encode_fn = lambda imgs: self.encode_images_to_latents(args, vae, imgs)
+                        train_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
+                    resolution_stage_cache.capture(train_dataset_group, stage)
+
+                latents_caching_strategy.resolution_schedule_cache_key = None
+                resolution_stage_cache.restore(train_dataset_group, initial_stage)
+                train_dataset_group.set_current_strategies()
+
             # Initial in-memory variant generation (VAE is still on GPU)
             if aug_refresh_epochs > 0 and latents_aug_variants > 1:
                 vae_encode_fn = lambda imgs: self.encode_images_to_latents(args, vae, imgs)
-                train_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
+                if resolution_schedule is None:
+                    train_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
                 if val_dataset_group is not None:
                     val_dataset_group.refresh_latent_variants(vae_encode_fn, accelerator.device, vae_dtype)
                 logger.info("Initial latent augmentation variants generated in-memory.")
@@ -3106,16 +3146,12 @@ class NetworkTrainer:
                             f"Switching Anima resolution stage: {active_resolution_stage.resolution} -> {stage.resolution}, "
                             f"batch {active_resolution_stage.batch_size} -> {stage.batch_size}"
                         )
-                        apply_stage_to_dataset_group(train_dataset_group, stage)
+                        if resolution_stage_cache is not None:
+                            resolution_stage_cache.restore(train_dataset_group, stage)
+                        else:
+                            apply_stage_to_dataset_group(train_dataset_group, stage)
                         args.train_batch_size = stage.batch_size
                         train_dataset_group.set_current_strategies()
-                        if cache_latents:
-                            vae.to(accelerator.device, dtype=vae_dtype)
-                            vae.requires_grad_(False)
-                            vae.eval()
-                            train_dataset_group.new_cache_latents(vae, accelerator)
-                            vae.to("cpu")
-                            clean_memory_on_device(accelerator.device)
                         train_dataloader = create_train_dataloader()
                         train_dataset_group.set_max_train_steps(args.max_train_steps)
                     active_resolution_stage = stage

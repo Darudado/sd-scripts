@@ -118,6 +118,75 @@ class ResolutionSchedule:
         return sha256(encoded).hexdigest()
 
 
+class ResolutionStageCache:
+    """In-memory snapshots of dataset/bucket state prepared before training.
+
+    The snapshots intentionally retain tensor references. Latent tensors are
+    already CPU-resident after caching; copying them would duplicate the RAM
+    required for each scheduled resolution.
+    """
+
+    _DATASET_ATTRIBUTES = (
+        "width",
+        "height",
+        "size",
+        "batch_size",
+        "enable_bucket",
+        "bucket_no_upscale",
+        "bucket_manager",
+        "buckets_indices",
+        "_length",
+    )
+    _IMAGE_ATTRIBUTES = (
+        "bucket_reso",
+        "resized_size",
+        "latents",
+        "latents_flipped",
+        "latents_npz",
+        "latents_original_size",
+        "latents_crop_ltrb",
+        "latents_aug_variants",
+    )
+
+    def __init__(self) -> None:
+        self._snapshots: dict[ResolutionStage, list[tuple[dict[str, Any], dict[str, dict[str, Any]]]]] = {}
+
+    def capture(self, dataset_group: Any, stage: ResolutionStage) -> None:
+        datasets = []
+        for dataset in dataset_group.datasets:
+            dataset_state = {
+                attribute: getattr(dataset, attribute)
+                for attribute in self._DATASET_ATTRIBUTES
+                if hasattr(dataset, attribute)
+            }
+            image_state = {
+                image_key: {
+                    attribute: getattr(image_info, attribute)
+                    for attribute in self._IMAGE_ATTRIBUTES
+                    if hasattr(image_info, attribute)
+                }
+                for image_key, image_info in dataset.image_data.items()
+            }
+            datasets.append((dataset_state, image_state))
+        self._snapshots[stage] = datasets
+
+    def restore(self, dataset_group: Any, stage: ResolutionStage) -> None:
+        try:
+            snapshots = self._snapshots[stage]
+        except KeyError as error:
+            raise ResolutionScheduleError(f"latents were not pre-cached for stage starting at step {stage.start_step}") from error
+        if len(snapshots) != len(dataset_group.datasets):
+            raise ResolutionScheduleError("dataset count changed after resolution-stage caching")
+
+        for dataset, (dataset_state, image_state) in zip(dataset_group.datasets, snapshots):
+            for attribute, value in dataset_state.items():
+                setattr(dataset, attribute, value)
+            for image_key, values in image_state.items():
+                image_info = dataset.image_data[image_key]
+                for attribute, value in values.items():
+                    setattr(image_info, attribute, value)
+
+
 def apply_stage_to_dataset_group(dataset_group: Any, stage: ResolutionStage) -> None:
     """Rebuild dataset buckets for one stage without replacing the dataset object.
 

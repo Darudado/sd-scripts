@@ -308,7 +308,10 @@ class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
         return self.ANIMA_LATENTS_NPZ_SUFFIX
 
     def get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
-        return os.path.splitext(absolute_path)[0] + f"_{image_size[0]:04d}x{image_size[1]:04d}" + self.ANIMA_LATENTS_NPZ_SUFFIX
+        schedule_suffix = ""
+        if self.resolution_schedule_cache_key is not None:
+            schedule_suffix = f"_schedule_{self.resolution_schedule_cache_key}"
+        return os.path.splitext(absolute_path)[0] + schedule_suffix + f"_{image_size[0]:04d}x{image_size[1]:04d}" + self.ANIMA_LATENTS_NPZ_SUFFIX
 
     def is_disk_cached_latents_expected(
         self,

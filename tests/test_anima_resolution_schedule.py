@@ -1,6 +1,7 @@
 import unittest
 
 from library.anima_resolution_schedule import (
+    ResolutionStageCache,
     ResolutionSchedule,
     ResolutionScheduleError,
     apply_stage_to_dataset_group,
@@ -110,6 +111,59 @@ class ResolutionScheduleTest(unittest.TestCase):
         self.assertIsNone(image.latents_flipped)
         self.assertIsNone(image.latents_npz)
         self.assertIsNone(image.latents_aug_variants)
+
+    def test_stage_cache_restores_precomputed_latents_without_rebuilding(self):
+        class Image:
+            def __init__(self):
+                self.latents = None
+                self.latents_flipped = None
+                self.latents_npz = None
+                self.latents_aug_variants = None
+                self.bucket_reso = None
+                self.resized_size = None
+
+        class Dataset:
+            def __init__(self):
+                self.width = self.height = self.size = 1024
+                self.batch_size = 1
+                self.enable_bucket = False
+                self.bucket_no_upscale = False
+                self.bucket_manager = None
+                self.buckets_indices = None
+                self.image_data = {"image": Image()}
+
+            def make_buckets(self):
+                image = self.image_data["image"]
+                image.bucket_reso = (self.width, self.height)
+                image.resized_size = (self.width, self.height)
+                self.bucket_manager = {"resolution": self.width}
+                self.buckets_indices = [self.width]
+
+        stages = ResolutionSchedule.from_entries(
+            [
+                {"resolution": 512, "percent": 50, "batch_size": 4},
+                {"resolution": 1024, "batch_size": 2},
+            ],
+            total_steps=10,
+        ).stages
+        dataset = Dataset()
+        group = type("Group", (), {"datasets": [dataset]})()
+        cache = ResolutionStageCache()
+
+        apply_stage_to_dataset_group(group, stages[0])
+        dataset.image_data["image"].latents = "512-latents"
+        cache.capture(group, stages[0])
+
+        apply_stage_to_dataset_group(group, stages[1])
+        dataset.image_data["image"].latents = "1024-latents"
+        cache.capture(group, stages[1])
+
+        cache.restore(group, stages[0])
+
+        self.assertEqual(dataset.width, 512)
+        self.assertEqual(dataset.batch_size, 4)
+        self.assertEqual(dataset.bucket_manager, {"resolution": 512})
+        self.assertEqual(dataset.image_data["image"].latents, "512-latents")
 
 
 if __name__ == "__main__":
