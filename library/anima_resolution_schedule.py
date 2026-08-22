@@ -105,3 +105,28 @@ class ResolutionSchedule:
     def fingerprint(self) -> str:
         encoded = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
         return sha256(encoded).hexdigest()
+
+
+def apply_stage_to_dataset_group(dataset_group: Any, stage: ResolutionStage) -> None:
+    """Rebuild dataset buckets for one stage without replacing the dataset object.
+
+    ``bucket_no_upscale`` preserves native resolution for small images while the
+    stage square limits the maximum image area for larger images.
+    """
+
+    for dataset in dataset_group.datasets:
+        dataset.width = stage.resolution
+        dataset.height = stage.resolution
+        dataset.size = stage.resolution
+        dataset.batch_size = stage.batch_size
+        dataset.enable_bucket = True
+        dataset.bucket_no_upscale = True
+        dataset.bucket_manager = None
+
+        for image_info in dataset.image_data.values():
+            image_info.latents = None
+            image_info.latents_flipped = None
+            image_info.latents_npz = None
+            image_info.latents_aug_variants = None
+
+        dataset.make_buckets()
