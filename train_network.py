@@ -1983,11 +1983,6 @@ class NetworkTrainer:
                 f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
             )
 
-        if resolution_schedule is not None:
-            # Stage boundaries can interrupt a natural dataset epoch. Use the
-            # global optimizer-step budget as the only termination condition.
-            num_train_epochs = args.max_train_steps
-
         # データセット側にも学習ステップを送信
         train_dataset_group.set_max_train_steps(args.max_train_steps)
 
@@ -2443,6 +2438,10 @@ class NetworkTrainer:
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+        if resolution_schedule is not None:
+            # A stage boundary deliberately ends the current DataLoader pass;
+            # enough outer iterations must remain to activate every stage.
+            num_train_epochs = max(num_train_epochs, args.max_train_steps)
         if (args.save_n_epoch_ratio is not None) and (args.save_n_epoch_ratio > 0):
             args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
