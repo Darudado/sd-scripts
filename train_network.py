@@ -145,6 +145,9 @@ class NetworkTrainer:
         self.hf_prediction_mode = None   # set by setup_hf_objective / subclasses (None => base derives)
         self.hf_timesteps_in_sigma = False  # True for Anima (timesteps already in [0, 1])
         self.hf_eps_train = 5e-2         # train-time epsilon for x0-residual models (ChromaRadiance raw)
+        self.hf_high_noise_snr_cut = (1.0 / 3.0) ** 2  # equivalent to flow sigma_cut=0.75
+        self.hf_high_noise_min_weight = 0.10  # retain a small high-noise HF signal
+        self.hf_high_noise_power = 1.0       # attenuation exponent above the cutoff
         self._hf_noisy_latents = None    # stored by get_noise_pred_and_target (4D pre-pack)
         self.hf_loss_value = None        # detached scaled HF contribution for logging (tensor)
 
@@ -579,7 +582,15 @@ class NetworkTrainer:
         self.hf_scale = float(getattr(args, "hf_scale", 0.0) or 0.0)
         self.hf_exponent = float(getattr(args, "hf_exponent", 1.0) or 1.0)
         self.hf_patch = int(getattr(args, "hf_patch", 2) or 2)
+        self.hf_high_noise_min_weight = float(getattr(args, "hf_high_noise_min_weight", 0.10))
+        self.hf_high_noise_power = float(getattr(args, "hf_high_noise_power", 1.0))
+        self.hf_high_noise_snr_cut = float(getattr(args, "hf_high_noise_snr_cut", 1.0 / 9.0))
         hf_token_loss.validate_hf_args(self.hf_scale, self.hf_exponent, self.hf_patch)
+        hf_token_loss.validate_hf_high_noise_gate_args(
+            self.hf_high_noise_min_weight,
+            self.hf_high_noise_power,
+            self.hf_high_noise_snr_cut,
+        )
         if self.hf_prediction_mode is None:
             if getattr(args, "flow_model", False):
                 self.hf_prediction_mode = "flow"
@@ -590,7 +601,10 @@ class NetworkTrainer:
         if self.hf_scale > 0.0:
             logger.info(
                 f"High-Frequency Token latent loss enabled: scale={self.hf_scale}, "
-                f"exponent={self.hf_exponent}, patch={self.hf_patch}, mode={self.hf_prediction_mode}"
+                f"exponent={self.hf_exponent}, patch={self.hf_patch}, mode={self.hf_prediction_mode}, "
+                f"high_noise_snr_cut={self.hf_high_noise_snr_cut}, "
+                f"high_noise_min_weight={self.hf_high_noise_min_weight}, "
+                f"high_noise_power={self.hf_high_noise_power}"
             )
 
     def build_adaptive_model_fn(self, unet, accelerator, weight_dtype):
@@ -1195,13 +1209,47 @@ class NetworkTrainer:
         # existing periodic sync, not on the hot path).
         self.hf_loss_value = None
         if is_train and self._hf_noisy_latents is not None:
+            # HF-only one-sided high-noise gate. Low-noise samples remain exactly
+            # at weight 1; the main loss weighting is not modified.
+            hf_weighting = weighting
+            if self.hf_prediction_mode in (
+                "flow",
+                "x0_residual_eps",
+                "x0_direct",
+                "vpred_ddpm",
+                "eps_ddpm",
+            ):
+                hf_snr = hf_token_loss.hf_snr_from_timesteps(
+                    timesteps,
+                    mode=self.hf_prediction_mode,
+                    noise_scheduler=noise_scheduler,
+                    timesteps_in_sigma=self.hf_timesteps_in_sigma,
+                )
+                # Epsilon -> x0 reconstruction has a 1/SNR gradient factor;
+                # a zero floor is required to cap that factor at low SNR.
+                hf_min_gate = (
+                    0.0 if self.hf_prediction_mode == "eps_ddpm" else self.hf_high_noise_min_weight
+                )
+                hf_gate = hf_token_loss.hf_one_sided_snr_gate(
+                    hf_snr,
+                    snr_cut=self.hf_high_noise_snr_cut,
+                    min_gate=hf_min_gate,
+                    power=self.hf_high_noise_power,
+                )
+                if hf_weighting is None:
+                    hf_weighting = hf_gate
+                else:
+                    hf_weighting = (
+                        hf_weighting.detach().reshape(-1).to(dtype=hf_gate.dtype) * hf_gate
+                    )
+
             final_loss, self.hf_loss_value = hf_token_loss.hf_apply_term(
                 final_loss,
                 noise_pred,
                 clean=latents,
                 noisy=self._hf_noisy_latents,
                 timesteps=timesteps,
-                weighting=weighting,
+                weighting=hf_weighting,
                 scale=self.hf_scale,
                 exponent=self.hf_exponent,
                 patch=self.hf_patch,
@@ -2503,6 +2551,9 @@ class NetworkTrainer:
             "ss_hf_scale": self.hf_scale if self.hf_scale > 0.0 else 0.0,
             "ss_hf_exponent": self.hf_exponent if self.hf_scale > 0.0 else None,
             "ss_hf_patch": self.hf_patch if self.hf_scale > 0.0 else None,
+            "ss_hf_high_noise_snr_cut": self.hf_high_noise_snr_cut if self.hf_scale > 0.0 else None,
+            "ss_hf_high_noise_min_weight": self.hf_high_noise_min_weight if self.hf_scale > 0.0 else None,
+            "ss_hf_high_noise_power": self.hf_high_noise_power if self.hf_scale > 0.0 else None,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -4033,6 +4084,25 @@ def setup_parser() -> argparse.ArgumentParser:
         help="HF token patch size; MUST equal the model's own patchify size. "
         "2 for latent-space models (SD1.5/SD2/SDXL/Flux/SD3/Lumina/Hunyuan/Anima), "
         "16 for pixel-space models (e.g. ChromaRadiance).",
+    )
+    parser.add_argument(
+        "--hf_high_noise_snr_cut",
+        type=float,
+        default=1.0 / 9.0,
+        help="Universal SNR cutoff for HF high-noise attenuation (default: 0.111111, "
+        "equivalent to flow sigma 0.75). Must be > 0.",
+    )
+    parser.add_argument(
+        "--hf_high_noise_min_weight",
+        type=float,
+        default=0.10,
+        help="Minimum HF multiplier at the highest flow noise levels (default: 0.10). Range: [0, 1].",
+    )
+    parser.add_argument(
+        "--hf_high_noise_power",
+        type=float,
+        default=1.0,
+        help="Power controlling high-noise HF attenuation below hf_high_noise_snr_cut (default: 1.0).",
     )
 
     parser.add_argument(

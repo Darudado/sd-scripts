@@ -21,7 +21,8 @@ Invariants (spec §5, do not weaken):
   4. Native-dtype arithmetic (shifts/adds only — no FFT).
   5. Weights come from `clean` only, detached from the autograd graph.
   6. `patch` must equal the model's own patchify size; H, W must be divisible by patch.
-  7. No timestep gate (the t^2 factor from the x0 domain is accepted).
+  7. Supported prediction modes use an HF-only one-sided high-noise SNR gate;
+     low-noise samples are unchanged and the main loss weighting is never modified.
   8. Caption-independent: never touches target_v or the dropout mask.
 """
 
@@ -34,6 +35,97 @@ HF_EPS = 1e-6
 # Default train-time epsilon for x0-residual models whose training target is
 # v = (noisy - x0) / (t + eps_train) (e.g. ChromaRadiance `raw` prediction).
 HF_DEFAULT_EPS_TRAIN = 5e-2
+
+
+def hf_sigma_from_timesteps(
+    timesteps: torch.Tensor,
+    noise_scheduler=None,
+    timesteps_in_sigma: bool = False,
+) -> torch.Tensor:
+    """Convert trainer timesteps to the sigma convention used by HF reconstruction.
+
+    Flow trainers in this repository use either normalized sigma values directly
+    (Anima) or discrete timestep values in ``[0, num_train_timesteps]``.
+    """
+    t = timesteps.detach().to(dtype=torch.float64).reshape(-1)
+    if timesteps_in_sigma:
+        sigma = t
+    else:
+        if noise_scheduler is None:
+            raise ValueError("noise_scheduler is required for discrete flow timesteps")
+        sigma = t / float(noise_scheduler.config.num_train_timesteps)
+    return sigma.clamp(min=1e-6, max=1.0)
+
+
+def hf_one_sided_snr_gate(
+    snr: torch.Tensor,
+    snr_cut: float,
+    min_gate: float = 0.10,
+    power: float = 1.0,
+) -> torch.Tensor:
+    """Leave high-SNR samples unchanged and attenuate only low-SNR samples.
+
+    ``snr_cut`` is the boundary between the untouched low-noise region and the
+    attenuated high-noise region. Setting ``min_gate=0`` is useful for epsilon
+    prediction, whose x0 reconstruction has an inverse-SNR gradient factor.
+    """
+    if snr_cut <= 0.0:
+        raise ValueError("snr_cut must be > 0")
+    if not 0.0 <= min_gate <= 1.0:
+        raise ValueError("min_gate must be between 0 and 1")
+    if power <= 0.0:
+        raise ValueError("power must be > 0")
+
+    snr = snr.detach().to(dtype=torch.float64).reshape(-1).clamp(min=0.0)
+    high_noise_gate = (snr / float(snr_cut)).clamp(max=1.0).pow(float(power))
+    gate = torch.where(snr >= float(snr_cut), torch.ones_like(snr), high_noise_gate)
+    return gate.clamp(min=float(min_gate), max=1.0)
+
+
+def hf_snr_from_timesteps(
+    timesteps: torch.Tensor,
+    mode: str,
+    noise_scheduler=None,
+    timesteps_in_sigma: bool = False,
+) -> torch.Tensor:
+    """Compute SNR using the schedule appropriate for an HF prediction mode.
+
+    Flow modes and x0-direct models with a flow scheduler use the flow sigma
+    convention. DDPM modes and x0-direct models with a DDPM scheduler use the
+    scheduler's alpha-bar values.
+    """
+    if mode in ("flow", "x0_residual_eps") or (
+        mode == "x0_direct"
+        and (noise_scheduler is None or not hasattr(noise_scheduler, "alphas_cumprod"))
+    ):
+        sigma = hf_sigma_from_timesteps(
+            timesteps,
+            noise_scheduler=noise_scheduler,
+            timesteps_in_sigma=timesteps_in_sigma,
+        )
+        return ((1.0 - sigma) / sigma).square()
+
+    if noise_scheduler is None or not hasattr(noise_scheduler, "alphas_cumprod"):
+        raise ValueError(f"noise_scheduler with alphas_cumprod is required for mode '{mode}'")
+
+    acp = noise_scheduler.alphas_cumprod.to(device=timesteps.device, dtype=torch.float64)
+    ts = timesteps.detach().long().clamp(0, acp.numel() - 1)
+    alpha_bar = acp[ts].clamp(min=0.0, max=1.0)
+    return alpha_bar / (1.0 - alpha_bar).clamp_min(1e-6)
+
+
+def validate_hf_high_noise_gate_args(
+    min_gate: float,
+    power: float,
+    snr_cut: float,
+) -> None:
+    """Validate the one-sided high-noise gate configuration."""
+    if not 0.0 <= min_gate <= 1.0:
+        raise ValueError("hf_high_noise_min_weight must be between 0 and 1")
+    if power <= 0.0:
+        raise ValueError("hf_high_noise_power must be > 0")
+    if snr_cut <= 0.0:
+        raise ValueError("hf_high_noise_snr_cut must be > 0")
 
 
 def laplacian_energy(x: torch.Tensor) -> torch.Tensor:

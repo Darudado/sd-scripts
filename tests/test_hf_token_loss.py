@@ -41,6 +41,10 @@ from library.hf_token_loss import (
     hf_token_weights,
     hf_per_sample_loss,
     validate_hf_args,
+    validate_hf_high_noise_gate_args,
+    hf_sigma_from_timesteps,
+    hf_one_sided_snr_gate,
+    hf_snr_from_timesteps,
     hf_x0_hat,
     hf_apply_term,
 )
@@ -224,6 +228,97 @@ class TestWeights:
         right = w[:, 4:].mean()
         left = w[:, :4].mean()
         assert right > left, "Checkerboard (detail) tokens must be weighted higher"
+
+
+class TestHighNoiseSNRGate:
+    def test_low_noise_is_exactly_unchanged(self):
+        snr = torch.tensor([1e6, 9.0, 1.0 / 9.0], device=DEVICE, dtype=torch.float64)
+        gate = hf_one_sided_snr_gate(snr, snr_cut=1.0 / 9.0, min_gate=0.1, power=1.0)
+        assert torch.equal(gate, torch.ones_like(gate))
+
+    def test_only_high_noise_is_attenuated_and_floored(self):
+        snr = torch.tensor([1.0 / 9.0, 0.0625, 0.012345679, 0.0], device=DEVICE, dtype=torch.float64)
+        gate = hf_one_sided_snr_gate(snr, snr_cut=1.0 / 9.0, min_gate=0.1, power=1.0)
+        assert gate[0] == 1.0
+        assert gate[1] < 1.0
+        assert gate[2] < gate[1]
+        assert gate[3] == 0.1
+        assert torch.isfinite(gate).all()
+
+    def test_power_controls_high_noise_attenuation(self):
+        snr = torch.tensor([0.0625, 0.012345679], device=DEVICE, dtype=torch.float64)
+        linear = hf_one_sided_snr_gate(snr, snr_cut=1.0 / 9.0, min_gate=0.0, power=1.0)
+        squared = hf_one_sided_snr_gate(snr, snr_cut=1.0 / 9.0, min_gate=0.0, power=2.0)
+        assert torch.all(squared <= linear)
+        assert torch.all(squared < linear)
+
+    def test_timestep_conversion_matches_flow_convention(self):
+        scheduler = FakeScheduler(num_train_timesteps=1000)
+        timesteps = torch.tensor([0.0, 750.0, 1000.0], device=DEVICE, dtype=torch.float64)
+        sigma = hf_sigma_from_timesteps(timesteps, scheduler, timesteps_in_sigma=False)
+        torch.testing.assert_close(
+            sigma,
+            torch.tensor([1e-6, 0.75, 1.0], device=DEVICE, dtype=torch.float64),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_sigma_timesteps_are_used_directly(self):
+        sigma = hf_sigma_from_timesteps(
+            torch.tensor([0.2, 0.8], device=DEVICE, dtype=torch.float64),
+            timesteps_in_sigma=True,
+        )
+        torch.testing.assert_close(
+            sigma,
+            torch.tensor([0.2, 0.8], device=DEVICE, dtype=torch.float64),
+        )
+
+    def test_gate_validation(self):
+        validate_hf_high_noise_gate_args(0.1, 1.0, 1.0 / 9.0)
+        with pytest.raises(ValueError):
+            validate_hf_high_noise_gate_args(0.1, 1.0, 0.0)
+        with pytest.raises(ValueError):
+            validate_hf_high_noise_gate_args(1.1, 1.0, 1.0 / 9.0)
+        with pytest.raises(ValueError):
+            validate_hf_high_noise_gate_args(0.1, 0.0, 1.0 / 9.0)
+
+    def test_generic_snr_gate_leaves_high_snr_unchanged(self):
+        snr = torch.tensor([10.0, 1.0, 0.1, 0.0], device=DEVICE, dtype=torch.float64)
+        gate = hf_one_sided_snr_gate(snr, snr_cut=0.1, min_gate=0.1, power=1.0)
+        assert gate[0] == 1.0
+        assert gate[1] == 1.0
+        assert gate[2] == 1.0
+        assert gate[3] == 0.1
+
+    def test_eps_mode_uses_zero_floor_for_inverse_snr(self):
+        snr = torch.tensor([0.1, 0.01, 0.0], device=DEVICE, dtype=torch.float64)
+        gate = hf_one_sided_snr_gate(snr, snr_cut=0.1, min_gate=0.0, power=1.0)
+        expected = torch.tensor([1.0, 0.1, 0.0], device=DEVICE, dtype=torch.float64)
+        torch.testing.assert_close(gate, expected)
+
+    def test_ddpm_snr_from_timesteps(self):
+        scheduler = FakeScheduler(num_train_timesteps=1000)
+        timesteps = torch.tensor([0, 500, 900], device=DEVICE, dtype=torch.long)
+        snr = hf_snr_from_timesteps(timesteps, "vpred_ddpm", scheduler)
+        expected_alpha = scheduler.alphas_cumprod[timesteps]
+        expected = expected_alpha / (1.0 - expected_alpha).clamp_min(1e-6)
+        torch.testing.assert_close(snr, expected)
+
+    def test_flow_snr_from_timesteps(self):
+        scheduler = FakeScheduler(num_train_timesteps=1000)
+        timesteps = torch.tensor([250.0, 750.0], device=DEVICE, dtype=torch.float64)
+        snr = hf_snr_from_timesteps(timesteps, "flow", scheduler)
+        expected_sigma = timesteps / 1000.0
+        expected = ((1.0 - expected_sigma) / expected_sigma).square()
+        torch.testing.assert_close(snr, expected)
+
+    def test_x0_direct_uses_flow_snr_without_alpha_bar(self):
+        scheduler = SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
+        timesteps = torch.tensor([250.0, 750.0], device=DEVICE, dtype=torch.float64)
+        snr = hf_snr_from_timesteps(timesteps, "x0_direct", scheduler)
+        expected_sigma = timesteps / 1000.0
+        expected = ((1.0 - expected_sigma) / expected_sigma).square()
+        torch.testing.assert_close(snr, expected)
 
 
 # ──────────────────────────────────────────────
@@ -499,12 +594,23 @@ def test_cli_args_registered():
     assert ns.hf_scale == 0.0
     assert ns.hf_exponent == 1.0
     assert ns.hf_patch == 2
+    assert ns.hf_high_noise_snr_cut == pytest.approx(1.0 / 9.0)
+    assert ns.hf_high_noise_min_weight == 0.10
+    assert ns.hf_high_noise_power == 1.0
 
     # explicit values
-    ns = parser.parse_args(["--hf_scale", "0.5", "--hf_exponent", "2.0", "--hf_patch", "16"])
+    ns = parser.parse_args([
+        "--hf_scale", "0.5", "--hf_exponent", "2.0", "--hf_patch", "16",
+        "--hf_high_noise_snr_cut", "0.05",
+        "--hf_high_noise_min_weight", "0.2",
+        "--hf_high_noise_power", "2.0",
+    ])
     assert ns.hf_scale == 0.5
     assert ns.hf_exponent == 2.0
     assert ns.hf_patch == 16
+    assert ns.hf_high_noise_snr_cut == 0.05
+    assert ns.hf_high_noise_min_weight == 0.2
+    assert ns.hf_high_noise_power == 2.0
 
 
 # ──────────────────────────────────────────────

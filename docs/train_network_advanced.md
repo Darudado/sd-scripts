@@ -291,6 +291,40 @@ loss without the feature.
 *   `--hf_patch` (default `2`): token patch size; **must equal the model's own patchify size**.
     Use `2` for all latent-space models (SD1.5/SD2/SDXL/Flux/SD3/Lumina/Hunyuan/Anima) and
     `16` for pixel-space models such as ChromaRadiance. `H`/`W` must be divisible by the patch.
+*   `--hf_high_noise_snr_cut` (default `0.111111`, equivalent to flow sigma `0.75`): universal
+    SNR cutoff for high-noise HF attenuation. This is used for flow, x0-direct, DDPM v-prediction,
+    and DDPM epsilon-prediction modes.
+*   `--hf_high_noise_min_weight` (default `0.10`): lower bound for the high-noise HF multiplier.
+*   `--hf_high_noise_power` (default `1.0`): attenuation exponent below the SNR cutoff; larger values
+    suppress high-noise HF supervision more sharply. These gates are HF-only and do not modify the main loss.
+
+For flow matching, SNR is computed as `((1 - sigma) / sigma)^2`. The following reference values
+show how quickly SNR falls as the noise level increases:
+
+| Flow sigma | SNR | Signal variance relative to noise | SNR (dB) | Typical interpretation |
+|---:|---:|---:|---:|---|
+| `0.00` | `∞` | infinitely signal-dominant | `∞` | clean endpoint |
+| `0.05` | `361.0000` | 361× | `25.58` | nearly clean |
+| `0.10` | `81.0000` | 81× | `19.08` | very signal-dominant |
+| `0.20` | `16.0000` | 16× | `12.04` | signal-dominant |
+| `0.25` | `9.0000` | 9× | `9.54` | signal-dominant |
+| `0.3333` | `4.0000` | 4× | `6.02` | moderately signal-dominant |
+| `0.40` | `2.2500` | 2.25× | `3.52` | signal still dominant |
+| `0.50` | `1.0000` | 1× | `0.00` | equal signal and noise variance |
+| `0.60` | `0.4444` | 0.444× | `-3.52` | noise-dominant |
+| `0.667` | `0.2498` | 0.250× | `-6.02` | noise substantially dominant |
+| `0.70` | `0.1837` | 0.184× | `-7.36` | high noise |
+| `0.75` | `0.1111` | 0.111× | `-9.54` | default HF cutoff |
+| `0.80` | `0.0625` | 0.0625× | `-12.04` | strongly noise-dominant |
+| `0.90` | `0.0123` | 0.0123× | `-19.08` | almost pure noise |
+| `0.95` | `0.0028` | 0.0028× | `-25.58` | nearly pure noise |
+| `0.99` | `0.0001` | 0.0001× | `-39.91` | effectively pure noise |
+| `1.00` | `0.0000` | 0× | `-∞` | pure-noise endpoint |
+
+The default `hf_high_noise_snr_cut=0.111111` therefore corresponds to flow sigma `0.75`.
+For DDPM modes, use the scheduler-derived `alpha_bar / (1 - alpha_bar)` SNR instead of this
+flow-sigma table; the same SNR cutoff represents the same signal-to-noise ratio, but not necessarily
+the same integer timestep across different DDPM schedules.
 
 **How it works:** the per-token weight is the mean squared Laplacian response of the clean
 latent inside each patch (replication padding — load-bearing: a constant input gives exactly
@@ -303,9 +337,14 @@ clean target.
 
 * **RNG-neutral & deterministic**: weights are a pure function of the clean batch; the
   global RNG stream position is identical whether the term is on or off.
-* **No timestep gate**: the term applies at all `t` (the t² factor from the x0 domain is
-  accepted). Per-sample timestep importance weights (e.g. the SD3/Flux `weighting_scheme`
-  weights) are applied to the HF term with the same convention as the main MSE.
+* **High-noise gate**: supported prediction modes leave high-SNR/low-noise samples unchanged, then apply
+  a one-sided SNR attenuation below `hf_high_noise_snr_cut`. Flow modes derive SNR from sigma, while
+  DDPM modes derive it from scheduler `alpha_bar`. This avoids suppressing the useful low-noise end
+  while limiting the HF contribution where clean reconstruction is least reliable. DDPM epsilon mode
+  uses an effective zero floor for this gate to prevent its inverse-SNR x0 reconstruction factor from
+  becoming unbounded at the pure-noise endpoint.
+  Per-sample timestep importance weights (e.g. the SD3/Flux `weighting_scheme` weights) are still
+  applied to the HF term with the same convention as the main MSE.
 * **Caption-independent**: CFG-dropped rows contribute normally; the term never touches
   `target_v` or the dropout mask.
 * **Compatible with auxiliary features**: composes with token mining, wavelet masking,
