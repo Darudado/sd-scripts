@@ -283,6 +283,7 @@ The weights `w_token` are computed per micro-batch, on-GPU, from the clean batch
 no extractor network, no RNG draw. `hf_scale == 0` (the default) is bit-identical to the
 loss without the feature.
 
+
 *   `--hf_scale` (default `0.0`, must be `>= 0`): term weight (λ); `0.0` disables the term.
 *   `--hf_exponent` (default `1.0`, must be `> 0`): weight concentration exponent (γ);
     `1` weights tokens linearly in detail, `> 1` concentrates on the highest-detail tokens,
