@@ -483,6 +483,9 @@ class BaseSubset:
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        resolution: Optional[Tuple[int, int]] = None,
+        min_bucket_reso: Optional[int] = None,
+        max_bucket_reso: Optional[int] = None,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -519,6 +522,9 @@ class BaseSubset:
         self.validation_split = float(validation_split) if validation_split is not None else 0.0
 
         self.resize_interpolation = resize_interpolation
+        self.resolution = resolution
+        self.min_bucket_reso = min_bucket_reso
+        self.max_bucket_reso = max_bucket_reso
 
 
 class DreamBoothSubset(BaseSubset):
@@ -558,6 +564,9 @@ class DreamBoothSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        resolution: Optional[Tuple[int, int]] = None,
+        min_bucket_reso: Optional[int] = None,
+        max_bucket_reso: Optional[int] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -591,6 +600,9 @@ class DreamBoothSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            resolution=resolution,
+            min_bucket_reso=min_bucket_reso,
+            max_bucket_reso=max_bucket_reso,
         )
 
         self.is_reg = is_reg
@@ -640,6 +652,9 @@ class FineTuningSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        resolution: Optional[Tuple[int, int]] = None,
+        min_bucket_reso: Optional[int] = None,
+        max_bucket_reso: Optional[int] = None,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -673,6 +688,9 @@ class FineTuningSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            resolution=resolution,
+            min_bucket_reso=min_bucket_reso,
+            max_bucket_reso=max_bucket_reso,
         )
 
         self.metadata_file = metadata_file
@@ -719,6 +737,9 @@ class ControlNetSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        resolution: Optional[Tuple[int, int]] = None,
+        min_bucket_reso: Optional[int] = None,
+        max_bucket_reso: Optional[int] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -752,6 +773,9 @@ class ControlNetSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            resolution=resolution,
+            min_bucket_reso=min_bucket_reso,
+            max_bucket_reso=max_bucket_reso,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
@@ -1427,6 +1451,24 @@ class BaseDataset(torch.utils.data.Dataset):
         self.image_data[info.image_key] = info
         self.image_to_subset[info.image_key] = subset
 
+    def get_subset_resolution(self, subset: BaseSubset) -> Tuple[int, int]:
+        """Return the effective resolution for a subset."""
+        resolution = getattr(subset, "resolution", None)
+        if resolution is None:
+            resolution = (self.width, self.height)
+        assert resolution is not None, "resolution is required / resolution（解像度）指定は必須です"
+        return resolution
+
+    def get_subset_bucket_bounds(self, subset: BaseSubset) -> Tuple[Optional[int], Optional[int]]:
+        """Return effective min/max bucket sizes for a subset."""
+        min_bucket_reso = getattr(subset, "min_bucket_reso", None)
+        max_bucket_reso = getattr(subset, "max_bucket_reso", None)
+        if min_bucket_reso is None:
+            min_bucket_reso = self.min_bucket_reso
+        if max_bucket_reso is None:
+            max_bucket_reso = self.max_bucket_reso
+        return min_bucket_reso, max_bucket_reso
+
     def make_buckets(self):
         """
         bucketingを行わない場合も呼び出し必須（ひとつだけbucketを作る）
@@ -1477,12 +1519,34 @@ class BaseDataset(torch.utils.data.Dataset):
                         "min_bucket_reso and max_bucket_reso are ignored if bucket_no_upscale is set, because bucket reso is defined by image size automatically / bucket_no_upscaleが指定された場合は、bucketの解像度は画像サイズから自動計算されるため、min_bucket_resoとmax_bucket_resoは無視されます"
                     )
 
+            self.subset_bucket_managers = {}
+            for subset in self.subsets:
+                resolution = self.get_subset_resolution(subset)
+                min_bucket_reso, max_bucket_reso = self.get_subset_bucket_bounds(subset)
+                min_bucket_reso, max_bucket_reso = self.adjust_min_max_bucket_reso_by_steps(
+                    resolution, min_bucket_reso, max_bucket_reso, self.bucket_reso_steps
+                )
+                subset_bucket_manager = BucketManager(
+                    self.bucket_no_upscale,
+                    resolution,
+                    min_bucket_reso,
+                    max_bucket_reso,
+                    self.bucket_reso_steps,
+                    getattr(self, "multires_training", False),
+                )
+                if not self.bucket_no_upscale:
+                    subset_bucket_manager.make_buckets()
+                self.subset_bucket_managers[id(subset)] = subset_bucket_manager
+
             img_ar_errors = []
             for image_info in self.image_data.values():
+                subset = self.image_to_subset[image_info.image_key]
+                subset_bucket_manager = self.subset_bucket_managers[id(subset)]
                 image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
+                image_info.bucket_reso, image_info.resized_size, ar_error = subset_bucket_manager.select_bucket(
                     image_width, image_height
                 )
+                self.bucket_manager.add_if_new_reso(image_info.bucket_reso)
 
                 # logger.info(image_info.image_key, image_info.bucket_reso)
                 img_ar_errors.append(abs(ar_error))
@@ -1491,9 +1555,18 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             self.bucket_manager = BucketManager(False, (self.width, self.height), None, None, None)
             self.bucket_manager.set_predefined_resos([(self.width, self.height)])  # ひとつの固定サイズbucketのみ
+            self.subset_bucket_managers = {}
+            for subset in self.subsets:
+                resolution = self.get_subset_resolution(subset)
+                subset_bucket_manager = BucketManager(False, resolution, None, None, None)
+                subset_bucket_manager.set_predefined_resos([resolution])
+                self.subset_bucket_managers[id(subset)] = subset_bucket_manager
             for image_info in self.image_data.values():
+                subset = self.image_to_subset[image_info.image_key]
+                subset_bucket_manager = self.subset_bucket_managers[id(subset)]
                 image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, _ = self.bucket_manager.select_bucket(image_width, image_height)
+                image_info.bucket_reso, image_info.resized_size, _ = subset_bucket_manager.select_bucket(image_width, image_height)
+                self.bucket_manager.add_if_new_reso(image_info.bucket_reso)
 
         for image_info in self.image_data.values():
             for _ in range(image_info.num_repeats):
@@ -1539,6 +1612,17 @@ class BaseDataset(torch.utils.data.Dataset):
             f"bucket_reso_steps is {self.bucket_reso_steps}. it must be divisible by {min_steps}.\n"
             + f"bucket_reso_stepsが{self.bucket_reso_steps}です。{min_steps}で割り切れる必要があります"
         )
+
+    def get_resolutions(self) -> List[Tuple[int, int]]:
+        """Return distinct effective resolutions used by this dataset."""
+        resolutions = []
+        for subset in self.subsets:
+            resolution = self.get_subset_resolution(subset)
+            if resolution not in resolutions:
+                resolutions.append(resolution)
+        if not resolutions and self.width is not None and self.height is not None:
+            resolutions.append((self.width, self.height))
+        return resolutions
 
     def is_latent_cacheable(self):
         if self.latents_aug_variant_count > 1:
@@ -2028,13 +2112,14 @@ class BaseDataset(torch.utils.data.Dataset):
     # いい感じに切り出す
     def crop_target(self, subset: BaseSubset, image, face_cx, face_cy, face_w, face_h):
         height, width = image.shape[0:2]
-        if height == self.height and width == self.width:
+        target_width, target_height = self.get_subset_resolution(subset)
+        if height == target_height and width == target_width:
             return image
 
         # 画像サイズはsizeより大きいのでリサイズする
         face_size = max(face_w, face_h)
-        size = min(self.height, self.width)  # 短いほう
-        min_scale = max(self.height / height, self.width / width)  # 画像がモデル入力サイズぴったりになる倍率（最小の倍率）
+        size = min(target_height, target_width)  # 短いほう
+        min_scale = max(target_height / height, target_width / width)  # 画像がモデル入力サイズぴったりになる倍率（最小の倍率）
         min_scale = min(1.0, max(min_scale, size / (face_size * subset.face_crop_aug_range[1])))  # 指定した顔最小サイズ
         max_scale = min(1.0, max(min_scale, size / (face_size * subset.face_crop_aug_range[0])))  # 指定した顔最大サイズ
         if min_scale >= max_scale:  # range指定がmin==max
@@ -2044,14 +2129,14 @@ class BaseDataset(torch.utils.data.Dataset):
 
         nh = int(height * scale + 0.5)
         nw = int(width * scale + 0.5)
-        assert nh >= self.height and nw >= self.width, f"internal error. small scale {scale}, {width}*{height}"
+        assert nh >= target_height and nw >= target_width, f"internal error. small scale {scale}, {width}*{height}"
         image = resize_image(image, width, height, nw, nh, subset.resize_interpolation)
         face_cx = int(face_cx * scale + 0.5)
         face_cy = int(face_cy * scale + 0.5)
         height, width = nh, nw
 
         # 顔を中心として448*640とかへ切り出す
-        for axis, (target_size, length, face_p) in enumerate(zip((self.height, self.width), (height, width), (face_cy, face_cx))):
+        for axis, (target_size, length, face_p) in enumerate(zip((target_height, target_width), (height, width), (face_cy, face_cx))):
             p1 = face_p - target_size // 2  # 顔を中心に持ってくるための切り出し位置
 
             if subset.random_crop:
@@ -2194,6 +2279,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     subset, image_info.absolute_path, subset.alpha_mask
                 )
                 im_h, im_w = img.shape[0:2]
+                target_width, target_height = self.get_subset_resolution(subset)
 
                 if self.enable_bucket:
                     img, original_size, crop_ltrb = trim_and_resize_if_required(
@@ -2207,20 +2293,20 @@ class BaseDataset(torch.utils.data.Dataset):
                 else:
                     if face_cx > 0:  # 顔位置情報あり
                         img = self.crop_target(subset, img, face_cx, face_cy, face_w, face_h)
-                    elif im_h > self.height or im_w > self.width:
+                    elif im_h > target_height or im_w > target_width:
                         assert (
                             subset.random_crop
                         ), f"image too large, but cropping and bucketing are disabled / 画像サイズが大きいのでface_crop_aug_rangeかrandom_crop、またはbucketを有効にしてください: {image_info.absolute_path}"
-                        if im_h > self.height:
-                            p = random.randint(0, im_h - self.height)
-                            img = img[p : p + self.height]
-                        if im_w > self.width:
-                            p = random.randint(0, im_w - self.width)
-                            img = img[:, p : p + self.width]
+                        if im_h > target_height:
+                            p = random.randint(0, im_h - target_height)
+                            img = img[p : p + target_height]
+                        if im_w > target_width:
+                            p = random.randint(0, im_w - target_width)
+                            img = img[:, p : p + target_width]
 
                     im_h, im_w = img.shape[0:2]
                     assert (
-                        im_h == self.height and im_w == self.width
+                        im_h == target_height and im_w == target_width
                     ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
 
                     original_size = [im_w, im_h]
@@ -3183,6 +3269,9 @@ class ControlNetDataset(BaseDataset):
                 token_warmup_step=subset.token_warmup_step,
                 protected_tags_file=subset.protected_tags_file,
                 resize_interpolation=subset.resize_interpolation,
+                resolution=subset.resolution,
+                min_bucket_reso=subset.min_bucket_reso,
+                max_bucket_reso=subset.max_bucket_reso,
             )
             db_subsets.append(db_subset)
 
@@ -3376,6 +3465,9 @@ class ControlNetDataset(BaseDataset):
         self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager
         self.buckets_indices = self.dreambooth_dataset_delegate.buckets_indices
 
+    def get_resolutions(self) -> List[Tuple[int, int]]:
+        return self.dreambooth_dataset_delegate.get_resolutions()
+
     def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True):
         return self.dreambooth_dataset_delegate.cache_latents(vae, vae_batch_size, cache_to_disk, is_main_process)
 
@@ -3534,7 +3626,12 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             dataset.verify_bucket_reso_steps(min_steps)
 
     def get_resolutions(self) -> List[Tuple[int, int]]:
-        return [(dataset.width, dataset.height) for dataset in self.datasets]
+        resolutions = []
+        for dataset in self.datasets:
+            for resolution in dataset.get_resolutions():
+                if resolution not in resolutions:
+                    resolutions.append(resolution)
+        return resolutions
 
     def is_latent_cacheable(self) -> bool:
         return all([dataset.is_latent_cacheable() for dataset in self.datasets])

@@ -2600,6 +2600,9 @@ class NetworkTrainer:
                         "caption_prefix": subset.caption_prefix,
                         "caption_suffix": subset.caption_suffix,
                         "resize_interpolation": subset.resize_interpolation,
+                        "resolution": subset.resolution,
+                        "min_bucket_reso": subset.min_bucket_reso,
+                        "max_bucket_reso": subset.max_bucket_reso,
                     }
 
                     image_dir_or_metadata_file = None
