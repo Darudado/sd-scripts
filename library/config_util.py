@@ -58,6 +58,7 @@ class BaseSubsetParams:
     resolution: Optional[Tuple[int, int]] = None
     min_bucket_reso: Optional[int] = None
     max_bucket_reso: Optional[int] = None
+    batch_size: Optional[int] = None
     num_repeats: int = 1
     shuffle_caption: bool = False
     caption_separator: str = (",",)
@@ -196,9 +197,10 @@ class ConfigSanitizer:
 
     # subset schema
     SUBSET_ASCENDABLE_SCHEMA = {
-        "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
-        "min_bucket_reso": int,
-        "max_bucket_reso": int,
+            "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
+            "min_bucket_reso": int,
+            "max_bucket_reso": int,
+            "batch_size": int,
         "color_aug": bool,
         "gamma_aug": bool,
         "gamma_aug_range": functools.partial(__validate_and_convert_twodim.__func__, float),
@@ -621,6 +623,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     resolution: {subset.resolution}
                     min_bucket_reso: {subset.min_bucket_reso}
                     max_bucket_reso: {subset.max_bucket_reso}
+                    batch_size: {subset.batch_size}
                 """), "  ")
 
                 if is_dreambooth:

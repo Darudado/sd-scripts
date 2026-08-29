@@ -9,7 +9,7 @@
     * DreamBooth の手法と fine tuning の手法の両方に対応している学習方法では、DreamBooth 方式と fine tuning 方式のデータセットを混合することが可能です。
 * サブセットごとに設定を変更することが可能になります
     * データセットを画像ディレクトリ別またはメタデータ別に分割したものがサブセットです。いくつかのサブセットが集まってデータセットを構成します。
-    * `keep_tokens` や `flip_aug` 等のオプションはサブセットごとに設定可能です。`resolution`、`min_bucket_reso`、`max_bucket_reso` は親データセットの値をサブセットごとに上書きできます。一方、`batch_size` などのオプションはデータセット単位で、同じデータセットに属するサブセットで値が共通になります。詳しくは後述します。
+    * `keep_tokens` や `flip_aug` 等のオプションはサブセットごとに設定可能です。`resolution`、`min_bucket_reso`、`max_bucket_reso`、`batch_size` は親データセットの値をサブセットごとに上書きできます。詳しくは後述します。
 
 設定ファイルの形式は JSON か TOML を利用できます。記述のしやすさを考えると [TOML](https://toml.io/ja/v1.0.0-rc.2) を利用するのがオススメです。以下、TOML の利用を前提に説明します。
 
@@ -104,7 +104,7 @@ DreamBooth の手法と fine tuning の手法の両方とも利用可能な学�
 
 #### データセット向けオプション
 
-データセットの設定に関わるオプションです。多くの項目は `datasets.subsets` に記述できませんが、`resolution`、`min_bucket_reso`、`max_bucket_reso` はサブセットで上書きできます。
+データセットの設定に関わるオプションです。多くの項目は `datasets.subsets` に記述できませんが、`resolution`、`min_bucket_reso`、`max_bucket_reso`、`batch_size` はサブセットで上書きできます。
 
 | オプション名 | 設定例 | `[general]` | `[[datasets]]` |
 | ---- | ---- | ---- | ---- |
@@ -124,9 +124,11 @@ DreamBooth の手法と fine tuning の手法の両方とも利用可能な学�
 | `resolution` | `256`, `[512, 512]` | o |
 | `min_bucket_reso` | `128` | o |
 | `max_bucket_reso` | `1024` | o |
+| `batch_size` | `2` | o |
 
 * `batch_size`
     * コマンドライン引数の `--train_batch_size` と同等です。
+    * サブセットに設定した場合、そのサブセットのバッチはデータセット単位の `batch_size` の代わりにこのサイズで作成されます。バッチは異なるサブセットの画像を混ぜないため、サブセットごとのバッチサイズは1エポックのステップ数と、各サブセットの学習への寄与の割合を変えます。
 * `max_bucket_reso`, `min_bucket_reso`
     * bucketの最大、最小解像度を指定します。`bucket_reso_steps` で割り切れる必要があります。
 * `skip_image_resolution`
@@ -134,7 +136,7 @@ DreamBooth の手法と fine tuning の手法の両方とも利用可能な学�
     * 同じ画像ディレクトリを異なる解像度の複数のデータセットで使い回す場合に、低解像度の元画像を高解像度のデータセットから除外するために使用します。
 
 これらの設定は、デフォルトでは親データセットからサブセットへ継承されます。
-`resolution`、`min_bucket_reso`、`max_bucket_reso` はサブセットごとに上書きできます。
+`resolution`、`min_bucket_reso`、`max_bucket_reso`、`batch_size` はサブセットごとに上書きできます。
 その他の設定はデータセットごとに固定で、同じデータセットに所属するサブセットで共有されます。
 
 以下の例では、1つ目のサブセットはデータセットの設定を使用し、2つ目のサブセットは学習解像度とbucketの範囲を上書きします。
@@ -155,7 +157,22 @@ max_bucket_reso = 1024
   max_bucket_reso = 1536
 ```
 
-`enable_bucket = true` の場合、各サブセットは有効な解像度とbucket範囲を使ってbucketに割り当てられます。バッチサイズはデータセット単位です。
+`enable_bucket = true` の場合、各サブセットは有効な解像度とbucket範囲を使ってbucketに割り当てられます。バッチはサブセットごとに、そのサブセットの有効な `batch_size`（上書きしない場合はデータセットから継承）で作成され、異なるサブセットの画像が混ざることはありません。
+
+```toml
+[[datasets]]
+resolution = 768
+batch_size = 4
+
+  [[datasets.subsets]]
+  image_dir = 'C:\hoge'
+
+  [[datasets.subsets]]
+  image_dir = 'C:\fuga'
+  batch_size = 1
+```
+
+この例では、`C:\hoge` の画像はバッチサイズ4で、`C:\fuga` の画像は1枚ずつ学習されます。
 
 #### サブセット向けオプション
 

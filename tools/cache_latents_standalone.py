@@ -524,6 +524,24 @@ def cache_latents(args: argparse.Namespace) -> None:
                 new_buckets.append(filtered)
         dataset.bucket_manager.buckets = new_buckets
 
+        # keep the subset-scoped batching buckets and batch indices consistent with the filtered image set
+        new_batch_buckets = []
+        new_batch_bucket_subsets = []
+        for bucket, subset in zip(dataset.batch_buckets, dataset.batch_bucket_subsets):
+            filtered = [k for k in bucket if k in my_keys]
+            if filtered:
+                new_batch_buckets.append(filtered)
+                new_batch_bucket_subsets.append(subset)
+        dataset.batch_buckets = new_batch_buckets
+        dataset.batch_bucket_subsets = new_batch_bucket_subsets
+        dataset.buckets_indices = []
+        for bucket_index, bucket in enumerate(dataset.batch_buckets):
+            bucket_batch_size = dataset.get_subset_batch_size(dataset.batch_bucket_subsets[bucket_index])
+            batch_count = math.ceil(len(bucket) / bucket_batch_size)
+            for batch_index in range(batch_count):
+                dataset.buckets_indices.append(train_util.BucketBatchIndex(bucket_index, bucket_batch_size, batch_index))
+        dataset._length = len(dataset.buckets_indices)
+
         # allow every rank to write its shard
         dataset.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, True)
         accelerator.wait_for_everyone()

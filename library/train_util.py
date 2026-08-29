@@ -486,6 +486,7 @@ class BaseSubset:
         resolution: Optional[Tuple[int, int]] = None,
         min_bucket_reso: Optional[int] = None,
         max_bucket_reso: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -525,6 +526,7 @@ class BaseSubset:
         self.resolution = resolution
         self.min_bucket_reso = min_bucket_reso
         self.max_bucket_reso = max_bucket_reso
+        self.batch_size = batch_size
 
 
 class DreamBoothSubset(BaseSubset):
@@ -567,6 +569,7 @@ class DreamBoothSubset(BaseSubset):
         resolution: Optional[Tuple[int, int]] = None,
         min_bucket_reso: Optional[int] = None,
         max_bucket_reso: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -603,6 +606,7 @@ class DreamBoothSubset(BaseSubset):
             resolution=resolution,
             min_bucket_reso=min_bucket_reso,
             max_bucket_reso=max_bucket_reso,
+            batch_size=batch_size,
         )
 
         self.is_reg = is_reg
@@ -655,6 +659,7 @@ class FineTuningSubset(BaseSubset):
         resolution: Optional[Tuple[int, int]] = None,
         min_bucket_reso: Optional[int] = None,
         max_bucket_reso: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -691,6 +696,7 @@ class FineTuningSubset(BaseSubset):
             resolution=resolution,
             min_bucket_reso=min_bucket_reso,
             max_bucket_reso=max_bucket_reso,
+            batch_size=batch_size,
         )
 
         self.metadata_file = metadata_file
@@ -740,6 +746,7 @@ class ControlNetSubset(BaseSubset):
         resolution: Optional[Tuple[int, int]] = None,
         min_bucket_reso: Optional[int] = None,
         max_bucket_reso: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -776,6 +783,7 @@ class ControlNetSubset(BaseSubset):
             resolution=resolution,
             min_bucket_reso=min_bucket_reso,
             max_bucket_reso=max_bucket_reso,
+            batch_size=batch_size,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
@@ -846,6 +854,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
         self.enable_bucket = False
         self.bucket_manager: BucketManager = None  # not initialized
+        # subset-scoped buckets used for batch formation: each bucket holds image keys
+        # from a single subset so that per-subset batch sizes can be applied
+        self.batch_buckets: List[List[str]] = []
+        self.batch_bucket_subsets: List[BaseSubset] = []
         self.min_bucket_reso = None
         self.max_bucket_reso = None
         self.bucket_reso_steps = None
@@ -1469,6 +1481,18 @@ class BaseDataset(torch.utils.data.Dataset):
             max_bucket_reso = self.max_bucket_reso
         return min_bucket_reso, max_bucket_reso
 
+    def get_subset_batch_size(self, subset: BaseSubset) -> int:
+        """Return the effective batch size for a subset.
+
+        Falls back to the dataset-level batch size when the subset does not
+        override it. Batch formation itself is deterministic (index
+        arithmetic), so this never consumes RNG state.
+        """
+        batch_size = getattr(subset, "batch_size", None)
+        if batch_size is None:
+            batch_size = self.batch_size
+        return max(1, int(batch_size))
+
     def make_buckets(self):
         """
         bucketingを行わない場合も呼び出し必須（ひとつだけbucketを作る）
@@ -1568,9 +1592,25 @@ class BaseDataset(torch.utils.data.Dataset):
                 image_info.bucket_reso, image_info.resized_size, _ = subset_bucket_manager.select_bucket(image_width, image_height)
                 self.bucket_manager.add_if_new_reso(image_info.bucket_reso)
 
+        # build subset-scoped batching buckets: every batch is drawn from a single subset,
+        # which allows a per-subset batch size (the dataset-level bucket_manager above is
+        # kept for resolution bookkeeping and logging only)
+        self.batch_buckets = []
+        self.batch_bucket_subsets = []
+        batch_bucket_ids = {}  # (id(subset), bucket_reso) -> index into batch_buckets
         for image_info in self.image_data.values():
+            subset = self.image_to_subset[image_info.image_key]
             for _ in range(image_info.num_repeats):
                 self.bucket_manager.add_image(image_info.bucket_reso, image_info.image_key)
+
+            bucket_key = (id(subset), image_info.bucket_reso)
+            batch_bucket_index = batch_bucket_ids.get(bucket_key)
+            if batch_bucket_index is None:
+                batch_bucket_index = len(self.batch_buckets)
+                batch_bucket_ids[bucket_key] = batch_bucket_index
+                self.batch_buckets.append([])
+                self.batch_bucket_subsets.append(subset)
+            self.batch_buckets[batch_bucket_index].extend([image_info.image_key] * image_info.num_repeats)
 
         # bucket情報を表示、格納する
         if self.enable_bucket:
@@ -1591,11 +1631,13 @@ class BaseDataset(torch.utils.data.Dataset):
             logger.info(f"mean ar error (without repeats): {mean_img_ar_error}")
 
         # データ参照用indexを作る。このindexはdatasetのshuffleに用いられる
+        # バッチはサブセット単位で作られるため、バッチサイズはサブセットごとに決まる
         self.buckets_indices: List[BucketBatchIndex] = []
-        for bucket_index, bucket in enumerate(self.bucket_manager.buckets):
-            batch_count = int(math.ceil(len(bucket) / self.batch_size))
+        for bucket_index, bucket in enumerate(self.batch_buckets):
+            bucket_batch_size = self.get_subset_batch_size(self.batch_bucket_subsets[bucket_index])
+            batch_count = int(math.ceil(len(bucket) / bucket_batch_size))
             for batch_index in range(batch_count):
-                self.buckets_indices.append(BucketBatchIndex(bucket_index, self.batch_size, batch_index))
+                self.buckets_indices.append(BucketBatchIndex(bucket_index, bucket_batch_size, batch_index))
 
         self.shuffle_buckets()
         self._length = len(self.buckets_indices)
@@ -1605,7 +1647,8 @@ class BaseDataset(torch.utils.data.Dataset):
         random.seed(self.seed + self.current_epoch)
 
         random.shuffle(self.buckets_indices)
-        self.bucket_manager.shuffle()
+        for bucket in self.batch_buckets:
+            random.shuffle(bucket)
 
     def verify_bucket_reso_steps(self, min_steps: int):
         assert self.bucket_reso_steps is None or self.bucket_reso_steps % min_steps == 0, (
@@ -2162,7 +2205,7 @@ class BaseDataset(torch.utils.data.Dataset):
         return self._length
 
     def __getitem__(self, index):
-        bucket = self.bucket_manager.buckets[self.buckets_indices[index].bucket_index]
+        bucket = self.batch_buckets[self.buckets_indices[index].bucket_index]
         bucket_batch_size = self.buckets_indices[index].bucket_batch_size
         image_index = self.buckets_indices[index].batch_index * bucket_batch_size
 
@@ -2536,7 +2579,7 @@ class BaseDataset(torch.utils.data.Dataset):
         example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
 
         if self.debug_dataset:
-            example["image_keys"] = bucket[image_index : image_index + self.batch_size]
+            example["image_keys"] = bucket[image_index : image_index + bucket_batch_size]
         return example
 
     def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
@@ -3464,6 +3507,8 @@ class ControlNetDataset(BaseDataset):
         self.dreambooth_dataset_delegate.make_buckets()
         self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager
         self.buckets_indices = self.dreambooth_dataset_delegate.buckets_indices
+        self.batch_buckets = self.dreambooth_dataset_delegate.batch_buckets
+        self.batch_bucket_subsets = self.dreambooth_dataset_delegate.batch_bucket_subsets
 
     def get_resolutions(self) -> List[Tuple[int, int]]:
         return self.dreambooth_dataset_delegate.get_resolutions()
@@ -3483,7 +3528,7 @@ class ControlNetDataset(BaseDataset):
     def __getitem__(self, index):
         example = self.dreambooth_dataset_delegate[index]
 
-        bucket = self.dreambooth_dataset_delegate.bucket_manager.buckets[
+        bucket = self.dreambooth_dataset_delegate.batch_buckets[
             self.dreambooth_dataset_delegate.buckets_indices[index].bucket_index
         ]
         bucket_batch_size = self.dreambooth_dataset_delegate.buckets_indices[index].bucket_batch_size
