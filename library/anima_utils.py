@@ -36,6 +36,20 @@ def _rename_hook(k: str) -> str:
         return k[len("net."):]
     return k
 
+def count_blocks(state_dict_keys: list[str], prefix_string: str) -> int:
+    count = 0
+    while True:
+        c = False
+        for k in state_dict_keys:
+            if k.startswith(prefix_string.format(count)):
+                c = True
+                break
+        if c == False:
+            break
+        count += 1
+    logger.info(f"Provided Anima model has {count} blocks.")
+    return count
+
 def load_anima_model(
     device: Union[str, torch.device],
     dit_path: str,
@@ -72,8 +86,13 @@ def load_anima_model(
 
     # We currently support fixed DiT config for Anima models
     # Detect block.39 from the checkpoint
+    key_prefix = ""
     with safe_open(dit_path, framework="pt") as f:
-        is_2_9b = any(k.endswith("blocks.39.mlp.layer1.weight") for k in f.keys())  # 2.9B has 40 blocks
+        state_dict_keys = list(f.keys())
+        if any(k.startswith("model.diffusion_model.") for k in state_dict_keys):
+            key_prefix = "model.diffusion_model."
+        elif any(k.startswith("net.") for k in state_dict_keys):
+            key_prefix = "net."
 
     dit_config = {
         "max_img_h": 512,
@@ -93,7 +112,7 @@ def load_anima_model(
         "max_fps": 30,
         "use_adaln_lora": True,
         "adaln_lora_dim": 256,
-        "num_blocks": 40 if is_2_9b else 28,
+        "num_blocks": count_blocks(state_dict_keys, "{}blocks.".format(key_prefix) + "{}."),
         "num_heads": 16,
         "extra_per_block_abs_pos_emb": False,
         "rope_h_extrapolation_ratio": 4.0,
