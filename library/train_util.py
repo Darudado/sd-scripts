@@ -237,6 +237,12 @@ class ImageInfo:
         self.caption_aug_hash: Optional[str] = None  # caption augmentation config hash for cache invalidation
         self.text_encoder_outputs_variants: Optional[List[Any]] = None  # per-variant TE outputs for k=1..K-1 (in-RAM path)
 
+        # resolution jitter: per-jitter-resolution bucket assignment {(reso_side): (bucket_reso, resized_size)}
+        self.jitter_bucket_info: Optional[Dict[int, Tuple[Tuple[int, int], Tuple[int, int]]]] = None
+        # resolution jitter: in-memory latents per jitter resolution
+        # {(reso_side): (latents, latents_flipped, alpha_mask, original_size, crop_ltrb)}
+        self.latents_by_reso: Dict[int, tuple] = {}
+
 
 class BucketManager:
     def __init__(self, no_upscale, max_reso, min_size, max_size, reso_steps, multires_training=False) -> None:
@@ -487,6 +493,9 @@ class BaseSubset:
         min_bucket_reso: Optional[int] = None,
         max_bucket_reso: Optional[int] = None,
         batch_size: Optional[int] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -527,6 +536,11 @@ class BaseSubset:
         self.min_bucket_reso = min_bucket_reso
         self.max_bucket_reso = max_bucket_reso
         self.batch_size = batch_size
+
+        # resolution jitter (None = inherit from dataset / inactive)
+        self.resolution_jitter_resolutions = resolution_jitter_resolutions
+        self.resolution_jitter_batch_sizes = resolution_jitter_batch_sizes
+        self.resolution_jitter_weights = resolution_jitter_weights
 
 
 class DreamBoothSubset(BaseSubset):
@@ -570,6 +584,9 @@ class DreamBoothSubset(BaseSubset):
         min_bucket_reso: Optional[int] = None,
         max_bucket_reso: Optional[int] = None,
         batch_size: Optional[int] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -607,6 +624,9 @@ class DreamBoothSubset(BaseSubset):
             min_bucket_reso=min_bucket_reso,
             max_bucket_reso=max_bucket_reso,
             batch_size=batch_size,
+            resolution_jitter_resolutions=resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes=resolution_jitter_batch_sizes,
+            resolution_jitter_weights=resolution_jitter_weights,
         )
 
         self.is_reg = is_reg
@@ -660,6 +680,9 @@ class FineTuningSubset(BaseSubset):
         min_bucket_reso: Optional[int] = None,
         max_bucket_reso: Optional[int] = None,
         batch_size: Optional[int] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -697,6 +720,9 @@ class FineTuningSubset(BaseSubset):
             min_bucket_reso=min_bucket_reso,
             max_bucket_reso=max_bucket_reso,
             batch_size=batch_size,
+            resolution_jitter_resolutions=resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes=resolution_jitter_batch_sizes,
+            resolution_jitter_weights=resolution_jitter_weights,
         )
 
         self.metadata_file = metadata_file
@@ -747,6 +773,9 @@ class ControlNetSubset(BaseSubset):
         min_bucket_reso: Optional[int] = None,
         max_bucket_reso: Optional[int] = None,
         batch_size: Optional[int] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -784,6 +813,9 @@ class ControlNetSubset(BaseSubset):
             min_bucket_reso=min_bucket_reso,
             max_bucket_reso=max_bucket_reso,
             batch_size=batch_size,
+            resolution_jitter_resolutions=resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes=resolution_jitter_batch_sizes,
+            resolution_jitter_weights=resolution_jitter_weights,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
@@ -832,6 +864,9 @@ class BaseDataset(torch.utils.data.Dataset):
         debug_dataset: bool,
         resize_interpolation: Optional[str] = None,
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
 
@@ -858,6 +893,17 @@ class BaseDataset(torch.utils.data.Dataset):
         # from a single subset so that per-subset batch sizes can be applied
         self.batch_buckets: List[List[str]] = []
         self.batch_bucket_subsets: List[BaseSubset] = []
+        # parallel to batch_buckets: jitter resolution side (int) for jitter pools, None otherwise
+        self.batch_bucket_jitter_resos: List[Optional[int]] = []
+        # parallel to batch_buckets: jitter selection weight for the bucket's resolution (None = non-jitter)
+        self.batch_bucket_weights: List[Optional[float]] = []
+        self.has_resolution_jitter: bool = False
+        self.all_buckets_indices: List[BucketBatchIndex] = []
+
+        # dataset-level resolution jitter (subsets defer to these when unset)
+        self.resolution_jitter_resolutions = resolution_jitter_resolutions
+        self.resolution_jitter_batch_sizes = resolution_jitter_batch_sizes
+        self.resolution_jitter_weights = resolution_jitter_weights
         self.min_bucket_reso = None
         self.max_bucket_reso = None
         self.bucket_reso_steps = None
@@ -1493,6 +1539,44 @@ class BaseDataset(torch.utils.data.Dataset):
             batch_size = self.batch_size
         return max(1, int(batch_size))
 
+    def get_subset_resolution_jitter(self, subset: BaseSubset) -> Optional[Tuple[List[int], List[int], List[float]]]:
+        """Return (resolutions, batch_sizes, weights) for a subset, or None when jitter is inactive.
+
+        Subset-level settings defer to the dataset-level settings when unset; jitter is
+        inactive when unset at both levels. Validation datasets never jitter.
+        Batch formation itself is deterministic (index arithmetic), so this never
+        consumes RNG state.
+        """
+        if not getattr(self, "is_training_dataset", True):
+            return None
+
+        resolutions = getattr(subset, "resolution_jitter_resolutions", None)
+        if resolutions is None:
+            resolutions = self.resolution_jitter_resolutions
+        if resolutions is None:
+            return None
+
+        batch_sizes = getattr(subset, "resolution_jitter_batch_sizes", None)
+        if batch_sizes is None:
+            batch_sizes = self.resolution_jitter_batch_sizes
+        weights = getattr(subset, "resolution_jitter_weights", None)
+        if weights is None:
+            weights = self.resolution_jitter_weights
+
+        if batch_sizes is None or weights is None or not (len(resolutions) == len(batch_sizes) == len(weights)):
+            raise ValueError(
+                "resolution jitter requires resolutions, batch_sizes and weights with the same length; "
+                f"subset-level and dataset-level settings were mixed inconsistently "
+                f"(resolutions={resolutions}, batch_sizes={batch_sizes}, weights={weights}) / "
+                "解像度ジッターの設定が不整合です。resolutions、batch_sizes、weightsは同じ長さで指定してください"
+            )
+
+        return (
+            [int(r) for r in resolutions],
+            [max(1, int(b)) for b in batch_sizes],
+            [float(w) for w in weights],
+        )
+
     def make_buckets(self):
         """
         bucketingを行わない場合も呼び出し必須（ひとつだけbucketを作る）
@@ -1519,6 +1603,53 @@ class BaseDataset(torch.utils.data.Dataset):
         #                 futures = []
         #     for future in futures:
         #         future.result()
+
+        # precompute per-subset resolution jitter configs (None = inactive for that subset)
+        jitter_cfgs: Dict[int, Tuple[List[int], List[int], List[float]]] = {}
+        for subset in self.subsets:
+            cfg = self.get_subset_resolution_jitter(subset)
+            if cfg is not None:
+                assert (
+                    not self.bucket_no_upscale
+                ), "resolution_jitter cannot be used with bucket_no_upscale / 解像度ジッターはbucket_no_upscaleと併用できません"
+                jitter_cfgs[id(subset)] = cfg
+        self.has_resolution_jitter = bool(jitter_cfgs)
+        if self.has_resolution_jitter:
+            logger.info(
+                "resolution jitter enabled for one or more subsets: "
+                + "; ".join(
+                    f"subset {i}: resolutions={cfg[0]}, batch_sizes={cfg[1]}, weights={cfg[2]}"
+                    for i, cfg in jitter_cfgs.items()
+                )
+            )
+
+        # per-(subset, jitter resolution) bucket managers for jitter pools
+        subset_jitter_managers: Dict[Tuple[int, int], BucketManager] = {}
+        for subset in self.subsets:
+            cfg = jitter_cfgs.get(id(subset))
+            if cfg is None:
+                continue
+            for reso_side in cfg[0]:
+                if self.enable_bucket:
+                    min_bucket_reso, max_bucket_reso = self.get_subset_bucket_bounds(subset)
+                    # clamp bounds around the jitter resolution so buckets at that size can be generated
+                    if min_bucket_reso is not None:
+                        min_bucket_reso = min(min_bucket_reso, reso_side)
+                    if max_bucket_reso is not None:
+                        max_bucket_reso = max(max_bucket_reso, reso_side)
+                    jitter_manager = BucketManager(
+                        self.bucket_no_upscale,
+                        (reso_side, reso_side),
+                        min_bucket_reso,
+                        max_bucket_reso,
+                        self.bucket_reso_steps,
+                        False,
+                    )
+                    jitter_manager.make_buckets()
+                else:
+                    jitter_manager = BucketManager(False, (reso_side, reso_side), None, None, None)
+                    jitter_manager.set_predefined_resos([(reso_side, reso_side)])
+                subset_jitter_managers[(id(subset), reso_side)] = jitter_manager
 
         if self.enable_bucket:
             logger.info("make buckets")
@@ -1572,6 +1703,16 @@ class BaseDataset(torch.utils.data.Dataset):
                 )
                 self.bucket_manager.add_if_new_reso(image_info.bucket_reso)
 
+                # assign the image to a bucket for each jitter resolution of its subset
+                cfg = jitter_cfgs.get(id(subset))
+                if cfg is not None:
+                    image_info.jitter_bucket_info = {}
+                    for reso_side in cfg[0]:
+                        jitter_manager = subset_jitter_managers[(id(subset), reso_side)]
+                        jitter_reso, jitter_resized, _ = jitter_manager.select_bucket(image_width, image_height)
+                        image_info.jitter_bucket_info[reso_side] = (jitter_reso, jitter_resized)
+                        self.bucket_manager.add_if_new_reso(jitter_reso)
+
                 # logger.info(image_info.image_key, image_info.bucket_reso)
                 img_ar_errors.append(abs(ar_error))
 
@@ -1592,25 +1733,47 @@ class BaseDataset(torch.utils.data.Dataset):
                 image_info.bucket_reso, image_info.resized_size, _ = subset_bucket_manager.select_bucket(image_width, image_height)
                 self.bucket_manager.add_if_new_reso(image_info.bucket_reso)
 
+                # assign the image to a bucket for each jitter resolution of its subset
+                cfg = jitter_cfgs.get(id(subset))
+                if cfg is not None:
+                    image_info.jitter_bucket_info = {}
+                    for reso_side in cfg[0]:
+                        jitter_manager = subset_jitter_managers[(id(subset), reso_side)]
+                        jitter_reso, jitter_resized, _ = jitter_manager.select_bucket(image_width, image_height)
+                        image_info.jitter_bucket_info[reso_side] = (jitter_reso, jitter_resized)
+                        self.bucket_manager.add_if_new_reso(jitter_reso)
+
         # build subset-scoped batching buckets: every batch is drawn from a single subset,
         # which allows a per-subset batch size (the dataset-level bucket_manager above is
-        # kept for resolution bookkeeping and logging only)
+        # kept for resolution bookkeeping and logging only).
+        # For jitter-enabled subsets, one pool of batches is built per jitter resolution
+        # (the canonical-resolution pool is not used for those subsets).
         self.batch_buckets = []
         self.batch_bucket_subsets = []
-        batch_bucket_ids = {}  # (id(subset), bucket_reso) -> index into batch_buckets
+        self.batch_bucket_jitter_resos = []
+        self.batch_bucket_weights = []
+        batch_bucket_ids = {}  # (id(subset), jitter_reso, bucket_reso) -> index into batch_buckets
         for image_info in self.image_data.values():
             subset = self.image_to_subset[image_info.image_key]
             for _ in range(image_info.num_repeats):
                 self.bucket_manager.add_image(image_info.bucket_reso, image_info.image_key)
 
-            bucket_key = (id(subset), image_info.bucket_reso)
-            batch_bucket_index = batch_bucket_ids.get(bucket_key)
-            if batch_bucket_index is None:
-                batch_bucket_index = len(self.batch_buckets)
-                batch_bucket_ids[bucket_key] = batch_bucket_index
-                self.batch_buckets.append([])
-                self.batch_bucket_subsets.append(subset)
-            self.batch_buckets[batch_bucket_index].extend([image_info.image_key] * image_info.num_repeats)
+            cfg = jitter_cfgs.get(id(subset))
+            if cfg is None:
+                pool_resos = [(None, image_info.bucket_reso)]
+            else:
+                pool_resos = [(reso_side, image_info.jitter_bucket_info[reso_side][0]) for reso_side in cfg[0]]
+            for jitter_reso, bucket_reso in pool_resos:
+                bucket_key = (id(subset), jitter_reso, bucket_reso)
+                batch_bucket_index = batch_bucket_ids.get(bucket_key)
+                if batch_bucket_index is None:
+                    batch_bucket_index = len(self.batch_buckets)
+                    batch_bucket_ids[bucket_key] = batch_bucket_index
+                    self.batch_buckets.append([])
+                    self.batch_bucket_subsets.append(subset)
+                    self.batch_bucket_jitter_resos.append(jitter_reso)
+                    self.batch_bucket_weights.append(None if jitter_reso is None else cfg[2][cfg[0].index(jitter_reso)])
+                self.batch_buckets[batch_bucket_index].extend([image_info.image_key] * image_info.num_repeats)
 
         # bucket情報を表示、格納する
         if self.enable_bucket:
@@ -1632,12 +1795,22 @@ class BaseDataset(torch.utils.data.Dataset):
 
         # データ参照用indexを作る。このindexはdatasetのshuffleに用いられる
         # バッチはサブセット単位で作られるため、バッチサイズはサブセットごとに決まる
+        # (jitter pools use the batch size configured for their resolution)
         self.buckets_indices: List[BucketBatchIndex] = []
         for bucket_index, bucket in enumerate(self.batch_buckets):
-            bucket_batch_size = self.get_subset_batch_size(self.batch_bucket_subsets[bucket_index])
+            jitter_reso = self.batch_bucket_jitter_resos[bucket_index]
+            if jitter_reso is not None:
+                resolutions, batch_sizes, _ = jitter_cfgs[id(self.batch_bucket_subsets[bucket_index])]
+                bucket_batch_size = batch_sizes[resolutions.index(jitter_reso)]
+            else:
+                bucket_batch_size = self.get_subset_batch_size(self.batch_bucket_subsets[bucket_index])
             batch_count = int(math.ceil(len(bucket) / bucket_batch_size))
             for batch_index in range(batch_count):
                 self.buckets_indices.append(BucketBatchIndex(bucket_index, bucket_batch_size, batch_index))
+
+        # keep the deterministic full index list; shuffle_buckets() resamples from it
+        # (weighted by resolution) each epoch when jitter is active
+        self.all_buckets_indices = list(self.buckets_indices)
 
         self.shuffle_buckets()
         self._length = len(self.buckets_indices)
@@ -1646,7 +1819,20 @@ class BaseDataset(torch.utils.data.Dataset):
         # set random seed for this epoch
         random.seed(self.seed + self.current_epoch)
 
-        random.shuffle(self.buckets_indices)
+        if self.has_resolution_jitter:
+            # weighted sampling with replacement: each batch index is weighted by its
+            # resolution's jitter weight (non-jitter batches weight 1.0). Weights are
+            # normalized so they sum to 1 across the epoch, keeping the epoch length
+            # stable while making the share of steps per resolution follow the weights.
+            all_indices = self.all_buckets_indices
+            weights = []
+            for batch_index in all_indices:
+                weight = self.batch_bucket_weights[batch_index.bucket_index]
+                weights.append(1.0 if weight is None else float(weight))
+            total = sum(weights)
+            self.buckets_indices = random.choices(all_indices, weights=[w / total for w in weights], k=len(all_indices))
+        else:
+            random.shuffle(self.buckets_indices)
         for bucket in self.batch_buckets:
             random.shuffle(bucket)
 
@@ -1657,12 +1843,18 @@ class BaseDataset(torch.utils.data.Dataset):
         )
 
     def get_resolutions(self) -> List[Tuple[int, int]]:
-        """Return distinct effective resolutions used by this dataset."""
+        """Return distinct effective resolutions used by this dataset (including jitter resolutions)."""
         resolutions = []
         for subset in self.subsets:
             resolution = self.get_subset_resolution(subset)
             if resolution not in resolutions:
                 resolutions.append(resolution)
+            jitter = self.get_subset_resolution_jitter(subset)
+            if jitter is not None:
+                for reso_side in jitter[0]:
+                    jitter_reso = (reso_side, reso_side)
+                    if jitter_reso not in resolutions:
+                        resolutions.append(jitter_reso)
         if not resolutions and self.width is not None and self.height is not None:
             resolutions.append((self.width, self.height))
         return resolutions
@@ -1715,14 +1907,89 @@ class BaseDataset(torch.utils.data.Dataset):
             ]
         )
 
+    def _get_resolution_jitter_cache_passes(self) -> List[int]:
+        """Distinct jitter resolutions that need a dedicated caching pass (empty when no jitter)."""
+        passes: List[int] = []
+        if not self.has_resolution_jitter:
+            return passes
+        for subset in self.subsets:
+            jitter = self.get_subset_resolution_jitter(subset)
+            if jitter is None:
+                continue
+            for reso_side in jitter[0]:
+                if reso_side not in passes:
+                    passes.append(reso_side)
+        return passes
+
+    def _get_cache_pass_image_infos(self, pass_reso: Optional[int]) -> List[ImageInfo]:
+        """Image infos to cache in a pass: non-jitter subsets only in the canonical pass,
+        jitter subsets only in their jitter-resolution passes."""
+        infos = []
+        for info in self.image_data.values():
+            subset = self.image_to_subset[info.image_key]
+            jitter = self.get_subset_resolution_jitter(subset)
+            if jitter is None:
+                if pass_reso is None:
+                    infos.append(info)
+            elif pass_reso is not None and pass_reso in jitter[0]:
+                infos.append(info)
+        return infos
+
+    def _apply_jitter_cache_pass(self, pass_reso: int) -> None:
+        """Swap each jitter image's bucket assignment to the pass resolution before caching."""
+        for info in self.image_data.values():
+            if info.jitter_bucket_info and pass_reso in info.jitter_bucket_info:
+                info.bucket_reso, info.resized_size = info.jitter_bucket_info[pass_reso]
+
+    def _finish_jitter_cache_pass(self, pass_reso: int, canonical_bucket_info: dict) -> None:
+        """Collect in-memory latents cached at the pass resolution and restore canonical assignments."""
+        for key, info in self.image_data.items():
+            if info.jitter_bucket_info and pass_reso in info.jitter_bucket_info:
+                if info.latents is not None:
+                    info.latents_by_reso[pass_reso] = (
+                        info.latents,
+                        info.latents_flipped,
+                        info.alpha_mask,
+                        info.latents_original_size,
+                        info.latents_crop_ltrb,
+                    )
+                    info.latents = None
+                    info.latents_flipped = None
+                    info.alpha_mask = None
+                canonical_reso, canonical_resized = canonical_bucket_info[key]
+                info.bucket_reso, info.resized_size = canonical_reso, canonical_resized
+
     def new_cache_latents(self, model: Any, accelerator: Accelerator):
+        r"""
+        a brand new method to cache latents. This method caches latents with caching strategy.
+        normal cache_latents method is used by default, but this method is used when caching strategy is specified.
+
+        With resolution jitter, one caching pass runs per jitter resolution; each image of a
+        jitter-enabled subset is cached once per resolution (multi-resolution npz keys keep
+        them in the same file on disk).
+        """
+        cache_passes = self._get_resolution_jitter_cache_passes()
+        if not cache_passes:
+            self._new_cache_latents_pass(model, accelerator, None)
+            return
+
+        canonical_bucket_info = {key: (info.bucket_reso, info.resized_size) for key, info in self.image_data.items()}
+        for pass_reso in cache_passes:
+            logger.info(f"caching latents at resolution {pass_reso}x{pass_reso} (resolution jitter pass)")
+            self._apply_jitter_cache_pass(pass_reso)
+            try:
+                self._new_cache_latents_pass(model, accelerator, pass_reso)
+            finally:
+                self._finish_jitter_cache_pass(pass_reso, canonical_bucket_info)
+
+    def _new_cache_latents_pass(self, model: Any, accelerator: Accelerator, pass_reso: Optional[int]):
         r"""
         a brand new method to cache latents. This method caches latents with caching strategy.
         normal cache_latents method is used by default, but this method is used when caching strategy is specified.
         """
         logger.info("caching latents with caching strategy.")
         caching_strategy = LatentsCachingStrategy.get_strategy()
-        image_infos = list(self.image_data.values())
+        image_infos = self._get_cache_pass_image_infos(pass_reso)
 
         # sort by resolution
         image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
@@ -1852,9 +2119,25 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True, file_suffix=".npz"):
         # マルチGPUには対応していないので、そちらはtools/cache_latents.pyを使うこと
+        # With resolution jitter, one caching pass runs per jitter resolution.
+        cache_passes = self._get_resolution_jitter_cache_passes()
+        if not cache_passes:
+            self._cache_latents_pass(vae, vae_batch_size, cache_to_disk, is_main_process, file_suffix, None)
+            return
+
+        canonical_bucket_info = {key: (info.bucket_reso, info.resized_size) for key, info in self.image_data.items()}
+        for pass_reso in cache_passes:
+            logger.info(f"caching latents at resolution {pass_reso}x{pass_reso} (resolution jitter pass)")
+            self._apply_jitter_cache_pass(pass_reso)
+            try:
+                self._cache_latents_pass(vae, vae_batch_size, cache_to_disk, is_main_process, file_suffix, pass_reso)
+            finally:
+                self._finish_jitter_cache_pass(pass_reso, canonical_bucket_info)
+
+    def _cache_latents_pass(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True, file_suffix=".npz", pass_reso=None):
         logger.info("caching latents.")
 
-        image_infos = list(self.image_data.values())
+        image_infos = self._get_cache_pass_image_infos(pass_reso)
 
         # sort by resolution
         image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
@@ -2205,12 +2488,15 @@ class BaseDataset(torch.utils.data.Dataset):
         return self._length
 
     def __getitem__(self, index):
-        bucket = self.batch_buckets[self.buckets_indices[index].bucket_index]
+        bucket_index = self.buckets_indices[index].bucket_index
+        bucket = self.batch_buckets[bucket_index]
         bucket_batch_size = self.buckets_indices[index].bucket_batch_size
         image_index = self.buckets_indices[index].batch_index * bucket_batch_size
+        # resolution jitter: batches from jitter pools train at their pool's resolution
+        jitter_reso = self.batch_bucket_jitter_resos[bucket_index] if bucket_index < len(self.batch_bucket_jitter_resos) else None
 
         if self.caching_mode is not None:  # return batch for latents/text encoder outputs caching
-            return self.get_item_for_caching(bucket, bucket_batch_size, image_index)
+            return self.get_item_for_caching(bucket, bucket_batch_size, image_index, jitter_reso)
 
         loss_weights = []
         captions = []
@@ -2232,6 +2518,12 @@ class BaseDataset(torch.utils.data.Dataset):
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
 
+            # effective bucket assignment for this batch (differs from canonical for jitter batches)
+            if jitter_reso is not None:
+                eff_bucket_reso, eff_resized_size = image_info.jitter_bucket_info[jitter_reso]
+            else:
+                eff_bucket_reso, eff_resized_size = image_info.bucket_reso, image_info.resized_size
+
             custom_attributes.append(subset.custom_attributes)
 
             # in case of fine tuning, is_reg is always False
@@ -2241,7 +2533,19 @@ class BaseDataset(torch.utils.data.Dataset):
             is_canonical_only = image_info.is_val or not getattr(self, "is_training_dataset", True)  # validation always uses variant 0
 
             # image/latentsを処理する
-            if image_info.latents is not None:  # cache_latents=Trueの場合
+            jitter_cached = image_info.latents_by_reso.get(jitter_reso) if jitter_reso is not None else None
+            if jitter_cached is not None:
+                # resolution jitter with in-memory cached latents: use the latents cached at
+                # this batch's resolution (augmentation variants are only available at the
+                # canonical resolution, so they are not applied to jitter batches)
+                latents, latents_flipped, j_alpha_mask, original_size, crop_ltrb = jitter_cached
+                if flipped:
+                    latents = latents_flipped if latents_flipped is not None else torch.flip(latents, [-1])
+                    alpha_mask = None if j_alpha_mask is None else torch.flip(j_alpha_mask, [1])
+                else:
+                    alpha_mask = j_alpha_mask
+                image = None
+            elif image_info.latents is not None:  # cache_latents=Trueの場合
                 aug_variants = image_info.latents_aug_variants
                 if aug_variants:
                     # variant caching: sample one variant (validation always uses the canonical variant 0)
@@ -2279,7 +2583,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     if k == 0:
                         # load canonical from disk
                         latents, original_size, crop_ltrb, flipped_latents, alpha_mask, variant_flipped = (
-                            self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso, variant=0)
+                            self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, eff_bucket_reso, variant=0)
                         )
                         if variant_flipped is not None:
                             flipped = variant_flipped
@@ -2302,7 +2606,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     num_variants = self.get_effective_aug_variant_count(subset)
                     k = 0 if is_canonical_only or num_variants <= 1 else random.randrange(num_variants)
                     latents, original_size, crop_ltrb, flipped_latents, alpha_mask, variant_flipped = (
-                        self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso, variant=k)
+                        self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, eff_bucket_reso, variant=k)
                     )
                     if variant_flipped is not None:
                         # variant cache: flip is baked into the latents; only the flag is needed for conditioning
@@ -2322,14 +2626,17 @@ class BaseDataset(torch.utils.data.Dataset):
                     subset, image_info.absolute_path, subset.alpha_mask
                 )
                 im_h, im_w = img.shape[0:2]
-                target_width, target_height = self.get_subset_resolution(subset)
+                if jitter_reso is not None:
+                    target_width, target_height = eff_bucket_reso
+                else:
+                    target_width, target_height = self.get_subset_resolution(subset)
 
                 if self.enable_bucket:
                     img, original_size, crop_ltrb = trim_and_resize_if_required(
                         subset.random_crop,
                         img,
-                        image_info.bucket_reso,
-                        image_info.resized_size,
+                        eff_bucket_reso,
+                        eff_resized_size,
                         resize_interpolation=image_info.resize_interpolation,
                         random_crop_padding_percent=subset.random_crop_padding_percent,
                     )
@@ -2582,7 +2889,7 @@ class BaseDataset(torch.utils.data.Dataset):
             example["image_keys"] = bucket[image_index : image_index + bucket_batch_size]
         return example
 
-    def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
+    def get_item_for_caching(self, bucket, bucket_batch_size, image_index, jitter_reso=None):
         captions = []
         images = []
         input_ids1_list = []
@@ -2599,19 +2906,25 @@ class BaseDataset(torch.utils.data.Dataset):
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
 
+            # effective bucket assignment for this batch (differs from canonical for jitter batches)
+            if jitter_reso is not None:
+                eff_bucket_reso, eff_resized_size = image_info.jitter_bucket_info[jitter_reso]
+            else:
+                eff_bucket_reso, eff_resized_size = image_info.bucket_reso, image_info.resized_size
+
             if flip_aug is None:
                 flip_aug = subset.flip_aug
                 alpha_mask = subset.alpha_mask
                 random_crop = subset.random_crop
                 random_crop_padding_percent = subset.random_crop_padding_percent
-                bucket_reso = image_info.bucket_reso
+                bucket_reso = eff_bucket_reso
             else:
                 # TODO そもそも混在してても動くようにしたほうがいい
                 assert flip_aug == subset.flip_aug, "flip_aug must be same in a batch"
                 assert alpha_mask == subset.alpha_mask, "alpha_mask must be same in a batch"
                 assert random_crop == subset.random_crop, "random_crop must be same in a batch"
                 assert random_crop_padding_percent == subset.random_crop_padding_percent, "random_crop_padding_percent must be same in a batch"
-                assert bucket_reso == image_info.bucket_reso, "bucket_reso must be same in a batch"
+                assert bucket_reso == eff_bucket_reso, "bucket_reso must be same in a batch"
 
             caption = image_info.caption  # TODO cache some patterns of dropping, shuffling, etc.
 
@@ -2632,7 +2945,7 @@ class BaseDataset(torch.utils.data.Dataset):
             input_ids1_list.append(input_ids1)
             input_ids2_list.append(input_ids2)
             absolute_paths.append(image_info.absolute_path)
-            resized_sizes.append(image_info.resized_size)
+            resized_sizes.append(eff_resized_size)
 
         example = {}
 
@@ -2704,6 +3017,9 @@ class DreamBoothDataset(BaseDataset):
         validation_seed: Optional[int],
         resize_interpolation: Optional[str],
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__(
             resolution,
@@ -2712,6 +3028,9 @@ class DreamBoothDataset(BaseDataset):
             debug_dataset,
             resize_interpolation,
             skip_image_resolution,
+            resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes,
+            resolution_jitter_weights,
         )
 
         assert resolution is not None, f"resolution is required / resolution（解像度）指定は必須です"
@@ -3043,6 +3362,9 @@ class FineTuningDataset(BaseDataset):
         validation_split: float,
         resize_interpolation: Optional[str],
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__(
             resolution,
@@ -3051,6 +3373,9 @@ class FineTuningDataset(BaseDataset):
             debug_dataset,
             resize_interpolation,
             skip_image_resolution,
+            resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes,
+            resolution_jitter_weights,
         )
 
         self.batch_size = batch_size
@@ -3265,6 +3590,9 @@ class ControlNetDataset(BaseDataset):
         validation_seed: Optional[int],
         resize_interpolation: Optional[str] = None,
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        resolution_jitter_resolutions: Optional[List[int]] = None,
+        resolution_jitter_batch_sizes: Optional[List[int]] = None,
+        resolution_jitter_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__(
             resolution,
@@ -3273,6 +3601,9 @@ class ControlNetDataset(BaseDataset):
             debug_dataset,
             resize_interpolation,
             skip_image_resolution,
+            resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes,
+            resolution_jitter_weights,
         )
 
         db_subsets = []
@@ -3337,6 +3668,9 @@ class ControlNetDataset(BaseDataset):
             validation_seed,
             resize_interpolation,
             skip_image_resolution,
+            resolution_jitter_resolutions,
+            resolution_jitter_batch_sizes,
+            resolution_jitter_weights,
         )
         self.controlnet_subsets = subsets
 

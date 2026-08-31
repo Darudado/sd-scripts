@@ -30,6 +30,7 @@ from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
+from library import anchor_loss
 from library import hf_token_loss
 from library.strategy_sdxl import SdxlTextEncodingStrategy
 
@@ -151,6 +152,16 @@ class NetworkTrainer:
         self._hf_noisy_latents = None    # stored by get_noise_pred_and_target (4D pre-pack)
         self.hf_loss_value = None        # detached scaled HF contribution for logging (tensor)
 
+        # Multiscale MSE x0-prediction ("anchor") loss config (see library/anchor_loss.py)
+        self.anchor_scale = 0.0            # term weight; 0 = off (bit-identical no-op)
+        self.anchor_levels = 4             # requested Laplacian levels; must be >= 1
+        self.anchor_snr_weighting = False  # optional soft SNR(t) gate; inert while scale == 0
+        self.anchor_prediction_mode = None  # set by setup_anchor_objective / subclasses (None => base derives)
+        self.anchor_timesteps_in_sigma = False  # True for Anima (timesteps already in [0, 1])
+        self._anchor_noisy_latents = None  # stored by get_noise_pred_and_target (4D pre-pack)
+        self.anchor_loss_value = None      # detached scaled anchor contribution for logging (tensor)
+        self._anchor_warned_missing = False  # one-time warning when the term cannot run
+
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
         self,
@@ -178,6 +189,7 @@ class NetworkTrainer:
         current_wav_mask_ratio=None,
         current_weight_noise_norm=None,
         current_hf_loss=None,
+        current_anchor_loss=None,
         it_s: float = 0.0,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
@@ -207,6 +219,9 @@ class NetworkTrainer:
 
         if current_hf_loss is not None:
             logs["loss/current_hf"] = current_hf_loss
+
+        if current_anchor_loss is not None:
+            logs["loss/current_anchor"] = current_anchor_loss
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -471,6 +486,11 @@ class NetworkTrainer:
         if is_train and self.hf_scale > 0.0:
             self._hf_noisy_latents = noisy_latents.detach() if isinstance(noisy_latents, torch.Tensor) else None
 
+        # Store noisy latents for the multiscale x0-prediction anchor loss (must be 4D
+        # pre-pack; for inpainting this is the 4-channel latent, before the mask concat).
+        if is_train and self.anchor_scale > 0.0:
+            self._anchor_noisy_latents = noisy_latents.detach() if isinstance(noisy_latents, torch.Tensor) else None
+
         # ensure the hidden state will require grad
         if is_train and args.gradient_checkpointing:
             for x in noisy_latents:
@@ -605,6 +625,32 @@ class NetworkTrainer:
                 f"high_noise_snr_cut={self.hf_high_noise_snr_cut}, "
                 f"high_noise_min_weight={self.hf_high_noise_min_weight}, "
                 f"high_noise_power={self.hf_high_noise_power}"
+            )
+
+    def setup_anchor_objective(self, args):
+        """Resolve the multiscale MSE x0-prediction ("anchor") loss config from args.
+
+        Base objective resolution: eps/v-pred/flow (DDPM-family). Subclasses set
+        `self.anchor_prediction_mode` (and optionally `anchor_timesteps_in_sigma`) in
+        their `__init__`; a non-None mode is never clobbered here.
+        """
+        self.anchor_scale = float(getattr(args, "anchor_scale", 0.0) or 0.0)
+        anchor_levels_arg = getattr(args, "anchor_levels", 4)
+        self.anchor_levels = 4 if anchor_levels_arg is None else int(anchor_levels_arg)
+        self.anchor_snr_weighting = bool(getattr(args, "anchor_snr_weighting", False))
+        anchor_loss.validate_anchor_args(self.anchor_scale, self.anchor_levels)
+        if self.anchor_prediction_mode is None:
+            if getattr(args, "flow_model", False):
+                self.anchor_prediction_mode = "flow"
+            elif args.v_parameterization:
+                self.anchor_prediction_mode = "vpred_ddpm"
+            else:
+                self.anchor_prediction_mode = "eps_ddpm"
+        if self.anchor_scale > 0.0:
+            logger.info(
+                f"Multiscale MSE x0-prediction anchor loss enabled: scale={self.anchor_scale}, "
+                f"levels={self.anchor_levels}, snr_weighting={self.anchor_snr_weighting}, "
+                f"mode={self.anchor_prediction_mode}"
             )
 
     def build_adaptive_model_fn(self, unet, accelerator, weight_dtype):
@@ -1259,6 +1305,63 @@ class NetworkTrainer:
                 eps_train=self.hf_eps_train,
             )
 
+        # --- Multiscale MSE x0-prediction ("anchor") loss: frequency-even Laplacian-pyramid MSE on the predicted x0 ---
+        # Opt-in auxiliary (anchor_scale > 0). The Python-level gate keeps the off path
+        # bit-identical (no extra ops/allocations/RNG). The pyramid is built ONCE on the
+        # delta (x0_pred - clean); band MSEs are whitened by calibrated band filter
+        # energies (cached per shape/dtype) and averaged uniformly. Batch aggregation
+        # mirrors the primary loss's per-sample weighting and reduction (spec §3.8).
+        self.anchor_loss_value = None
+        if is_train and self.anchor_scale > 0.0 and self._anchor_noisy_latents is None and not self._anchor_warned_missing:
+            # Trainers/paths that never store the noisy latents (e.g. flux/sd3/lumina/
+            # hunyuan, which override get_noise_pred_and_target, and the iLECO/ADDifT
+            # distillation paths, which have no analytic clean x0) silently skip the
+            # term — make that visible instead of a silent no-op.
+            self._anchor_warned_missing = True
+            logger.warning(
+                "anchor_scale > 0 but no noisy latents were stored by this trainer/path; "
+                "the multiscale x0-prediction anchor loss is INERT for this configuration."
+            )
+        if is_train and self.anchor_scale > 0.0 and self._anchor_noisy_latents is not None:
+            anchor_per_sample = anchor_loss.anchor_per_sample_from_prediction(
+                noise_pred,
+                clean=latents,
+                noisy=self._anchor_noisy_latents,
+                timesteps=timesteps,
+                mode=self.anchor_prediction_mode,
+                noise_scheduler=noise_scheduler,
+                timesteps_in_sigma=self.anchor_timesteps_in_sigma,
+                levels=self.anchor_levels,
+            )  # [B] fp32, differentiable only through x0_pred
+
+            # Optional soft SNR(t) gate (batch-mean-1 normalized; reshapes across t only).
+            if self.anchor_snr_weighting:
+                anchor_snr_w = anchor_loss.anchor_snr_weights(
+                    timesteps,
+                    self.anchor_prediction_mode,
+                    noise_scheduler=noise_scheduler,
+                    timesteps_in_sigma=self.anchor_timesteps_in_sigma,
+                )
+                anchor_per_sample = anchor_per_sample * anchor_snr_w
+
+            # Mirror the primary loss's per-sample weighting: scheduler weighting,
+            # per-sample data weights, then the per-sample timestep weighting
+            # (min-SNR-gamma etc.) applied by post_process_loss.
+            if weighting is not None:
+                anchor_w = weighting.detach().reshape(-1)
+                if anchor_w.shape[0] == anchor_per_sample.shape[0]:
+                    anchor_per_sample = anchor_per_sample * anchor_w.to(anchor_per_sample.dtype)
+            anchor_loss_weights = batch.get("loss_weights")
+            if anchor_loss_weights is not None:
+                anchor_per_sample = anchor_per_sample * anchor_loss_weights.reshape(-1).to(anchor_per_sample.dtype)
+            anchor_per_sample = self.post_process_loss(anchor_per_sample, args, timesteps, noise_scheduler)
+
+            anchor_term = anchor_per_sample.mean()
+            final_loss = final_loss + self.anchor_scale * anchor_term
+            # Detached, already-scaled contribution for logging (materialized at the
+            # caller's existing periodic sync — no .item() on the hot path).
+            self.anchor_loss_value = (self.anchor_scale * anchor_term).detach()
+
         return final_loss, pre_scaling_loss, loss_scaled
     
     def process_val_batch(
@@ -1529,6 +1632,7 @@ class NetworkTrainer:
         train_util.verify_training_args(args)
         train_util.prepare_dataset_args(args, True)
         self.setup_hf_objective(args)  # High-Frequency Token latent loss (validates hf_scale/hf_exponent/hf_patch)
+        self.setup_anchor_objective(args)  # Multiscale MSE x0-prediction anchor loss (validates anchor args)
         train_util.set_torch_cuda_reduced_precision(args)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
@@ -2554,6 +2658,9 @@ class NetworkTrainer:
             "ss_hf_high_noise_snr_cut": self.hf_high_noise_snr_cut if self.hf_scale > 0.0 else None,
             "ss_hf_high_noise_min_weight": self.hf_high_noise_min_weight if self.hf_scale > 0.0 else None,
             "ss_hf_high_noise_power": self.hf_high_noise_power if self.hf_scale > 0.0 else None,
+            "ss_anchor_scale": self.anchor_scale if self.anchor_scale > 0.0 else 0.0,
+            "ss_anchor_levels": self.anchor_levels if self.anchor_scale > 0.0 else None,
+            "ss_anchor_snr_weighting": bool(self.anchor_snr_weighting) if self.anchor_scale > 0.0 else None,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -2695,6 +2802,15 @@ class NetworkTrainer:
                     "ss_enable_bucket": bool(dataset.enable_bucket),
                     "ss_bucket_no_upscale": bool(dataset.bucket_no_upscale),
                     "ss_multires_training": bool(getattr(dataset, "multires_training", False)),
+                    "ss_resolution_jitter": json.dumps(
+                        {
+                            "resolutions": dataset.resolution_jitter_resolutions,
+                            "batch_sizes": dataset.resolution_jitter_batch_sizes,
+                            "weights": dataset.resolution_jitter_weights,
+                        }
+                    )
+                    if getattr(dataset, "has_resolution_jitter", False)
+                    else None,
                     "ss_min_bucket_reso": dataset.min_bucket_reso,
                     "ss_max_bucket_reso": dataset.max_bucket_reso,
                     "ss_skip_image_resolution": dataset.skip_image_resolution,
@@ -3007,6 +3123,7 @@ class NetworkTrainer:
         current_global_step_wav_mask = 0.0 if self.wavelet_masking_enabled else None
         current_global_step_wnoise = 0.0 if self.weight_noise_enabled else None
         current_global_step_hf = 0.0 if self.hf_scale > 0.0 else None
+        current_global_step_anchor = 0.0 if self.anchor_scale > 0.0 else None
         avr_loss = 0.0
         accumulation_counter = 0
         accumulated_samples = 0  # Tracks actual samples across micro-batches for dynamic sigma
@@ -3072,6 +3189,7 @@ class NetworkTrainer:
                 current_ffl_loss=None,
                 current_patch_topology_loss=None,
                 current_hf_loss=None,
+                current_anchor_loss=None,
                 it_s=rate_tracker.it_per_sec,
             )
             if val_logs:
@@ -3214,6 +3332,11 @@ class NetworkTrainer:
                     # existing periodic sync — the hot path keeps a detached tensor)
                     if self.hf_scale > 0.0 and self.hf_loss_value is not None:
                         current_global_step_hf = (current_global_step_hf or 0.0) + self.hf_loss_value.item()
+
+                    # Track multiscale anchor loss for logging (materialized at the
+                    # existing periodic sync — the hot path keeps a detached tensor)
+                    if self.anchor_scale > 0.0 and self.anchor_loss_value is not None:
+                        current_global_step_anchor = (current_global_step_anchor or 0.0) + self.anchor_loss_value.item()
 
                     if loss.ndim != 0:
                         loss = loss.mean()
@@ -3482,6 +3605,7 @@ class NetworkTrainer:
                             current_wav_mask_ratio=(current_global_step_wav_mask / accumulation_counter) if self.wavelet_masking_enabled and current_global_step_wav_mask is not None else None,
                             current_weight_noise_norm=(current_global_step_wnoise / accumulation_counter) if self.weight_noise_enabled and current_global_step_wnoise is not None else None,
                             current_hf_loss=(current_global_step_hf / accumulation_counter) if self.hf_scale > 0.0 and current_global_step_hf is not None else None,
+                            current_anchor_loss=(current_global_step_anchor / accumulation_counter) if self.anchor_scale > 0.0 and current_global_step_anchor is not None else None,
                             it_s=rate_tracker.it_per_sec,
                         )
                         if val_logs:
@@ -3501,6 +3625,8 @@ class NetworkTrainer:
                         current_global_step_wnoise = 0.0
                     if self.hf_scale > 0.0:
                         current_global_step_hf = 0.0
+                    if self.anchor_scale > 0.0:
+                        current_global_step_anchor = 0.0
                     accumulation_counter = 0
                     accumulated_samples = 0
 
@@ -4106,6 +4232,33 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Power controlling high-noise HF attenuation below hf_high_noise_snr_cut (default: 1.0).",
+    )
+
+    # Multiscale MSE x0-prediction ("anchor") loss arguments (see library/anchor_loss.py)
+    parser.add_argument(
+        "--anchor_scale",
+        type=float,
+        default=0.0,
+        help="Multiscale MSE x0-prediction (anchor) loss weight (0 = off, must be >= 0). "
+        "L_total = L_mse + anchor_scale * L_anchor. Frequency-even Laplacian-pyramid "
+        "reconstruction term on the predicted clean output (x0): emphasizes composition "
+        "and global look without zeroing out fine detail. Sweep 0.05 - 1.0.",
+    )
+    parser.add_argument(
+        "--anchor_levels",
+        type=int,
+        default=4,
+        help="Number of Laplacian pyramid band-pass octaves for the anchor loss (plus the "
+        "coarsest Gaussian residual). Must be >= 1; clamped down to what the latent grid "
+        "supports. More levels give subject/identity detail a voice, fewer levels judge "
+        "mostly composition/global look.",
+    )
+    parser.add_argument(
+        "--anchor_snr_weighting",
+        action="store_true",
+        help="Apply the soft SNR(t) gate to the anchor loss (batch-mean-1 normalized): "
+        "early (noisy, low-SNR) steps weigh less, late (clean, high-SNR) steps weigh more. "
+        "Inert while --anchor_scale is 0.",
     )
 
     parser.add_argument(

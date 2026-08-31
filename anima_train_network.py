@@ -46,6 +46,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # (divided by 1000), so the HF Tweedie must treat them as sigmas directly.
         self.hf_prediction_mode = "flow"
         self.hf_timesteps_in_sigma = True
+        # Same convention for the multiscale x0-prediction anchor loss (flow Tweedie
+        # on sigmas in [0, 1]).
+        self.anchor_prediction_mode = "flow"
+        self.anchor_timesteps_in_sigma = True
         self._ot_logged = False    # fires a one-time first-batch OT log
         self._cfm_logged = False   # fires a one-time first-batch CFM log
         self.ileco_text_encoder_conds = None
@@ -760,6 +764,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # iLECO is a teacher-distillation path: the training target is the teacher's
         # velocity, so there is no analytic clean x0 for the HF token term — skip it.
         self._hf_noisy_latents = None
+        # Same for the multiscale x0-prediction anchor loss (no analytic clean x0).
+        self._anchor_noisy_latents = None
         anima: anima_models.Anima = unet
 
         if self.ileco_text_encoder_conds is None:
@@ -861,6 +867,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # velocity (x0_hat converges to a sigma-dependent blend), so there is no analytic
         # clean x0 for the HF token term — skip it.
         self._hf_noisy_latents = None
+        # Same for the multiscale x0-prediction anchor loss (no analytic clean x0).
+        self._anchor_noisy_latents = None
         anima: anima_models.Anima = unet
 
         if network is None or not hasattr(network, "set_multiplier"):
@@ -1126,6 +1134,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Store noisy latents for High-Frequency Token loss (4D, before 5D unsqueeze)
         if is_train and self.hf_scale > 0.0:
             self._hf_noisy_latents = noisy_model_input.detach()
+
+        # Store noisy latents for the multiscale x0-prediction anchor loss (4D, before 5D unsqueeze)
+        if is_train and self.anchor_scale > 0.0:
+            self._anchor_noisy_latents = noisy_model_input.detach()
 
         # Set T-LoRA timestep mask before timestep scaling (mask expects [0, max_timestep] range)
         self.apply_tlora_mask(timesteps)
